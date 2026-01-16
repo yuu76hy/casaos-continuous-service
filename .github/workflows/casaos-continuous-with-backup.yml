@@ -1,4 +1,4 @@
-name: CasaOS+VNC+Tailscale 持续服务（最终修复版）
+name: CasaOS+VNC+Tailscale 持续服务（对象存储备份版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -15,51 +15,31 @@ jobs:
       MAX_RUN_MINUTES: 340
       FIXED_VNC_PWD: "123456789"
       CASAOS_PORT: 80
+      NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       INC_BACKUP_BASE: "casaos_base.tar.gz"
-      KEEP_BACKUP_NUM: 1
-      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
+      KEEP_BACKUP_NUM: 2
+      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run"
+      # 新增 runner 用户密码配置
       RUNNER_PASSWORD: "runner123"
     steps:
-      - name: 轻量清理（只删大文件）
-        id: clean_disk_light
-        run: |
-          df -h / || true
-          sudo rm -rf /home/runner/actions-runner/cached/_diag/* /home/runner/actions-runner/_work/_temp/* || true
-          df -h / || true
-
-      - name: 替换为国内Ubuntu源（解决update超时）
-        id: replace_apt_source
-        run: |
-          # 备份原源
-          sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-          # 改用echo逐行写入，避免EOF语法错误
-          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse" > /etc/apt/sources.list
-          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse" >> /etc/apt/sources.list
-          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse" >> /etc/apt/sources.list
-          # 更新源缓存（带重试）
-          sudo apt update -y || { echo "更新源失败，重试一次"; sudo apt update -y; }
-
-      - name: 系统环境初始化（带权限兜底）
+      - name: 系统环境初始化与依赖更新
         id: init_env
         continue-on-error: false
         run: |
-          # 强制安装依赖（解决权限/依赖缺失）
-          sudo apt install -y --no-install-recommends tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release || { echo "依赖安装失败"; exit 1; }
-          # 重置runner用户权限
-          sudo chown -R runner:runner /home/runner || true
-          # 设置runner密码
+          echo "===== 初始化系统环境 ====="
+          sudo apt update -y 2>&1 | grep -v "restart" || { echo "系统更新失败"; exit 1; }
+          sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "系统升级失败"; exit 1; }
+          sudo apt install -y tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release || { echo "依赖安装失败"; exit 1; }
+          
+          # 核心修改：为 runner 用户设置密码
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
-          # 创建备份目录
-          sudo mkdir -p $BACKUP_DIR && sudo chmod 777 $BACKUP_DIR
-          # 记录系统信息
-          echo "OS_VERSION=$(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')" >> $GITHUB_ENV
-          echo "RUNNER_USER=$(whoami)" >> $GITHUB_ENV
+          echo "===== runner 用户密码已设置 ====="
+          
+          sudo mkdir -p $BACKUP_DIR $NETDISK_ROOT
+          sudo chown -R runner:runner $BACKUP_DIR $NETDISK_ROOT
+          sudo chmod -R 755 $BACKUP_DIR $NETDISK_ROOT
+          echo "===== 环境初始化完成 ====="
 
       - name: 配置对象存储（rclone）
         id: config_rclone
@@ -67,9 +47,10 @@ jobs:
         env:
           OSS_CONFIG: ${{ secrets.OSS_CONFIG }}
         run: |
-          export OSS_ENDPOINT=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
-          export OSS_AK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
-          export OSS_SK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
+          echo "===== 配置对象存储 ====="
+          export OSS_ENDPOINT=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
+          export OSS_AK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
+          export OSS_SK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
           
           mkdir -p ~/.config/rclone
           echo "[oss]" > ~/.config/rclone/rclone.conf
@@ -78,111 +59,125 @@ jobs:
           echo "endpoint = $OSS_ENDPOINT" >> ~/.config/rclone/rclone.conf
           echo "access_key_id = $OSS_AK" >> ~/.config/rclone/rclone.conf
           echo "secret_access_key = $OSS_SK" >> ~/.config/rclone/rclone.conf
-          chmod 600 ~/.config/rclone/rclone.conf
           
+          chmod 600 ~/.config/rclone/rclone.conf
           if rclone lsd oss:; then
-            echo "OSS_CONNECT_STATUS=✅ 成功" >> $GITHUB_ENV
-            echo "OSS_ENDPOINT=$OSS_ENDPOINT" >> $GITHUB_ENV
+            echo "对象存储连接成功"
           else
-            echo "对象存储连接失败，终止流程"
-            exit 1
+            echo "对象存储连接失败"; exit 1;
           fi
+          echo "===== 对象存储配置完成 ====="
 
-      - name: 安装 Docker + CasaOS（精简版）
-        id: install_services
+      - name: 恢复历史备份（基准+增量）
+        id: restore_backup
+        continue-on-error: true
         run: |
-          # 安装Docker（国内源）
-          curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
-          echo "deb [arch=$(dpkg --print-architecture)] https://mirrors.aliyun.com/docker-ce/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-          sudo apt update -y && sudo apt install -y --no-install-recommends docker-ce docker-ce-cli containerd.io
-          sudo systemctl start docker && sudo systemctl enable docker
-          if sudo systemctl is-active --quiet docker; then
-            echo "DOCKER_STATUS=✅ 运行中" >> $GITHUB_ENV
+          echo "===== 恢复历史备份 ====="
+          rclone copy oss:casaos-backup/ $BACKUP_DIR/ || { echo "无历史备份，跳过恢复"; exit 0; }
+          if [ -f "$BACKUP_DIR/$INC_BACKUP_BASE" ]; then
+            echo "恢复基准备份..."
+            sudo tar -zxf $BACKUP_DIR/$INC_BACKUP_BASE -C / --preserve-permissions || echo "基准备份恢复失败"
+            LATEST_INC=$(ls -tp $BACKUP_DIR/inc_*.tar.gz 2>/dev/null | grep -v '/' | head -n1)
+            if [ -n "$LATEST_INC" ]; then
+              echo "恢复增量备份：$LATEST_INC"
+              sudo tar -zxf $LATEST_INC -C / --preserve-permissions || echo "增量备份恢复失败"
+            fi
           else
-            echo "DOCKER_STATUS=❌ 未启动" >> $GITHUB_ENV
+            echo "无基准备份，将创建新基准"
           fi
+          echo "===== 备份恢复完成 ====="
 
-          # 安装CasaOS（国内源）
-          curl -fsSL https://mirror.ghproxy.com/https://get.casaos.io | sudo bash -s -- --lite || echo "CasaOS安装警告"
-          sleep 10 && sudo systemctl start casaos
-          if sudo systemctl is-active --quiet casaos; then
-            echo "CASAOS_STATUS=✅ 运行中" >> $GITHUB_ENV
-          else
-            echo "CASAOS_STATUS=❌ 未启动" >> $GITHUB_ENV
-          fi
+      - name: 安装 Docker + CasaOS
+        id: install_services
+        continue-on-error: true
+        run: |
+          echo "===== 安装 Docker 引擎 ====="
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+          sudo apt update -y 2>&1 | grep -v "restart" && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          sudo systemctl start docker && sudo systemctl enable docker
+          
+          echo "===== 安装 CasaOS ====="
+          curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || echo "警告：CasaOS安装失败"
+          sleep 10 && sudo systemctl start casaos || echo "CasaOS启动失败"
+          echo "===== 服务安装完成 ====="
 
       - name: 配置 VNC + Tailscale
         id: deploy_core
+        continue-on-error: true
         run: |
-          # 配置VNC
+          echo "===== 配置 VNC 服务 ====="
           mkdir -p $VNCDIR && chmod 700 $VNCDIR
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
+          
           echo "#!/bin/bash" > $VNCDIR/xstartup
           echo "export DISPLAY=:0" >> $VNCDIR/xstartup
           echo "export XDG_RUNTIME_DIR=/tmp/runtime-runner" >> $VNCDIR/xstartup
           echo "mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR" >> $VNCDIR/xstartup
           echo "exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title \"CasaOS服务\"" >> $VNCDIR/xstartup
           chmod +x $VNCDIR/xstartup
+          
           pgrep -x Xvnc && vncserver -kill $DISPLAY || true
-          vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth
-          if pgrep -x Xvnc >/dev/null; then
-            echo "VNC_STATUS=✅ 运行中 (端口:$VNC_PORT)" >> $GITHUB_ENV
-          else
-            echo "VNC_STATUS=❌ 启动失败" >> $GITHUB_ENV
-          fi
-
-          # 配置Tailscale
-          curl -fsSL https://mirror.ghproxy.com/https://tailscale.com/install.sh | sudo sh || true
+          vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth || echo "VNC启动失败"
+          
+          echo "===== 配置 Tailscale 组网 ====="
+          curl -fsSL https://tailscale.com/install.sh | sudo sh 2>&1 | grep -v "restart" || echo "Tailscale安装失败"
           sudo systemctl enable --now tailscaled && sleep 3
           MAX_RETRIES=3
           while [ $MAX_RETRIES -gt 0 ]; do
             if sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=casaos-${{ github.run_id }} --accept-routes=false; then
               TAILSCALE_IP=$(sudo tailscale ip -4)
-              echo "TAILSCALE_STATUS=✅ 运行中 (IP:$TAILSCALE_IP)" >> $GITHUB_ENV
-              echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
               break
             fi
-            MAX_RETRIES=$((MAX_RETRIES-1))
-            sleep 5
+            MAX_RETRIES=$((MAX_RETRIES-1)) && sleep 5
           done
-          if [ $MAX_RETRIES -eq 0 ]; then
-            echo "TAILSCALE_STATUS=❌ 启动失败（密钥可能无效）" >> $GITHUB_ENV
-          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "===== 核心服务部署完成 ====="
 
-      - name: 输出详细状态
+      - name: 输出服务访问信息
         id: output_info
+        continue-on-error: false
         run: |
           echo -e "\n========================================"
-          echo -e " 🚀 服务部署状态汇总"
+          echo -e " 🚀 服务启动完成 - 访问信息汇总"
           echo -e "========================================"
-          echo -e " 🖥️  系统信息 | 可用空间: $(df -h / | awk 'NR==2{print $4}')"
-          echo -e "   - 系统版本: ${OS_VERSION} | 运行用户: ${RUNNER_USER}"
-          echo -e "   - runner密码: \033[1;32m${RUNNER_PASSWORD}\033[0m"
-          echo -e " 📦 对象存储 | 状态: ${OSS_CONNECT_STATUS} | 端点: ${OSS_ENDPOINT}"
-          echo -e " 🎯 服务状态 | Docker: ${DOCKER_STATUS} | CasaOS: ${CASAOS_STATUS}"
-          echo -e "   - VNC: ${VNC_STATUS} | Tailscale: ${TAILSCALE_STATUS}"
-          echo -e " 🔗 访问地址 | VNC: ${TAILSCALE_IP:-未获取}:${VNC_PORT} | CasaOS: http://${TAILSCALE_IP:-未获取}:${CASAOS_PORT}"
+          echo -e " 🔑 密码信息"
+          echo -e " VNC密码：\033[1;32m${FIXED_VNC_PWD}\033[0m"
+          echo -e " runner 用户密码：\033[1;32m${RUNNER_PASSWORD}\033[0m"
+          echo -e " CasaOS账号：\033[1;32madmin\033[0m / 密码：\033[1;32madmin\033[0m"
+          echo -e " \n 🌐 访问地址（Tailscale IP）"
+          echo -e " CasaOS面板：\033[1;34mhttp://${TAILSCALE_IP}:${CASAOS_PORT}\033[0m"
+          echo -e " VNC远程：\033[1;34m${TAILSCALE_IP}:${VNC_PORT}\033[0m"
+          echo -e " \n 📦 备份信息"
+          echo -e " 备份存储：对象存储 oss:casaos-backup/"
+          echo -e " 备份策略：1次全量 + 增量备份，保留${KEEP_BACKUP_NUM}份"
           echo -e "========================================\n"
 
-      - name: 保活+备份（按需清理）
+      - name: 保活+续跑+自动备份核心逻辑
         id: core_logic
+        continue-on-error: true
         run: |
+          echo "===== 启动保活+备份监控 ====="
           start_time=$(date +%s)
           last_backup_time=$start_time
 
           full_backup() {
-            if [ "${OSS_CONNECT_STATUS}" = "✅ 成功" ]; then
-              sudo tar -zcf $BACKUP_DIR/$INC_BACKUP_BASE $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*"
-              rclone copy $BACKUP_DIR/$INC_BACKUP_BASE oss:casaos-backup/ && rm -f $BACKUP_DIR/$INC_BACKUP_BASE
-            fi
+            echo "===== 创建全量基准备份 ====="
+            BACKUP_NAME=$BACKUP_DIR/$INC_BACKUP_BASE
+            sudo tar -zcf $BACKUP_NAME $BACKUP_EXCLUDE / || { echo "全量备份失败"; return 1; }
+            rclone copy $BACKUP_NAME oss:casaos-backup/ || echo "基准备份上传失败"
+            echo "全量备份完成：$BACKUP_NAME"
           }
 
           inc_backup() {
-            if [ "${OSS_CONNECT_STATUS}" = "✅ 成功" ]; then
-              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-              sudo tar -zcf $BACKUP_DIR/inc_$TIMESTAMP.tar.gz $BACKUP_EXCLUDE / --listed-incremental=$BACKUP_DIR/backup.snar --wildcards "*/casaos/*" "*/docker/*"
-              rclone copy $BACKUP_DIR/inc_$TIMESTAMP.tar.gz oss:casaos-backup/ && rm -f $BACKUP_DIR/inc_$TIMESTAMP.tar.gz
-            fi
+            echo "===== 创建增量备份 ====="
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_NAME=$BACKUP_DIR/inc_$TIMESTAMP.tar.gz
+            sudo tar -zcf $BACKUP_NAME $BACKUP_EXCLUDE / --listed-incremental=$BACKUP_DIR/backup.snar || { echo "增量备份失败"; return 1; }
+            rclone copy $BACKUP_NAME oss:casaos-backup/ || echo "增量备份上传失败"
+            ls -tp $BACKUP_DIR/inc_*.tar.gz 2>/dev/null | grep -v '/' | tail -n +$((KEEP_BACKUP_NUM)) | xargs -I {} sudo rm -f {} || true
+            rclone delete oss:casaos-backup/ --include "inc_*.tar.gz" --min-age $((KEEP_BACKUP_NUM * 86400)) || true
+            echo "增量备份完成：$BACKUP_NAME"
           }
 
           [ ! -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && full_backup || inc_backup
@@ -190,36 +185,38 @@ jobs:
           while true; do
             current_time=$(date +%s)
             run_minutes=$(( (current_time - start_time) / 60 ))
-            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
-            
-            if (( $(echo "$FREE_SPACE < 2" | bc -l) )); then
-              sudo apt clean -y && sudo docker system prune -af && rm -rf /tmp/* || true
-            fi
 
             if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ]; then
+              echo "===== 剩余10分钟，触发续跑 ====="
               full_backup
-              curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" -d '{"event_type":"renew_vnc"}' || true
+              curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" \
+                -d '{"event_type":"renew_vnc"}' || echo "续跑触发失败"
             fi
 
-            if [ $((current_time - last_backup_time)) -ge 7200 ]; then
+            if [ $((current_time - last_backup_time)) -ge 3600 ]; then
               inc_backup
               last_backup_time=$current_time
             fi
 
-            pgrep -x Xvnc || vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth
-            sudo systemctl is-active --quiet docker || sudo systemctl restart docker
-            sudo systemctl is-active --quiet casaos || sudo systemctl restart casaos
-            sudo systemctl is-active --quiet tailscaled || sudo systemctl restart tailscaled
+            # 健康检查：仅保留 VNC、Docker、Tailscale
+            pgrep -x Xvnc || { echo "VNC异常，重启"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
+            pgrep -x dockerd || { echo "Docker异常，重启"; sudo systemctl restart docker; }
+            pgrep -x tailscaled || { echo "Tailscale异常，重启"; sudo systemctl restart tailscaled; }
 
-            echo "[$(date)] 运行${run_minutes}分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
+            echo "[$(date)] 运行时长：${run_minutes}分钟 | Tailscale IP：${TAILSCALE_IP}"
             sleep 300
           done
 
-      - name: 优雅清理
+      - name: 优雅清理环境
         id: clean_env
         if: always()
         run: |
-          vncserver -kill $DISPLAY || true
+          echo "===== 清理环境 ====="
+          [ -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && rclone copy $BACKUP_DIR/$INC_BACKUP_BASE oss:casaos-backup/ || true
+          vncserver -kill $DISPLAY || true && pkill -9 Xvnc || true
           sudo systemctl stop docker casaos tailscaled || true
           sudo tailscale down || true
-          rm -rf $BACKUP_DIR $VNCDIR || true
+          rm -rf $BACKUP_DIR $VNCDIR $NETDISK_ROOT || true
+          echo "===== 环境清理完成 ====="
