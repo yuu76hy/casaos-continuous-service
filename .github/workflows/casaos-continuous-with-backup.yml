@@ -1,0 +1,242 @@
+name: CasaOS+Docker+Firefox+VNC+Tailscale 持续服务（对象存储备份版）
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [renew_vnc]
+
+jobs:
+  casaos-firefox-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      DISPLAY: :0
+      VNCDIR: /home/runner/.vnc
+      VNC_PORT: 5900
+      MAX_RUN_MINUTES: 340
+      FIXED_VNC_PWD: "123456789"
+      OPENLIST_PORT: 3000
+      CASAOS_PORT: 80
+      FIREFOX_PORT: 6080
+      NETDISK_ROOT: /mnt/netdisk
+      BACKUP_DIR: /home/runner/backup
+      INC_BACKUP_BASE: "casaos_base.tar.gz"
+      KEEP_BACKUP_NUM: 2
+      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/mnt --exclude=/run --exclude=/var/run"
+    steps:
+      - name: 系统环境初始化与依赖更新
+        id: init_env
+        continue-on-error: false
+        run: |
+          echo "===== 初始化系统环境 ====="
+          sudo apt update -y || { echo "系统更新失败"; exit 1; }
+          sudo apt upgrade -y || { echo "系统升级失败"; exit 1; }
+          sudo apt install -y tar gzip rsync rclone || { echo "备份依赖安装失败"; exit 1; }
+          mkdir -p $BACKUP_DIR $NETDISK_ROOT
+          echo "===== 环境初始化完成 ====="
+
+      - name: 配置对象存储（rclone）
+        id: config_rclone
+        continue-on-error: false
+        env:
+          OSS_CONFIG: ${{ secrets.OSS_CONFIG }}
+        run: |
+          echo "===== 配置对象存储 ====="
+          IFS=';' read -r -a oss_arr <<< "$OSS_CONFIG"
+          for item in "${oss_arr[@]}"; do
+            key=$(echo $item | cut -d ':' -f1)
+            value=$(echo $item | cut -d ':' -f2-)
+            export OSS_${key^^}=$value
+          done
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+[oss]
+type = s3
+provider = Other
+endpoint = $OSS_ENDPOINT
+access_key_id = $OSS_AK
+secret_access_key = $OSS_SK
+EOF
+          chmod 600 ~/.config/rclone/rclone.conf
+          if rclone lsd oss:; then
+            echo "对象存储连接成功"
+          else
+            echo "对象存储连接失败"; exit 1;
+          fi
+          echo "===== 对象存储配置完成 ====="
+
+      - name: 恢复历史备份（基准+增量）
+        id: restore_backup
+        continue-on-error: true
+        run: |
+          echo "===== 恢复历史备份 ====="
+          rclone copy oss:casaos-backup/ $BACKUP_DIR/ || { echo "无历史备份，跳过恢复"; exit 0; }
+          if [ -f "$BACKUP_DIR/$INC_BACKUP_BASE" ]; then
+            echo "恢复基准备份..."
+            sudo tar -zxf $BACKUP_DIR/$INC_BACKUP_BASE -C / --preserve-permissions || echo "基准备份恢复失败"
+            LATEST_INC=$(ls -tp $BACKUP_DIR/inc_*.tar.gz 2>/dev/null | grep -v '/' | head -n1)
+            if [ -n "$LATEST_INC" ]; then
+              echo "恢复增量备份：$LATEST_INC"
+              sudo tar -zxf $LATEST_INC -C / --preserve-permissions || echo "增量备份恢复失败"
+            fi
+          else
+            echo "无基准备份，将创建新基准"
+          fi
+          echo "===== 备份恢复完成 ====="
+
+      - name: 安装核心依赖+Docker+CasaOS
+        id: install_services
+        continue-on-error: true
+        run: |
+          echo "===== 安装核心依赖 ====="
+          DEPS=(
+            "tigervnc-standalone-server" "netcat-openbsd" "psmisc" "curl" "git"
+            "sendmail" "mailutils" "openssh-client" "wget" "vim" "nano" "python3" "python3-pip" "python3-venv" "ca-certificates" "gnupg" "lsb-release"
+          )
+          for dep in "${DEPS[@]}"; do
+            sudo apt install -y "$dep" || echo "警告：$dep 安装失败"
+          done
+          # 安装Docker
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+          sudo apt update -y && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          sudo systemctl start docker && sudo systemctl enable docker
+          # 安装CasaOS
+          curl -fsSL https://get.casaos.io | sudo bash || echo "警告：CasaOS安装失败"
+          sleep 10 && sudo systemctl start casaos || echo "CasaOS启动失败"
+          echo "===== 服务依赖安装完成 ====="
+
+      - name: 部署Firefox+VNC+OpenList+Tailscale
+        id: deploy_apps
+        continue-on-error: true
+        run: |
+          echo "===== 部署Firefox容器 ====="
+          sudo docker stop firefox || true && sudo docker rm firefox || true
+          sudo docker run -d --name firefox --restart always -p ${FIREFOX_PORT}:6080 -e DISPLAY_WIDTH=1920 -e DISPLAY_HEIGHT=1080 -v /tmp/.X11-unix:/tmp/.X11-unix jlesage/firefox || echo "Firefox部署失败"
+          
+          echo "===== 配置VNC ====="
+          mkdir -p $VNCDIR && chmod 700 $VNCDIR
+          echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
+          cat > $VNCDIR/xstartup << "EOF"
+#!/bin/bash
+export DISPLAY=:0
+export XDG_RUNTIME_DIR=/tmp/runtime-runner
+mkdir -p $XDG_RUNTIME_DIR && chmod 700 $XDG_RUNTIME_DIR
+exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title "CasaOS服务"
+EOF
+          chmod +x $VNCDIR/xstartup
+          pgrep -x Xvnc && vncserver -kill $DISPLAY || true
+          vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth || echo "VNC启动失败"
+          
+          echo "===== 部署OpenList ====="
+          [ ! -d /home/runner/OpenList ] && git clone https://github.com/thsrite/OpenList.git /home/runner/OpenList || true
+          cd /home/runner/OpenList && [ ! -d venv ] && python3 -m venv venv || true
+          source venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt || true
+          pkill -f "python3 main.py" || true
+          nohup python3 main.py > openlist.log 2>&1 & disown
+          
+          echo "===== 配置Tailscale ====="
+          curl -fsSL https://tailscale.com/install.sh | sudo sh || echo "Tailscale安装失败"
+          sudo systemctl enable --now tailscaled && sleep 3
+          MAX_RETRIES=3
+          while [ $MAX_RETRIES -gt 0 ]; do
+            if sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=casaos-${{ github.run_id }} --accept-routes=false; then
+              TAILSCALE_IP=$(sudo tailscale ip -4)
+              break
+            fi
+            MAX_RETRIES=$((MAX_RETRIES-1)) && sleep 5
+          done
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "===== 应用部署完成 ====="
+
+      - name: 输出服务访问信息
+        id: output_info
+        continue-on-error: false
+        run: |
+          echo -e "\n========================================"
+          echo -e " 🚀 服务启动完成 - 访问信息汇总"
+          echo -e "========================================"
+          echo -e " 🔑 密码信息"
+          echo -e " VNC密码：\033[1;32m${FIXED_VNC_PWD}\033[0m"
+          echo -e " CasaOS账号：\033[1;32madmin\033[0m / 密码：\033[1;32madmin\033[0m"
+          echo -e " \n 🌐 访问地址（Tailscale IP）"
+          echo -e " CasaOS面板：\033[1;34mhttp://${TAILSCALE_IP}:${CASAOS_PORT}\033[0m"
+          echo -e " Firefox浏览器：\033[1;34mhttp://${TAILSCALE_IP}:${FIREFOX_PORT}\033[0m"
+          echo -e " VNC远程：\033[1;34m${TAILSCALE_IP}:${VNC_PORT}\033[0m"
+          echo -e " OpenList网盘：\033[1;34m${TAILSCALE_IP}:${OPENLIST_PORT}\033[0m"
+          echo -e " \n 📦 备份信息"
+          echo -e " 备份存储：对象存储 oss:casaos-backup/"
+          echo -e " 备份策略：1次全量 + 增量备份，保留${KEEP_BACKUP_NUM}份"
+          echo -e "========================================\n"
+
+      - name: 保活+续跑+自动备份核心逻辑
+        id: core_logic
+        continue-on-error: true
+        run: |
+          echo "===== 启动保活+备份监控 ====="
+          start_time=$(date +%s)
+          last_backup_time=$start_time
+
+          full_backup() {
+            echo "===== 创建全量基准备份 ====="
+            BACKUP_NAME=$BACKUP_DIR/$INC_BACKUP_BASE
+            sudo tar -zcf $BACKUP_NAME $BACKUP_EXCLUDE / || { echo "全量备份失败"; return 1; }
+            rclone copy $BACKUP_NAME oss:casaos-backup/ || echo "基准备份上传失败"
+            echo "全量备份完成：$BACKUP_NAME"
+          }
+
+          inc_backup() {
+            echo "===== 创建增量备份 ====="
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            BACKUP_NAME=$BACKUP_DIR/inc_$TIMESTAMP.tar.gz
+            sudo tar -zcf $BACKUP_NAME $BACKUP_EXCLUDE / --listed-incremental=$BACKUP_DIR/backup.snar || { echo "增量备份失败"; return 1; }
+            rclone copy $BACKUP_NAME oss:casaos-backup/ || echo "增量备份上传失败"
+            ls -tp $BACKUP_DIR/inc_*.tar.gz 2>/dev/null | grep -v '/' | tail -n +$((KEEP_BACKUP_NUM)) | xargs -I {} sudo rm -f {} || true
+            rclone delete oss:casaos-backup/ --include "inc_*.tar.gz" --min-age $((KEEP_BACKUP_NUM * 86400)) || true
+            echo "增量备份完成：$BACKUP_NAME"
+          }
+
+          [ ! -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && full_backup || inc_backup
+
+          while true; do
+            current_time=$(date +%s)
+            run_minutes=$(( (current_time - start_time) / 60 ))
+
+            # 续跑触发：剩余10分钟（关键修改：USER_GITHUB_PAT）
+            if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ]; then
+              echo "===== 剩余10分钟，触发续跑 ====="
+              full_backup
+              curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" \
+                -d '{"event_type":"renew_vnc"}' || echo "续跑触发失败"
+            fi
+
+            # 每小时增量备份
+            if [ $((current_time - last_backup_time)) -ge 3600 ]; then
+              inc_backup
+              last_backup_time=$current_time
+            fi
+
+            # 健康检查
+            pgrep -x Xvnc || { echo "VNC异常，重启"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
+            sudo docker inspect -f '{{.State.Running}}' firefox 2>/dev/null | grep true || { echo "Firefox异常，重启"; sudo docker start firefox; }
+            pgrep -f "python3 main.py" || { echo "OpenList异常，重启"; cd /home/runner/OpenList && source venv/bin/activate && nohup python3 main.py > openlist.log 2>&1 & disown; }
+            pgrep -x tailscaled || { echo "Tailscale异常，重启"; sudo systemctl restart tailscaled; }
+
+            echo "[$(date)] 运行时长：${run_minutes}分钟 | Tailscale IP：${TAILSCALE_IP}"
+            sleep 300
+          done
+
+      - name: 优雅清理环境
+        id: clean_env
+        if: always()
+        run: |
+          echo "===== 清理环境 ====="
+          [ -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && rclone copy $BACKUP_DIR/$INC_BACKUP_BASE oss:casaos-backup/ || true
+          vncserver -kill $DISPLAY || true && pkill -9 Xvnc || true
+          pkill -f "python3 main.py" || true
+          sudo docker stop firefox && sudo docker rm firefox || true
+          sudo systemctl stop docker casaos tailscaled || true
+          sudo tailscale down || true
+          rm -rf $BACKUP_DIR $VNCDIR /home/runner/OpenList || true
+          echo "===== 环境清理完成 ====="
