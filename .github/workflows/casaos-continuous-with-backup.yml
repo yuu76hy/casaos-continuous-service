@@ -42,7 +42,6 @@ jobs:
         id: config_rclone
         continue-on-error: false
         env:
-          # 直接填入你的存储密钥（也可改回Secrets，见下方说明）
           OSS_AK: "o57570wv"
           OSS_SK: "5g2m47tkhldphlzz"
           OSS_ENDPOINT: "objectstorageapi.ap-northeast-1.clawcloudrun.com"
@@ -54,22 +53,21 @@ jobs:
           fi
           
           mkdir -p ~/.config/rclone
-          # 核心：添加path_style = true 适配Path-style请求
-          cat > ~/.config/rclone/rclone.conf << EOF
-[oss]
-type = s3
-provider = Other
-endpoint = $OSS_ENDPOINT
-access_key_id = $OSS_AK
-secret_access_key = $OSS_SK
-path_style = true  # 必须开启：适配Path-style请求
-acl = private
-EOF
+          # 修复：改用echo逐行写入，避免EOF语法缩进错误
+          echo "[oss]" > ~/.config/rclone/rclone.conf
+          echo "type = s3" >> ~/.config/rclone/rclone.conf
+          echo "provider = Other" >> ~/.config/rclone/rclone.conf
+          echo "endpoint = $OSS_ENDPOINT" >> ~/.config/rclone/rclone.conf
+          echo "access_key_id = $OSS_AK" >> ~/.config/rclone/rclone.conf
+          echo "secret_access_key = $OSS_SK" >> ~/.config/rclone/rclone.conf
+          echo "path_style = true" >> ~/.config/rclone/rclone.conf
+          echo "acl = private" >> ~/.config/rclone/rclone.conf
+          
           chmod 600 ~/.config/rclone/rclone.conf
           
           echo "===== 测试存储连接 ====="
           # 先创建备份目录（避免目录不存在报错）
-          rclone mkdir oss:casaos-backup/
+          rclone mkdir oss:casaos-backup/ || true
           if rclone lsd oss:casaos-backup/ --verbose; then
             echo "对象存储连接成功（Path-style模式）"
             echo "OSS_CONNECT_STATUS=✅ 成功" >> $GITHUB_ENV
