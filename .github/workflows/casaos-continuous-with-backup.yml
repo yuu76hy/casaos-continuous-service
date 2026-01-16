@@ -1,4 +1,4 @@
-name: CasaOS+VNC+Tailscale 持续服务（国内源修复版）
+name: CasaOS+VNC+Tailscale 持续服务（最终修复版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -33,26 +33,24 @@ jobs:
         run: |
           # 备份原源
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
-          # 写入清华源（国内访问更快）
-          sudo cat > /etc/apt/sources.list << EOF
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
-deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
-deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse
-deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse
-deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse
-deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse
-EOF
-          # 更新源缓存
-          sudo apt update -y || { echo "更新源失败，尝试重试"; sudo apt update -y; }
+          # 改用echo逐行写入，避免EOF语法错误
+          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse" > /etc/apt/sources.list
+          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-updates main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-backports main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse" >> /etc/apt/sources.list
+          sudo echo "deb-src https://mirrors.tuna.tsinghua.edu.cn/ubuntu/ noble-security main restricted universe multiverse" >> /etc/apt/sources.list
+          # 更新源缓存（带重试）
+          sudo apt update -y || { echo "更新源失败，重试一次"; sudo apt update -y; }
 
       - name: 系统环境初始化（带权限兜底）
         id: init_env
         continue-on-error: false
         run: |
           # 强制安装依赖（解决权限/依赖缺失）
-          sudo apt install -y --no-install-recommends --force-yes tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release || { echo "依赖安装失败"; exit 1; }
+          sudo apt install -y --no-install-recommends tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release || { echo "依赖安装失败"; exit 1; }
           # 重置runner用户权限
           sudo chown -R runner:runner /home/runner || true
           # 设置runner密码
@@ -98,12 +96,20 @@ EOF
           echo "deb [arch=$(dpkg --print-architecture)] https://mirrors.aliyun.com/docker-ce/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
           sudo apt update -y && sudo apt install -y --no-install-recommends docker-ce docker-ce-cli containerd.io
           sudo systemctl start docker && sudo systemctl enable docker
-          echo "DOCKER_STATUS=$(if sudo systemctl is-active --quiet docker; then echo "✅ 运行中"; else echo "❌ 未启动"; fi)" >> $GITHUB_ENV
+          if sudo systemctl is-active --quiet docker; then
+            echo "DOCKER_STATUS=✅ 运行中" >> $GITHUB_ENV
+          else
+            echo "DOCKER_STATUS=❌ 未启动" >> $GITHUB_ENV
+          fi
 
           # 安装CasaOS（国内源）
           curl -fsSL https://mirror.ghproxy.com/https://get.casaos.io | sudo bash -s -- --lite || echo "CasaOS安装警告"
           sleep 10 && sudo systemctl start casaos
-          echo "CASAOS_STATUS=$(if sudo systemctl is-active --quiet casaos; then echo "✅ 运行中"; else echo "❌ 未启动"; fi)" >> $GITHUB_ENV
+          if sudo systemctl is-active --quiet casaos; then
+            echo "CASAOS_STATUS=✅ 运行中" >> $GITHUB_ENV
+          else
+            echo "CASAOS_STATUS=❌ 未启动" >> $GITHUB_ENV
+          fi
 
       - name: 配置 VNC + Tailscale
         id: deploy_core
@@ -119,7 +125,11 @@ EOF
           chmod +x $VNCDIR/xstartup
           pgrep -x Xvnc && vncserver -kill $DISPLAY || true
           vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth
-          echo "VNC_STATUS=$(if pgrep -x Xvnc >/dev/null; then echo "✅ 运行中 (端口:$VNC_PORT)"; else echo "❌ 启动失败"; fi)" >> $GITHUB_ENV
+          if pgrep -x Xvnc >/dev/null; then
+            echo "VNC_STATUS=✅ 运行中 (端口:$VNC_PORT)" >> $GITHUB_ENV
+          else
+            echo "VNC_STATUS=❌ 启动失败" >> $GITHUB_ENV
+          fi
 
           # 配置Tailscale
           curl -fsSL https://mirror.ghproxy.com/https://tailscale.com/install.sh | sudo sh || true
@@ -135,7 +145,9 @@ EOF
             MAX_RETRIES=$((MAX_RETRIES-1))
             sleep 5
           done
-          [ $MAX_RETRIES -eq 0 ] && echo "TAILSCALE_STATUS=❌ 启动失败（密钥可能无效）" >> $GITHUB_ENV
+          if [ $MAX_RETRIES -eq 0 ]; then
+            echo "TAILSCALE_STATUS=❌ 启动失败（密钥可能无效）" >> $GITHUB_ENV
+          fi
 
       - name: 输出详细状态
         id: output_info
