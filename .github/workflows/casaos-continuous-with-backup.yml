@@ -1,4 +1,4 @@
-name: CasaOS+VNC+Tailscale 持续服务（对象存储备份版）
+name: CasaOS+VNC+Tailscale 持续服务（内存备份+定时清理版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -19,9 +19,10 @@ jobs:
       BACKUP_DIR: /home/runner/backup
       INC_BACKUP_BASE: "casaos_base.tar.gz"
       KEEP_BACKUP_NUM: 2
-      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run"
-      # 新增 runner 用户密码配置
+      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
       RUNNER_PASSWORD: "runner123"
+      # 垃圾清理间隔（3600秒=1小时）
+      CLEAN_INTERVAL: 3600
     steps:
       - name: 系统环境初始化与依赖更新
         id: init_env
@@ -32,7 +33,7 @@ jobs:
           sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "系统升级失败"; exit 1; }
           sudo apt install -y tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release || { echo "依赖安装失败"; exit 1; }
           
-          # 核心修改：为 runner 用户设置密码
+          # 为 runner 用户设置密码
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
           echo "===== runner 用户密码已设置 ====="
           
@@ -48,9 +49,9 @@ jobs:
           OSS_CONFIG: ${{ secrets.OSS_CONFIG }}
         run: |
           echo "===== 配置对象存储 ====="
-          export OSS_ENDPOINT=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
-          export OSS_AK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
-          export OSS_SK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
+          export OSS_ENDPOINT=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
+          export OSS_AK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
+          export OSS_SK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
           
           mkdir -p ~/.config/rclone
           echo "[oss]" > ~/.config/rclone/rclone.conf
@@ -61,31 +62,22 @@ jobs:
           echo "secret_access_key = $OSS_SK" >> ~/.config/rclone/rclone.conf
           
           chmod 600 ~/.config/rclone/rclone.conf
-          if rclone lsd oss:; then
+          if rclone lsd oss:casaos-backup/; then
             echo "对象存储连接成功"
+            echo "OSS_CONNECT_STATUS=✅ 成功" >> $GITHUB_ENV
           else
             echo "对象存储连接失败"; exit 1;
           fi
           echo "===== 对象存储配置完成 ====="
 
-      - name: 恢复历史备份（基准+增量）
-        id: restore_backup
+      - name: 恢复增量备份索引（仅索引，无数据）
+        id: restore_backup_index
         continue-on-error: true
         run: |
-          echo "===== 恢复历史备份 ====="
-          rclone copy oss:casaos-backup/ $BACKUP_DIR/ || { echo "无历史备份，跳过恢复"; exit 0; }
-          if [ -f "$BACKUP_DIR/$INC_BACKUP_BASE" ]; then
-            echo "恢复基准备份..."
-            sudo tar -zxf $BACKUP_DIR/$INC_BACKUP_BASE -C / --preserve-permissions || echo "基准备份恢复失败"
-            LATEST_INC=$(ls -tp $BACKUP_DIR/inc_*.tar.gz 2>/dev/null | grep -v '/' | head -n1)
-            if [ -n "$LATEST_INC" ]; then
-              echo "恢复增量备份：$LATEST_INC"
-              sudo tar -zxf $LATEST_INC -C / --preserve-permissions || echo "增量备份恢复失败"
-            fi
-          else
-            echo "无基准备份，将创建新基准"
-          fi
-          echo "===== 备份恢复完成 ====="
+          echo "===== 恢复增量备份索引 ====="
+          rclone copy oss:casaos-backup/backup.snar $BACKUP_DIR/ || { echo "无历史增量索引，跳过恢复"; exit 0; }
+          rclone copy oss:casaos-backup/current_full_backup.txt $BACKUP_DIR/ || true
+          echo "增量备份索引恢复完成"
 
       - name: 安装 Docker + CasaOS
         id: install_services
@@ -134,58 +126,110 @@ jobs:
           echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
           echo "===== 核心服务部署完成 ====="
 
-      - name: 输出服务访问信息
+      - name: 输出详细服务状态信息
         id: output_info
         continue-on-error: false
         run: |
           echo -e "\n========================================"
-          echo -e " 🚀 服务启动完成 - 访问信息汇总"
+          echo -e " 🚀 服务部署完成 - 详细状态汇总"
           echo -e "========================================"
-          echo -e " 🔑 密码信息"
-          echo -e " VNC密码：\033[1;32m${FIXED_VNC_PWD}\033[0m"
-          echo -e " runner 用户密码：\033[1;32m${RUNNER_PASSWORD}\033[0m"
-          echo -e " CasaOS账号：\033[1;32madmin\033[0m / 密码：\033[1;32madmin\033[0m"
-          echo -e " \n 🌐 访问地址（Tailscale IP）"
-          echo -e " CasaOS面板：\033[1;34mhttp://${TAILSCALE_IP}:${CASAOS_PORT}\033[0m"
-          echo -e " VNC远程：\033[1;34m${TAILSCALE_IP}:${VNC_PORT}\033[0m"
-          echo -e " \n 📦 备份信息"
-          echo -e " 备份存储：对象存储 oss:casaos-backup/"
-          echo -e " 备份策略：1次全量 + 增量备份，保留${KEEP_BACKUP_NUM}份"
+          echo -e " 🖥️  系统信息 | 可用空间: $(df -h / | awk 'NR==2{print $4}')"
+          echo -e "   - runner密码: \033[1;32m${RUNNER_PASSWORD}\033[0m"
+          echo -e " 📦 对象存储 | 状态: ${OSS_CONNECT_STATUS}"
+          echo -e " 🔗 访问地址 | VNC: ${TAILSCALE_IP:-未获取}:${VNC_PORT} | CasaOS: http://${TAILSCALE_IP:-未获取}:${CASAOS_PORT}"
+          echo -e " 📋 备份策略 | 全量+增量（内存直传，不落地）"
+          echo -e " 🧹 清理策略 | 每1小时自动扫描并清除垃圾数据"
           echo -e "========================================\n"
 
-      - name: 保活+续跑+自动备份核心逻辑
+      - name: 保活+续跑+内存直传备份+定时清理核心逻辑
         id: core_logic
         continue-on-error: true
         run: |
-          echo "===== 启动保活+备份监控 ====="
+          echo "===== 启动保活+备份+定时清理监控 ====="
           start_time=$(date +%s)
           last_backup_time=$start_time
+          last_clean_time=$start_time  # 记录上次清理时间
 
+          # 全量备份：内存直传
           full_backup() {
-            echo "===== 创建全量基准备份 ====="
-            BACKUP_NAME=$BACKUP_DIR/$INC_BACKUP_BASE
-            sudo tar -zcf $BACKUP_NAME $BACKUP_EXCLUDE / || { echo "全量备份失败"; return 1; }
-            rclone copy $BACKUP_NAME oss:casaos-backup/ || echo "基准备份上传失败"
-            echo "全量备份完成：$BACKUP_NAME"
-          }
-
-          inc_backup() {
-            echo "===== 创建增量备份 ====="
+            echo "===== 内存直传 - 创建全量备份 ====="
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            BACKUP_NAME=$BACKUP_DIR/inc_$TIMESTAMP.tar.gz
-            sudo tar -zcf $BACKUP_NAME $BACKUP_EXCLUDE / --listed-incremental=$BACKUP_DIR/backup.snar || { echo "增量备份失败"; return 1; }
-            rclone copy $BACKUP_NAME oss:casaos-backup/ || echo "增量备份上传失败"
-            ls -tp $BACKUP_DIR/inc_*.tar.gz 2>/dev/null | grep -v '/' | tail -n +$((KEEP_BACKUP_NUM)) | xargs -I {} sudo rm -f {} || true
-            rclone delete oss:casaos-backup/ --include "inc_*.tar.gz" --min-age $((KEEP_BACKUP_NUM * 86400)) || true
-            echo "增量备份完成：$BACKUP_NAME"
+            FULL_BACKUP_NAME="casaos_full_${TIMESTAMP}.tar.gz"
+            sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat oss:casaos-backup/${FULL_BACKUP_NAME}
+            if [ $? -eq 0 ]; then
+              echo "全量备份内存直传成功：oss:casaos-backup/${FULL_BACKUP_NAME}"
+              echo "${FULL_BACKUP_NAME}" > $BACKUP_DIR/current_full_backup.txt
+              rclone copy $BACKUP_DIR/current_full_backup.txt oss:casaos-backup/
+            else
+              echo "全量备份直传失败"
+            fi
           }
 
-          [ ! -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && full_backup || inc_backup
+          # 增量备份：内存直传
+          inc_backup() {
+            echo "===== 内存直传 - 创建增量备份 ====="
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            INC_BACKUP_NAME="casaos_inc_${TIMESTAMP}.tar.gz"
+            sudo tar -zcf - $BACKUP_EXCLUDE / --listed-incremental=$BACKUP_DIR/backup.snar --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat oss:casaos-backup/${INC_BACKUP_NAME}
+            if [ $? -eq 0 ]; then
+              echo "增量备份内存直传成功：oss:casaos-backup/${INC_BACKUP_NAME}"
+              rclone copy $BACKUP_DIR/backup.snar oss:casaos-backup/
+              rclone ls oss:casaos-backup/ --include "casaos_inc_*.tar.gz" | sort -k2 | head -n -${KEEP_BACKUP_NUM} | awk '{print $2}' | xargs -I {} rclone delete oss:casaos-backup/{}
+            else
+              echo "增量备份直传失败"
+            fi
+          }
+
+          # 核心垃圾清理函数（多维度清理）
+          auto_clean() {
+            echo "===== 开始每小时垃圾清理 ====="
+            BEFORE_CLEAN=$(df -h / | awk 'NR==2{print $4}')
+            
+            # 1. 清理系统APT缓存（最大垃圾来源）
+            sudo apt clean -y
+            sudo apt autoremove -y --purge
+            
+            # 2. 清理Docker冗余（镜像、容器、卷、网络）
+            sudo docker system prune -af --volumes 2>/dev/null || true
+            
+            # 3. 清理临时文件目录
+            sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null
+            sudo rm -rf /home/runner/.cache/* 2>/dev/null
+            
+            # 4. 清理GitHub Actions日志和缓存
+            sudo rm -rf /home/runner/actions-runner/cached/_diag/* 2>/dev/null
+            sudo rm -rf /home/runner/actions-runner/_work/_temp/* 2>/dev/null
+            
+            # 5. 清理VNC临时文件
+            sudo rm -rf /tmp/runtime-runner/* 2>/dev/null
+            
+            AFTER_CLEAN=$(df -h / | awk 'NR==2{print $4}')
+            echo "===== 垃圾清理完成 ====="
+            echo "清理前可用空间：${BEFORE_CLEAN} | 清理后可用空间：${AFTER_CLEAN}"
+          }
+
+          # 初始化备份
+          [ ! -f "$BACKUP_DIR/current_full_backup.txt" ] && full_backup || inc_backup
 
           while true; do
             current_time=$(date +%s)
             run_minutes=$(( (current_time - start_time) / 60 ))
+            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
+            
+            # 1. 每小时执行一次垃圾清理
+            if [ $((current_time - last_clean_time)) -ge $CLEAN_INTERVAL ]; then
+              auto_clean
+              last_clean_time=$current_time
+            fi
 
+            # 2. 空间应急清理（不足1GB时立即清理）
+            if (( $(echo "$FREE_SPACE < 1" | bc -l) )); then
+              echo "⚠️  空间不足1GB，紧急清理..."
+              auto_clean
+              last_clean_time=$current_time
+            fi
+
+            # 3. 剩余10分钟触发续跑
             if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ]; then
               echo "===== 剩余10分钟，触发续跑 ====="
               full_backup
@@ -195,17 +239,19 @@ jobs:
                 -d '{"event_type":"renew_vnc"}' || echo "续跑触发失败"
             fi
 
+            # 4. 每小时增量备份
             if [ $((current_time - last_backup_time)) -ge 3600 ]; then
               inc_backup
               last_backup_time=$current_time
             fi
 
-            # 健康检查：仅保留 VNC、Docker、Tailscale
+            # 5. 服务健康检查
             pgrep -x Xvnc || { echo "VNC异常，重启"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
-            pgrep -x dockerd || { echo "Docker异常，重启"; sudo systemctl restart docker; }
-            pgrep -x tailscaled || { echo "Tailscale异常，重启"; sudo systemctl restart tailscaled; }
+            sudo systemctl is-active --quiet docker || { echo "Docker异常，重启"; sudo systemctl restart docker; }
+            sudo systemctl is-active --quiet casaos || { echo "CasaOS异常，重启"; sudo systemctl restart casaos; }
+            sudo systemctl is-active --quiet tailscaled || { echo "Tailscale异常，重启"; sudo systemctl restart tailscaled; }
 
-            echo "[$(date)] 运行时长：${run_minutes}分钟 | Tailscale IP：${TAILSCALE_IP}"
+            echo "[$(date)] 运行${run_minutes}分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}') | 下次清理：$(( (last_clean_time + CLEAN_INTERVAL - current_time) / 60 ))分钟后"
             sleep 300
           done
 
@@ -214,7 +260,6 @@ jobs:
         if: always()
         run: |
           echo "===== 清理环境 ====="
-          [ -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && rclone copy $BACKUP_DIR/$INC_BACKUP_BASE oss:casaos-backup/ || true
           vncserver -kill $DISPLAY || true && pkill -9 Xvnc || true
           sudo systemctl stop docker casaos tailscaled || true
           sudo tailscale down || true
