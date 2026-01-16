@@ -48,7 +48,8 @@ jobs:
             export OSS_${key^^}=$value
           done
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
+          # 修复YAML语法：用EOF包裹配置块，避免换行/缩进问题
+          cat > ~/.config/rclone/rclone.conf << 'EOF'
 [oss]
 type = s3
 provider = Other
@@ -116,7 +117,8 @@ EOF
           echo "===== 配置VNC ====="
           mkdir -p $VNCDIR && chmod 700 $VNCDIR
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
-          cat > $VNCDIR/xstartup << "EOF"
+          # 修复YAML语法：EOF加单引号避免变量解析
+          cat > $VNCDIR/xstartup << 'EOF'
 #!/bin/bash
 export DISPLAY=:0
 export XDG_RUNTIME_DIR=/tmp/runtime-runner
@@ -201,7 +203,7 @@ EOF
             current_time=$(date +%s)
             run_minutes=$(( (current_time - start_time) / 60 ))
 
-            # 续跑触发：剩余10分钟（关键修改：USER_GITHUB_PAT）
+            # 续跑触发：剩余10分钟
             if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ]; then
               echo "===== 剩余10分钟，触发续跑 ====="
               full_backup
