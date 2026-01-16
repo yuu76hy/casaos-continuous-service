@@ -1,4 +1,4 @@
-name: CasaOS+VNC+Tailscale 持续服务（内存备份+定时清理版）
+name: CasaOS+VNC+Tailscale 持续服务（适配Path-style存储版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -21,7 +21,6 @@ jobs:
       KEEP_BACKUP_NUM: 2
       BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
       RUNNER_PASSWORD: "runner123"
-      # 垃圾清理间隔（3600秒=1小时）
       CLEAN_INTERVAL: 3600
     steps:
       - name: 系统环境初始化与依赖更新
@@ -33,40 +32,52 @@ jobs:
           sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "系统升级失败"; exit 1; }
           sudo apt install -y tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release || { echo "依赖安装失败"; exit 1; }
           
-          # 为 runner 用户设置密码
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
-          echo "===== runner 用户密码已设置 ====="
-          
           sudo mkdir -p $BACKUP_DIR $NETDISK_ROOT
           sudo chown -R runner:runner $BACKUP_DIR $NETDISK_ROOT
           sudo chmod -R 755 $BACKUP_DIR $NETDISK_ROOT
           echo "===== 环境初始化完成 ====="
 
-      - name: 配置对象存储（rclone）
+      - name: 配置对象存储（rclone）【适配Path-style】
         id: config_rclone
         continue-on-error: false
         env:
-          OSS_CONFIG: ${{ secrets.OSS_CONFIG }}
+          # 直接填入你的存储密钥（也可改回Secrets，见下方说明）
+          OSS_AK: "o57570wv"
+          OSS_SK: "5g2m47tkhldphlzz"
+          OSS_ENDPOINT: "objectstorageapi.ap-northeast-1.clawcloudrun.com"
         run: |
-          echo "===== 配置对象存储 ====="
-          export OSS_ENDPOINT=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
-          export OSS_AK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
-          export OSS_SK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
+          echo "===== 配置Path-style对象存储 ====="
+          # 验证参数是否为空
+          if [ -z "$OSS_AK" ] || [ -z "$OSS_SK" ] || [ -z "$OSS_ENDPOINT" ]; then
+            echo "错误：存储密钥/地址未配置"; exit 1;
+          fi
           
           mkdir -p ~/.config/rclone
-          echo "[oss]" > ~/.config/rclone/rclone.conf
-          echo "type = s3" >> ~/.config/rclone/rclone.conf
-          echo "provider = Other" >> ~/.config/rclone/rclone.conf
-          echo "endpoint = $OSS_ENDPOINT" >> ~/.config/rclone/rclone.conf
-          echo "access_key_id = $OSS_AK" >> ~/.config/rclone/rclone.conf
-          echo "secret_access_key = $OSS_SK" >> ~/.config/rclone/rclone.conf
-          
+          # 核心：添加path_style = true 适配Path-style请求
+          cat > ~/.config/rclone/rclone.conf << EOF
+[oss]
+type = s3
+provider = Other
+endpoint = $OSS_ENDPOINT
+access_key_id = $OSS_AK
+secret_access_key = $OSS_SK
+path_style = true  # 必须开启：适配Path-style请求
+acl = private
+EOF
           chmod 600 ~/.config/rclone/rclone.conf
-          if rclone lsd oss:casaos-backup/; then
-            echo "对象存储连接成功"
+          
+          echo "===== 测试存储连接 ====="
+          # 先创建备份目录（避免目录不存在报错）
+          rclone mkdir oss:casaos-backup/
+          if rclone lsd oss:casaos-backup/ --verbose; then
+            echo "对象存储连接成功（Path-style模式）"
             echo "OSS_CONNECT_STATUS=✅ 成功" >> $GITHUB_ENV
           else
-            echo "对象存储连接失败"; exit 1;
+            echo "错误：存储连接失败，请检查："
+            echo "1. 公网地址：$OSS_ENDPOINT 是否可访问"
+            echo "2. AK/SK 是否正确"
+            exit 1
           fi
           echo "===== 对象存储配置完成 ====="
 
@@ -135,7 +146,7 @@ jobs:
           echo -e "========================================"
           echo -e " 🖥️  系统信息 | 可用空间: $(df -h / | awk 'NR==2{print $4}')"
           echo -e "   - runner密码: \033[1;32m${RUNNER_PASSWORD}\033[0m"
-          echo -e " 📦 对象存储 | 状态: ${OSS_CONNECT_STATUS}"
+          echo -e " 📦 对象存储 | 状态: ${OSS_CONNECT_STATUS}（Path-style模式）"
           echo -e " 🔗 访问地址 | VNC: ${TAILSCALE_IP:-未获取}:${VNC_PORT} | CasaOS: http://${TAILSCALE_IP:-未获取}:${CASAOS_PORT}"
           echo -e " 📋 备份策略 | 全量+增量（内存直传，不落地）"
           echo -e " 🧹 清理策略 | 每1小时自动扫描并清除垃圾数据"
@@ -148,9 +159,8 @@ jobs:
           echo "===== 启动保活+备份+定时清理监控 ====="
           start_time=$(date +%s)
           last_backup_time=$start_time
-          last_clean_time=$start_time  # 记录上次清理时间
+          last_clean_time=$start_time
 
-          # 全量备份：内存直传
           full_backup() {
             echo "===== 内存直传 - 创建全量备份 ====="
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -165,7 +175,6 @@ jobs:
             fi
           }
 
-          # 增量备份：内存直传
           inc_backup() {
             echo "===== 内存直传 - 创建增量备份 ====="
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -180,35 +189,22 @@ jobs:
             fi
           }
 
-          # 核心垃圾清理函数（多维度清理）
           auto_clean() {
             echo "===== 开始每小时垃圾清理 ====="
             BEFORE_CLEAN=$(df -h / | awk 'NR==2{print $4}')
-            
-            # 1. 清理系统APT缓存（最大垃圾来源）
             sudo apt clean -y
             sudo apt autoremove -y --purge
-            
-            # 2. 清理Docker冗余（镜像、容器、卷、网络）
             sudo docker system prune -af --volumes 2>/dev/null || true
-            
-            # 3. 清理临时文件目录
             sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null
             sudo rm -rf /home/runner/.cache/* 2>/dev/null
-            
-            # 4. 清理GitHub Actions日志和缓存
             sudo rm -rf /home/runner/actions-runner/cached/_diag/* 2>/dev/null
             sudo rm -rf /home/runner/actions-runner/_work/_temp/* 2>/dev/null
-            
-            # 5. 清理VNC临时文件
             sudo rm -rf /tmp/runtime-runner/* 2>/dev/null
-            
             AFTER_CLEAN=$(df -h / | awk 'NR==2{print $4}')
             echo "===== 垃圾清理完成 ====="
             echo "清理前可用空间：${BEFORE_CLEAN} | 清理后可用空间：${AFTER_CLEAN}"
           }
 
-          # 初始化备份
           [ ! -f "$BACKUP_DIR/current_full_backup.txt" ] && full_backup || inc_backup
 
           while true; do
@@ -216,20 +212,17 @@ jobs:
             run_minutes=$(( (current_time - start_time) / 60 ))
             FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
             
-            # 1. 每小时执行一次垃圾清理
             if [ $((current_time - last_clean_time)) -ge $CLEAN_INTERVAL ]; then
               auto_clean
               last_clean_time=$current_time
             fi
 
-            # 2. 空间应急清理（不足1GB时立即清理）
             if (( $(echo "$FREE_SPACE < 1" | bc -l) )); then
               echo "⚠️  空间不足1GB，紧急清理..."
               auto_clean
               last_clean_time=$current_time
             fi
 
-            # 3. 剩余10分钟触发续跑
             if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ]; then
               echo "===== 剩余10分钟，触发续跑 ====="
               full_backup
@@ -239,13 +232,11 @@ jobs:
                 -d '{"event_type":"renew_vnc"}' || echo "续跑触发失败"
             fi
 
-            # 4. 每小时增量备份
             if [ $((current_time - last_backup_time)) -ge 3600 ]; then
               inc_backup
               last_backup_time=$current_time
             fi
 
-            # 5. 服务健康检查
             pgrep -x Xvnc || { echo "VNC异常，重启"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
             sudo systemctl is-active --quiet docker || { echo "Docker异常，重启"; sudo systemctl restart docker; }
             sudo systemctl is-active --quiet casaos || { echo "CasaOS异常，重启"; sudo systemctl restart casaos; }
