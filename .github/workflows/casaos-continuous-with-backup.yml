@@ -17,21 +17,28 @@ jobs:
       OPENLIST_PORT: 3000
       CASAOS_PORT: 80
       FIREFOX_PORT: 6080
-      NETDISK_ROOT: /mnt/netdisk
+      # 核心修复：改用runner有权限的目录，替换/mnt/netdisk
+      NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       INC_BACKUP_BASE: "casaos_base.tar.gz"
       KEEP_BACKUP_NUM: 2
-      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/mnt --exclude=/run --exclude=/var/run"
+      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run"
     steps:
       - name: 系统环境初始化与依赖更新
         id: init_env
         continue-on-error: false
         run: |
           echo "===== 初始化系统环境 ====="
-          sudo apt update -y || { echo "系统更新失败"; exit 1; }
-          sudo apt upgrade -y || { echo "系统升级失败"; exit 1; }
+          # 屏蔽系统更新后的服务重启提示
+          sudo apt update -y 2>&1 | grep -v "restart" || { echo "系统更新失败"; exit 1; }
+          sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "系统升级失败"; exit 1; }
           sudo apt install -y tar gzip rsync rclone || { echo "备份依赖安装失败"; exit 1; }
-          mkdir -p $BACKUP_DIR $NETDISK_ROOT
+          
+          # 修复权限问题：用sudo创建目录并赋予runner用户所有权
+          sudo mkdir -p $BACKUP_DIR $NETDISK_ROOT
+          sudo chown -R runner:runner $BACKUP_DIR $NETDISK_ROOT
+          sudo chmod -R 755 $BACKUP_DIR $NETDISK_ROOT
+          
           echo "===== 环境初始化完成 ====="
 
       - name: 配置对象存储（rclone）
@@ -93,15 +100,15 @@ jobs:
             "sendmail" "mailutils" "openssh-client" "wget" "vim" "nano" "python3" "python3-pip" "python3-venv" "ca-certificates" "gnupg" "lsb-release"
           )
           for dep in "${DEPS[@]}"; do
-            sudo apt install -y "$dep" || echo "警告：$dep 安装失败"
+            sudo apt install -y "$dep" 2>&1 | grep -v "restart" || echo "警告：$dep 安装失败"
           done
           # 安装Docker
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
           echo "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-          sudo apt update -y && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          sudo apt update -y 2>&1 | grep -v "restart" && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
           sudo systemctl start docker && sudo systemctl enable docker
           # 安装CasaOS
-          curl -fsSL https://get.casaos.io | sudo bash || echo "警告：CasaOS安装失败"
+          curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || echo "警告：CasaOS安装失败"
           sleep 10 && sudo systemctl start casaos || echo "CasaOS启动失败"
           echo "===== 服务依赖安装完成 ====="
 
@@ -134,7 +141,7 @@ jobs:
           nohup python3 main.py > openlist.log 2>&1 & disown
           
           echo "===== 配置Tailscale ====="
-          curl -fsSL https://tailscale.com/install.sh | sudo sh || echo "Tailscale安装失败"
+          curl -fsSL https://tailscale.com/install.sh | sudo sh 2>&1 | grep -v "restart" || echo "Tailscale安装失败"
           sudo systemctl enable --now tailscaled && sleep 3
           MAX_RETRIES=3
           while [ $MAX_RETRIES -gt 0 ]; do
@@ -237,5 +244,5 @@ jobs:
           sudo docker stop firefox && sudo docker rm firefox || true
           sudo systemctl stop docker casaos tailscaled || true
           sudo tailscale down || true
-          rm -rf $BACKUP_DIR $VNCDIR /home/runner/OpenList || true
+          rm -rf $BACKUP_DIR $VNCDIR /home/runner/OpenList $NETDISK_ROOT || true
           echo "===== 环境清理完成 ====="
