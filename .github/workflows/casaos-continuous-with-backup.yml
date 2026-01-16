@@ -41,23 +41,22 @@ jobs:
           OSS_CONFIG: ${{ secrets.OSS_CONFIG }}
         run: |
           echo "===== 配置对象存储 ====="
-          IFS=';' read -r -a oss_arr <<< "$OSS_CONFIG"
-          for item in "${oss_arr[@]}"; do
-            key=$(echo $item | cut -d ':' -f1)
-            value=$(echo $item | cut -d ':' -f2-)
-            export OSS_${key^^}=$value
-          done
+          # 拆分OSS配置（改用更稳定的写法，避免IFS分割问题）
+          export OSS_ENDPOINT=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
+          export OSS_AK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
+          export OSS_SK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
+          
+          # 关键修复：用echo逐行写入配置文件，彻底避免EOF解析冲突
           mkdir -p ~/.config/rclone
-          # 修复YAML语法：用EOF包裹配置块，避免换行/缩进问题
-          cat > ~/.config/rclone/rclone.conf << 'EOF'
-[oss]
-type = s3
-provider = Other
-endpoint = $OSS_ENDPOINT
-access_key_id = $OSS_AK
-secret_access_key = $OSS_SK
-EOF
+          echo "[oss]" > ~/.config/rclone/rclone.conf
+          echo "type = s3" >> ~/.config/rclone/rclone.conf
+          echo "provider = Other" >> ~/.config/rclone/rclone.conf
+          echo "endpoint = $OSS_ENDPOINT" >> ~/.config/rclone/rclone.conf
+          echo "access_key_id = $OSS_AK" >> ~/.config/rclone/rclone.conf
+          echo "secret_access_key = $OSS_SK" >> ~/.config/rclone/rclone.conf
+          
           chmod 600 ~/.config/rclone/rclone.conf
+          # 测试对象存储连接
           if rclone lsd oss:; then
             echo "对象存储连接成功"
           else
@@ -117,14 +116,12 @@ EOF
           echo "===== 配置VNC ====="
           mkdir -p $VNCDIR && chmod 700 $VNCDIR
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
-          # 修复YAML语法：EOF加单引号避免变量解析
-          cat > $VNCDIR/xstartup << 'EOF'
-#!/bin/bash
-export DISPLAY=:0
-export XDG_RUNTIME_DIR=/tmp/runtime-runner
-mkdir -p $XDG_RUNTIME_DIR && chmod 700 $XDG_RUNTIME_DIR
-exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title "CasaOS服务"
-EOF
+          # 同样用echo逐行写入，避免EOF问题
+          echo "#!/bin/bash" > $VNCDIR/xstartup
+          echo "export DISPLAY=:0" >> $VNCDIR/xstartup
+          echo "export XDG_RUNTIME_DIR=/tmp/runtime-runner" >> $VNCDIR/xstartup
+          echo "mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR" >> $VNCDIR/xstartup
+          echo "exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title \"CasaOS服务\"" >> $VNCDIR/xstartup
           chmod +x $VNCDIR/xstartup
           pgrep -x Xvnc && vncserver -kill $DISPLAY || true
           vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth || echo "VNC启动失败"
