@@ -25,13 +25,13 @@ jobs:
         id: clean_disk_light
         run: |
           echo "===== 初始可用空间 ====="
-          df -h /
+          df -h / || true
           # 只删除 GitHub Actions 旧日志和临时文件（最大的冗余项）
           sudo rm -rf /home/runner/actions-runner/cached/_diag/* || true
           sudo rm -rf /home/runner/actions-runner/_work/_temp/* || true
           # 不删系统apt缓存，保留基础依赖
           echo "===== 轻量清理后可用空间 ====="
-          df -h /
+          df -h / || true
 
       - name: 系统环境初始化
         id: init_env
@@ -54,19 +54,21 @@ jobs:
         env:
           OSS_CONFIG: ${{ secrets.OSS_CONFIG }}
         run: |
-          export OSS_ENDPOINT=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
-          export OSS_AK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
-          export OSS_SK=$(echo $OSS_CONFIG | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
+          # 解析OSS配置（容错处理）
+          export OSS_ENDPOINT=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /endpoint:/){gsub("endpoint:","",$i);print $i}}}')
+          export OSS_AK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /ak:/){gsub("ak:","",$i);print $i}}}')
+          export OSS_SK=$(echo "$OSS_CONFIG" | awk -F';' '{for(i=1;i<=NF;i++){if($i ~ /sk:/){gsub("sk:","",$i);print $i}}}')
           
+          # 创建rclone配置文件（修复YAML多行文本语法）
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
-[oss]
-type = s3
-provider = Other
-endpoint = $OSS_ENDPOINT
-access_key_id = $OSS_AK
-secret_access_key = $OSS_SK
-EOF
+          # 改用echo写入，避免EOF多行格式错误
+          echo "[oss]" > ~/.config/rclone/rclone.conf
+          echo "type = s3" >> ~/.config/rclone/rclone.conf
+          echo "provider = Other" >> ~/.config/rclone/rclone.conf
+          echo "endpoint = $OSS_ENDPOINT" >> ~/.config/rclone/rclone.conf
+          echo "access_key_id = $OSS_AK" >> ~/.config/rclone/rclone.conf
+          echo "secret_access_key = $OSS_SK" >> ~/.config/rclone/rclone.conf
+          
           chmod 600 ~/.config/rclone/rclone.conf
           # 检测连接
           if rclone lsd oss:; then
@@ -86,12 +88,21 @@ EOF
           sudo apt update -y && sudo apt install -y --no-install-recommends docker-ce docker-ce-cli containerd.io
           sudo systemctl start docker && sudo systemctl enable docker
           # 检测Docker状态
-          echo "DOCKER_STATUS=$(if sudo systemctl is-active --quiet docker; then echo "✅ 运行中"; else echo "❌ 未启动"; fi)" >> $GITHUB_ENV
+          if sudo systemctl is-active --quiet docker; then
+            echo "DOCKER_STATUS=✅ 运行中" >> $GITHUB_ENV
+          else
+            echo "DOCKER_STATUS=❌ 未启动" >> $GITHUB_ENV
+          fi
 
           # 安装CasaOS（跳过冗余依赖）
           curl -fsSL https://get.casaos.io | sudo bash -s -- --lite || echo "CasaOS安装警告"
           sleep 10 && sudo systemctl start casaos
-          echo "CASAOS_STATUS=$(if sudo systemctl is-active --quiet casaos; then echo "✅ 运行中"; else echo "❌ 未启动"; fi)" >> $GITHUB_ENV
+          # 检测CasaOS状态
+          if sudo systemctl is-active --quiet casaos; then
+            echo "CASAOS_STATUS=✅ 运行中" >> $GITHUB_ENV
+          else
+            echo "CASAOS_STATUS=❌ 未启动" >> $GITHUB_ENV
+          fi
 
       - name: 配置 VNC + Tailscale
         id: deploy_core
@@ -99,17 +110,22 @@ EOF
           # 配置VNC
           mkdir -p $VNCDIR && chmod 700 $VNCDIR
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
-          cat > $VNCDIR/xstartup << EOF
-#!/bin/bash
-export DISPLAY=:0
-export XDG_RUNTIME_DIR=/tmp/runtime-runner
-mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
-exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title "CasaOS服务"
-EOF
+          # 写入VNC启动脚本（改用echo避免EOF语法错误）
+          echo "#!/bin/bash" > $VNCDIR/xstartup
+          echo "export DISPLAY=:0" >> $VNCDIR/xstartup
+          echo "export XDG_RUNTIME_DIR=/tmp/runtime-runner" >> $VNCDIR/xstartup
+          echo "mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR" >> $VNCDIR/xstartup
+          echo "exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title \"CasaOS服务\"" >> $VNCDIR/xstartup
           chmod +x $VNCDIR/xstartup
+          
           pgrep -x Xvnc && vncserver -kill $DISPLAY || true
           vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth
-          echo "VNC_STATUS=$(if pgrep -x Xvnc >/dev/null; then echo "✅ 运行中 (端口:$VNC_PORT)"; else echo "❌ 启动失败"; fi)" >> $GITHUB_ENV
+          # 检测VNC状态
+          if pgrep -x Xvnc >/dev/null; then
+            echo "VNC_STATUS=✅ 运行中 (端口:$VNC_PORT)" >> $GITHUB_ENV
+          else
+            echo "VNC_STATUS=❌ 启动失败" >> $GITHUB_ENV
+          fi
 
           # 配置Tailscale
           curl -fsSL https://tailscale.com/install.sh | sudo sh || true
@@ -125,7 +141,9 @@ EOF
             MAX_RETRIES=$((MAX_RETRIES-1))
             sleep 5
           done
-          [ $MAX_RETRIES -eq 0 ] && echo "TAILSCALE_STATUS=❌ 启动失败（密钥可能无效）" >> $GITHUB_ENV
+          if [ $MAX_RETRIES -eq 0 ]; then
+            echo "TAILSCALE_STATUS=❌ 启动失败（密钥可能无效）" >> $GITHUB_ENV
+          fi
 
       - name: 输出详细状态
         id: output_info
@@ -163,11 +181,19 @@ EOF
             fi
           }
 
-          [ ! -f "$BACKUP_DIR/$INC_BACKUP_BASE" ] && full_backup || inc_backup
+          # 初始备份
+          if [ ! -f "$BACKUP_DIR/$INC_BACKUP_BASE" ]; then
+            full_backup
+          else
+            inc_backup
+          fi
 
+          # 主循环
           while true; do
-            run_minutes=$(( (date +%s - start_time) / 60 ))
-            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[G|M]//g')
+            current_time=$(date +%s)
+            run_minutes=$(( (current_time - start_time) / 60 ))
+            # 获取可用空间（数字部分）
+            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
             
             # 只在空间不足2GB时才清理
             if (( $(echo "$FREE_SPACE < 2" | bc -l) )); then
@@ -178,18 +204,43 @@ EOF
             fi
 
             # 剩余10分钟触发续跑
-            [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ] && full_backup && curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" -d '{"event_type":"renew_vnc"}' || true
-            
-            # 每2小时增量备份
-            [ $((date +%s - last_backup_time)) -ge 7200 ] && inc_backup && last_backup_time=$(date +%s)
-            
-            # 服务健康检查
-            pgrep -x Xvnc || vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth
-            sudo systemctl is-active --quiet docker || sudo systemctl restart docker
-            sudo systemctl is-active --quiet casaos || sudo systemctl restart casaos
-            sudo systemctl is-active --quiet tailscaled || sudo systemctl restart tailscaled
+            if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ]; then
+              echo "===== 剩余10分钟，触发续跑 ====="
+              full_backup
+              # 触发新实例
+              curl -X POST \
+                https://api.github.com/repos/${{ github.repository }}/dispatches \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" \
+                -d '{"event_type":"renew_vnc"}' || echo "续跑触发失败"
+            fi
 
-            echo "[$(date)] 运行${run_minutes}分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
+            # 每2小时增量备份
+            if [ $((current_time - last_backup_time)) -ge 7200 ]; then
+              inc_backup
+              last_backup_time=$current_time
+            fi
+
+            # 服务健康检查
+            if ! pgrep -x Xvnc >/dev/null; then
+              echo "VNC服务异常，重启中..."
+              vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth
+            fi
+            if ! sudo systemctl is-active --quiet docker; then
+              echo "Docker服务异常，重启中..."
+              sudo systemctl restart docker
+            fi
+            if ! sudo systemctl is-active --quiet casaos; then
+              echo "CasaOS服务异常，重启中..."
+              sudo systemctl restart casaos
+            fi
+            if ! sudo systemctl is-active --quiet tailscaled; then
+              echo "Tailscale服务异常，重启中..."
+              sudo systemctl restart tailscaled
+            fi
+
+            # 输出运行状态
+            echo "[$(date)] 运行${run_minutes}分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}') | Tailscale IP: ${TAILSCALE_IP:-未获取}"
             sleep 300
           done
 
@@ -197,8 +248,13 @@ EOF
         id: clean_env
         if: always()
         run: |
+          echo "===== 清理环境 ====="
+          # 停止VNC
           vncserver -kill $DISPLAY || true
+          pkill -9 Xvnc || true
+          # 停止核心服务
           sudo systemctl stop docker casaos tailscaled || true
           sudo tailscale down || true
-          rm -rf $BACKUP_DIR $VNCDIR || true
-          echo "环境清理完成"
+          # 删除临时文件
+          rm -rf $BACKUP_DIR $VNCDIR /tmp/* || true
+          echo "===== 环境清理完成 ====="
