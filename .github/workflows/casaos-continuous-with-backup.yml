@@ -7,19 +7,19 @@ on:
 jobs:
   run-service:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10  # 总运行时长10分钟
+    timeout-minutes: 10
     env:
-      MAX_RUN_MINUTES: 1  # 运行1分钟后触发备份，剩余9分钟执行后续逻辑
+      MAX_RUN_MINUTES: 1
       RUNNER_PASSWORD: "runner123"
       CASAOS_PORT: 80
       NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       LOG_DIR: /home/runner/logs
-      CLEAN_INTERVAL: 300  # 5分钟清理一次空间
+      CLEAN_INTERVAL: 300
       B2_BACKUP_BUCKET: "casaos-backup"
       BACKUP_MARKER: "latest_backup.txt"
       LOG_FILE: "casaos_service_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).log"
-      HEALTH_CHECK_TIMEOUT: 120  # 健康检查超时2分钟
+      HEALTH_CHECK_TIMEOUT: 120
       NEW_RUN_ID_FILE: "/home/runner/new_run_id.txt"
 
     steps:
@@ -96,8 +96,8 @@ jobs:
           if [ -f "$BACKUP_MARKER_FILE" ]; then
             LATEST_BACKUP=$(cat "$BACKUP_MARKER_FILE")
             echo "最新备份文件名称：$LATEST_BACKUP"
-            # 恢复时用的exclude列表（和打包时一致）
-            cat > $BACKUP_DIR/exclude-list.txt << EOF
+            # 修复第101行核心问题：EOF必须顶格写（相对于run的shell上下文），无多余缩进
+            cat > $BACKUP_DIR/exclude-list.txt <<EOF
 /proc
 /sys
 /tmp
@@ -238,7 +238,7 @@ EOF
             TS=$(date +%Y%m%d_%H%M%S)
             BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
             BK_TEMP_LOG="/tmp/backup_${CURRENT_RUN_ID}.log"
-            rm -f $BK_TEMP_LOG  # 清空临时日志
+            rm -f $BK_TEMP_LOG
 
             # 步骤1: 停止CasaOS服务
             echo "[$(date)] 步骤1/6: 停止CasaOS服务..."
@@ -251,11 +251,10 @@ EOF
             fi
             sleep 3
 
-            # 步骤2: 打包关键数据（终极修复：直接写死exclude参数）
+            # 步骤2: 打包关键数据（直接写死exclude参数）
             echo "[$(date)] 步骤2/6: 开始打包数据，目标文件: $BK_NAME" | tee -a $BK_TEMP_LOG
             echo "[$(date)] 打包范围: /etc/casaos /var/lib/docker | 排除项: /proc /sys /tmp /dev /run /var/run /home/runner/actions-runner /var/lib/docker/overlay2" | tee -a $BK_TEMP_LOG
             
-            # 直接写死每个exclude参数，彻底避免变量解析问题
             sudo tar -z1cf /tmp/$BK_NAME \
               --exclude=/proc \
               --exclude=/sys \
@@ -360,7 +359,7 @@ EOF
             fi
           }
 
-          # 检查新容器健康状态（精简轮询逻辑）
+          # 检查新容器健康状态
           check_new_container() {
             echo "[$(date)] 开始检查新容器健康状态，超时${HEALTH_CHECK_TIMEOUT}秒..."
             start_check=$(date +%s)
@@ -372,11 +371,11 @@ EOF
                 NEW_RUN_ID=$(echo "$RUNS" | head -n 1)
                 echo "[$(date)] 发现新容器Run ID：$NEW_RUN_ID"
                 echo $NEW_RUN_ID > $NEW_RUN_ID_FILE
-                sleep 15  # 缩短新容器等待时间
+                sleep 15
                 echo "[$(date)] 新容器验证通过！"
                 return 0
               fi
-              sleep 3  # 缩短轮询间隔
+              sleep 3
             done
             echo "[$(date)] 健康检查超时，未检测到正常新容器！"
             return 1
@@ -401,7 +400,7 @@ EOF
               last_clean=$now
             fi
 
-            # 关键触发条件：运行1分钟后触发备份（剩余9分钟）
+            # 触发备份
             if [ $((run_mins)) -eq $MAX_RUN_MINUTES ] && [ "$backup_done" = false ]; then
               echo "[$(date)] 触发备份条件满足，调用do_backup函数..."
               do_backup
@@ -435,7 +434,7 @@ EOF
               sudo systemctl restart tailscaled
             fi
 
-            # 剩余时间兜底，避免超时被强制终止
+            # 剩余时间兜底
             remaining_mins=$((10 - run_mins))
             if [ $remaining_mins -le 1 ]; then
               echo "[$(date)] 剩余时间不足1分钟，强制退出保活循环..."
