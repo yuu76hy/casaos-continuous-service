@@ -59,15 +59,14 @@ jobs:
             echo "错误：B2密钥未配置！请检查GitHub Secrets。"; exit 1;
           fi
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
-[b2_backend]
-type = b2
-account = $B2_KEY_ID
-key = $B2_APPLICATION_KEY
-hard_delete = true
-timeout = 20s
-retries = 2
-EOF
+          # 修复YAML语法错误：改用echo逐行写入，避免EOF多行格式问题
+          echo "[b2_backend]" > ~/.config/rclone/rclone.conf
+          echo "type = b2" >> ~/.config/rclone/rclone.conf
+          echo "account = $B2_KEY_ID" >> ~/.config/rclone/rclone.conf
+          echo "key = $B2_APPLICATION_KEY" >> ~/.config/rclone/rclone.conf
+          echo "hard_delete = true" >> ~/.config/rclone/rclone.conf
+          echo "timeout = 20s" >> ~/.config/rclone/rclone.conf
+          echo "retries = 2" >> ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/test_backups/ || echo "测试备份目录已存在，跳过创建"
           if rclone lsd b2_backend:${B2_BACKUP_BUCKET}/test_backups/; then
