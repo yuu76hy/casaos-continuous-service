@@ -67,62 +67,45 @@ jobs:
           fi
           echo "Config B2 done"
 
-      - name: Step3 - Check Backup
+      - name: Step3 - Check Backup & Restore (if exists)
         id: step3
         continue-on-error: false
         run: |
           echo "Check backup start"
+          # 核心逻辑：检查到备份就立即恢复，无备份则直接跳过
           if rclone copy b2_backend:${B2_BACKUP_BUCKET}/${BACKUP_MARKER} $BACKUP_DIR/ --timeout 30s; then
             LATEST_BACKUP=$(cat $BACKUP_DIR/${BACKUP_MARKER})
-            echo "Found backup: $LATEST_BACKUP"
-            echo "LATEST_BACKUP=$LATEST_BACKUP" >> $GITHUB_ENV
-            echo "HAS_BACKUP=true" >> $GITHUB_ENV
+            echo "Found backup: $LATEST_BACKUP → Start restore immediately"
+            
+            # 立即执行恢复操作（无需后续步骤判断）
+            echo "$BACKUP_EXCLUDE" | tr ' ' '\n' | sed 's/--exclude=//g' > $BACKUP_DIR/exclude-list.txt
+            rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null
+            
+            if [ $? -eq 0 ]; then
+              echo "Backup restore success!"
+              echo "HAS_BACKUP=true" >> $GITHUB_ENV
+            else
+              echo "Backup restore failed → Use new environment"
+              echo "HAS_BACKUP=false" >> $GITHUB_ENV
+            fi
           else
-            echo "No backup found"
+            echo "No backup found → Skip restore, use new environment"
             echo "HAS_BACKUP=false" >> $GITHUB_ENV
           fi
-          echo "Check backup done"
+          echo "Check & restore backup done"
 
-      - name: Step4 - Install Docker & CasaOS
+      - name: Step4 - Install CasaOS Only
         id: step4
         continue-on-error: false
         run: |
-          echo "Install Docker start"
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
-          echo "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-          sudo apt update -y 2>&1 | grep -v "restart"
-          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin || { echo "Docker install failed"; exit 1; }
-          sudo systemctl enable docker && sudo systemctl start docker
-          echo "Docker install done"
-          
           echo "Install CasaOS start"
           curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || { echo "CasaOS warn"; }
-          sudo systemctl stop casaos
-          sudo systemctl stop docker
-          echo "CasaOS install done"
+          # 恢复场景：恢复后启动CasaOS；全新场景：直接启动CasaOS
+          sudo systemctl start casaos
+          echo "CasaOS install done (Docker auto-installed by CasaOS)"
 
-      - name: Step5 - Restore Backup
+      - name: Step5 - Deploy VNC & Tailscale
         id: step5
-        if: env.HAS_BACKUP == 'true'
-        continue-on-error: false
-        run: |
-          echo "Restore backup start: $LATEST_BACKUP"
-          echo "$BACKUP_EXCLUDE" | tr ' ' '\n' | sed 's/--exclude=//g' > $BACKUP_DIR/exclude-list.txt
-          rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null
-          if [ $? -eq 0 ]; then
-            echo "Restore success"
-            sudo systemctl start docker
-            sleep 5 && sudo systemctl start casaos
-          else
-            echo "Restore failed"
-            echo "HAS_BACKUP=false" >> $GITHUB_ENV
-            sudo systemctl start docker
-            sleep 5 && sudo systemctl start casaos
-          fi
-          echo "Restore backup done"
-
-      - name: Step6 - Deploy VNC & Tailscale
-        id: step6
         continue-on-error: false
         run: |
           echo "Deploy VNC start"
@@ -159,8 +142,8 @@ jobs:
           fi
           echo "Tailscale deploy done"
 
-      - name: Step7 - Show Info
-        id: step7
+      - name: Step6 - Show Info
+        id: step6
         continue-on-error: false
         run: |
           echo "====================================="
@@ -173,11 +156,11 @@ jobs:
           echo "VNC: $TAILSCALE_IP:$VNC_PORT (PWD: $FIXED_VNC_PWD)"
           echo "CasaOS: http://$TAILSCALE_IP:$CASAOS_PORT"
           echo "Backup: Only at last 10 mins"
-          echo "Data: $(if [ $HAS_BACKUP = 'true' ]; then echo "Restored"; else echo "New"; fi)"
+          echo "Data: $(if [ $HAS_BACKUP = 'true' ]; then echo "Restored from backup"; else echo "New environment (no backup)"; fi)"
           echo "====================================="
 
-      - name: Step8 - Core Logic
-        id: step8
+      - name: Step7 - Core Logic
+        id: step7
         continue-on-error: true
         run: |
           echo "Core logic start"
@@ -202,7 +185,6 @@ jobs:
             TS=$(date +%Y%m%d_%H%M%S)
             BK_NAME="casaos_$TS.tar.gz"
             sudo systemctl stop casaos
-            sudo systemctl stop docker
             sleep 3
             sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --timeout 60s --retries 3
             if [ $? -eq 0 ]; then
@@ -212,8 +194,7 @@ jobs:
             else
               echo "Backup failed"
             fi
-            sudo systemctl start docker
-            sleep 5 && sudo systemctl start casaos
+            sudo systemctl start casaos
             backup_done=true
           }
 
@@ -244,7 +225,6 @@ jobs:
             fi
 
             pgrep -x Xvnc || { echo "VNC restart"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
-            sudo systemctl is-active --quiet docker || { echo "Docker restart"; sudo systemctl restart docker; }
             sudo systemctl is-active --quiet casaos || { echo "CasaOS restart"; sudo systemctl restart casaos; }
             sudo systemctl is-active --quiet tailscaled || { echo "Tailscale restart"; sudo systemctl restart tailscaled; }
 
@@ -252,13 +232,13 @@ jobs:
             sleep 300
           done
 
-      - name: Step9 - Clean Env
-        id: step9
+      - name: Step8 - Clean Env
+        id: step8
         if: always()
         run: |
           echo "Clean env start"
           vncserver -kill $DISPLAY || true && pkill -9 Xvnc || true
-          sudo systemctl stop docker casaos tailscaled || true
+          sudo systemctl stop casaos tailscaled || true
           sudo tailscale down || true
           rm -rf $BACKUP_DIR $VNCDIR $NETDISK_ROOT || true
           echo "Clean env done"
