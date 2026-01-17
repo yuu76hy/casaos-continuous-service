@@ -9,18 +9,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10  # 总运行时长10分钟
     env:
-      MAX_RUN_MINUTES: 1  # 运行1分钟后，剩余9分钟触发备份续跑
+      MAX_RUN_MINUTES: 1  # 运行1分钟后触发备份，剩余9分钟执行后续逻辑
       RUNNER_PASSWORD: "runner123"
       CASAOS_PORT: 80
       NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       LOG_DIR: /home/runner/logs
       BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
-      CLEAN_INTERVAL: 300  # 短时长场景，5分钟清理一次空间
+      CLEAN_INTERVAL: 300  # 5分钟清理一次空间
       B2_BACKUP_BUCKET: "casaos-backup"
       BACKUP_MARKER: "latest_backup.txt"
       LOG_FILE: "casaos_service_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).log"
-      HEALTH_CHECK_TIMEOUT: 120  # 短时长场景，健康检查超时缩短为2分钟
+      HEALTH_CHECK_TIMEOUT: 120  # 健康检查超时2分钟
       NEW_RUN_ID_FILE: "/home/runner/new_run_id.txt"
 
     steps:
@@ -223,26 +223,96 @@ jobs:
           }
 
           do_backup() {
-            echo "[$(date)] 服务剩余9分钟，开始执行备份任务..."
+            echo "====================================="
+            echo "[$(date)] 开始执行备份全流程 - 剩余9分钟"
+            echo "====================================="
             TS=$(date +%Y%m%d_%H%M%S)
             BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
+            BK_TEMP_LOG="/tmp/backup_${CURRENT_RUN_ID}.log"
+            rm -f $BK_TEMP_LOG  # 清空临时日志
+
+            # 步骤1: 停止CasaOS服务
+            echo "[$(date)] 步骤1/6: 停止CasaOS服务..."
             sudo systemctl stop casaos
-            sleep 3
-            if sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --timeout 60s --retries 3; then
-              BK_SIZE=$(rclone size b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --json | jq -r '.size')
-              if [ "$BK_SIZE" -gt 0 ]; then
-                echo "备份校验通过：大小 $BK_SIZE 字节"
-                echo "$BK_NAME" > $BACKUP_DIR/$BACKUP_MARKER
-                rclone copy $BACKUP_DIR/$BACKUP_MARKER b2_backend:${B2_BACKUP_BUCKET}/ --timeout 30s
-                rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/logs/ --timeout 30s
-                echo "日志已上传到B2: logs/$LOG_FILE"
-              else
-                echo "备份校验失败：文件大小为0"
-              fi
+            stop_exit=$?
+            if [ $stop_exit -ne 0 ]; then
+              echo "[$(date)] ERROR: CasaOS停止失败，错误码: $stop_exit" | tee -a $BK_TEMP_LOG
             else
-              echo "备份上传失败！"
+              echo "[$(date)] SUCCESS: CasaOS已停止" | tee -a $BK_TEMP_LOG
             fi
+            sleep 3
+
+            # 步骤2: 打包关键数据（带进度和错误捕获）
+            echo "[$(date)] 步骤2/6: 开始打包数据，目标文件: $BK_NAME" | tee -a $BK_TEMP_LOG
+            echo "[$(date)] 打包范围: /etc/casaos /var/lib/docker | 排除项: $BACKUP_EXCLUDE" | tee -a $BK_TEMP_LOG
+            sudo tar -z1cf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>> $BK_TEMP_LOG > /tmp/$BK_NAME
+            tar_exit=$?
+            if [ $tar_exit -ne 0 ]; then
+              echo "[$(date)] ERROR: 数据打包失败，错误码: $tar_exit | 查看临时日志: $BK_TEMP_LOG"
+              echo "[$(date)] 打包失败详情: $(cat $BK_TEMP_LOG | tail -5)"
+              backup_done=true
+              return 1
+            else
+              BK_SIZE_LOCAL=$(du -h /tmp/$BK_NAME | awk '{print $1}')
+              echo "[$(date)] SUCCESS: 数据打包完成 | 本地文件大小: $BK_SIZE_LOCAL" | tee -a $BK_TEMP_LOG
+            fi
+
+            # 步骤3: 上传到B2存储
+            echo "[$(date)] 步骤3/6: 开始上传到B2存储桶: ${B2_BACKUP_BUCKET}" | tee -a $BK_TEMP_LOG
+            rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME /tmp/$BK_NAME --timeout 60s --retries 3 --progress 2>> $BK_TEMP_LOG
+            rclone_exit=$?
+            if [ $rclone_exit -ne 0 ]; then
+              echo "[$(date)] ERROR: B2上传失败，错误码: $rclone_exit | 查看临时日志: $BK_TEMP_LOG"
+              echo "[$(date)] 上传失败详情: $(cat $BK_TEMP_LOG | tail -5)"
+              rm -f /tmp/$BK_NAME
+              backup_done=true
+              return 1
+            else
+              echo "[$(date)] SUCCESS: B2上传完成" | tee -a $BK_TEMP_LOG
+            fi
+
+            # 步骤4: 校验B2上的备份文件
+            echo "[$(date)] 步骤4/6: 校验B2上的备份文件..." | tee -a $BK_TEMP_LOG
+            BK_SIZE_REMOTE=$(rclone size b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --json 2>> $BK_TEMP_LOG | jq -r '.size')
+            size_exit=$?
+            if [ $size_exit -ne 0 ] || [ "$BK_SIZE_REMOTE" -eq 0 ]; then
+              echo "[$(date)] ERROR: 备份校验失败 | 远程文件大小: $BK_SIZE_REMOTE 字节 | 错误码: $size_exit" | tee -a $BK_TEMP_LOG
+              rclone delete b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME 2>/dev/null
+              rm -f /tmp/$BK_NAME
+              backup_done=true
+              return 1
+            else
+              BK_SIZE_REMOTE_HUMAN=$(echo $BK_SIZE_REMOTE | awk '{printf "%.2f MB", $1/1024/1024}')
+              echo "[$(date)] SUCCESS: 备份校验通过 | 远程文件大小: $BK_SIZE_REMOTE_HUMAN" | tee -a $BK_TEMP_LOG
+            fi
+
+            # 步骤5: 上传备份标记和日志
+            echo "[$(date)] 步骤5/6: 上传备份标记文件和日志..." | tee -a $BK_TEMP_LOG
+            echo "$BK_NAME" > $BACKUP_DIR/$BACKUP_MARKER
+            rclone copy $BACKUP_DIR/$BACKUP_MARKER b2_backend:${B2_BACKUP_BUCKET}/ --timeout 30s 2>> $BK_TEMP_LOG
+            rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/logs/ --timeout 30s 2>> $BK_TEMP_LOG
+            marker_exit=$?
+            if [ $marker_exit -ne 0 ]; then
+              echo "[$(date)] WARNING: 标记文件上传失败，错误码: $marker_exit" | tee -a $BK_TEMP_LOG
+            else
+              echo "[$(date)] SUCCESS: 标记文件和日志已上传" | tee -a $BK_TEMP_LOG
+            fi
+
+            # 步骤6: 启动CasaOS服务
+            echo "[$(date)] 步骤6/6: 启动CasaOS服务..." | tee -a $BK_TEMP_LOG
             sudo systemctl start casaos
+            start_exit=$?
+            if [ $start_exit -ne 0 ]; then
+              echo "[$(date)] ERROR: CasaOS启动失败，错误码: $start_exit" | tee -a $BK_TEMP_LOG
+            else
+              echo "[$(date)] SUCCESS: CasaOS已启动" | tee -a $BK_TEMP_LOG
+            fi
+
+            # 清理临时文件
+            rm -f /tmp/$BK_NAME
+            echo "====================================="
+            echo "[$(date)] 备份全流程执行完毕 | 临时日志: $BK_TEMP_LOG"
+            echo "====================================="
             backup_done=true
           }
 
@@ -272,21 +342,18 @@ jobs:
             echo "[$(date)] 开始检查新容器健康状态，超时${HEALTH_CHECK_TIMEOUT}秒..."
             start_check=$(date +%s)
             while [ $(( $(date +%s) - start_check )) -lt $HEALTH_CHECK_TIMEOUT ]; do
-              # 获取仓库最新运行中的工作流
               RUNS=$(curl -s -H "Authorization: Bearer $GITHUB_PAT" \
-                "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&event=repository_dispatch" \
+                "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&event=repository_dispatch&per_page=1" \
                 | jq -r '.workflow_runs[] | select(.id != '$CURRENT_RUN_ID') | .id')
               if [ -n "$RUNS" ]; then
                 NEW_RUN_ID=$(echo "$RUNS" | head -n 1)
                 echo "[$(date)] 发现新容器Run ID：$NEW_RUN_ID"
                 echo $NEW_RUN_ID > $NEW_RUN_ID_FILE
-                # 短时长场景，缩短新容器初始化等待时间
-                sleep 30
-                echo "[$(date)] 新容器已启动并完成初始化，验证通过！"
+                sleep 15  # 缩短新容器等待时间
+                echo "[$(date)] 新容器验证通过！"
                 return 0
               fi
-              echo "[$(date)] 新容器尚未启动，等待5秒..."
-              sleep 5
+              sleep 3  # 缩短轮询间隔
             done
             echo "[$(date)] 健康检查超时，未检测到正常新容器！"
             return 1
@@ -311,21 +378,27 @@ jobs:
               last_clean=$now
             fi
 
-            # 关键触发条件：运行1分钟后触发（剩余9分钟）
+            # 关键触发条件：运行1分钟后触发备份（剩余9分钟）
             if [ $((run_mins)) -eq $MAX_RUN_MINUTES ] && [ "$backup_done" = false ]; then
+              echo "[$(date)] 触发备份条件满足，调用do_backup函数..."
               do_backup
-              if trigger_renew; then
-                if check_new_container; then
-                  echo "[$(date)] 新容器健康检查通过，旧容器准备退出..."
-                  sudo systemctl stop casaos tailscaled
-                  sudo tailscale down
-                  echo "[$(date)] 旧容器已安全退出！"
-                  exit 0
-                else
-                  echo "[$(date)] 新容器健康检查失败，旧容器继续运行..."
-                fi
+              backup_exit=$?
+              if [ $backup_exit -ne 0 ]; then
+                echo "[$(date)] 备份函数执行失败，错误码: $backup_exit，跳过续跑逻辑"
               else
-                echo "[$(date)] 续跑触发失败，旧容器继续运行..."
+                if trigger_renew; then
+                  if check_new_container; then
+                    echo "[$(date)] 新容器健康检查通过，旧容器准备退出..."
+                    sudo systemctl stop casaos tailscaled
+                    sudo tailscale down
+                    echo "[$(date)] 旧容器已安全退出！"
+                    exit 0
+                  else
+                    echo "[$(date)] 新容器健康检查失败，旧容器继续运行..."
+                  fi
+                else
+                  echo "[$(date)] 续跑触发失败，旧容器继续运行..."
+                fi
               fi
             fi
 
@@ -339,7 +412,15 @@ jobs:
               sudo systemctl restart tailscaled
             fi
 
-            echo "[$(date)] 已运行 $run_mins 分钟 | 剩余时间: $((10 - run_mins)) 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
+            # 剩余时间兜底，避免超时被强制终止
+            remaining_mins=$((10 - run_mins))
+            if [ $remaining_mins -le 1 ]; then
+              echo "[$(date)] 剩余时间不足1分钟，强制退出保活循环..."
+              sudo systemctl stop casaos tailscaled
+              exit 0
+            fi
+
+            echo "[$(date)] 已运行 $run_mins 分钟 | 剩余时间: $remaining_mins 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
             sleep 10
           done
 
@@ -353,7 +434,7 @@ jobs:
           echo "====================================="
           sudo systemctl stop casaos tailscaled || true
           sudo tailscale down || true
-          rm -rf $BACKUP_DIR $NETDISK_ROOT || true
+          rm -rf $BACKUP_DIR $NETDISK_ROOT /tmp/backup_*.log || true
           rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/logs/ --timeout 30s || echo "日志上传失败"
           echo "====================================="
           echo "步骤8：环境清理完成！"
