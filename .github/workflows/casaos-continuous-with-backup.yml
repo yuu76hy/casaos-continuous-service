@@ -15,7 +15,6 @@ jobs:
       NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       LOG_DIR: /home/runner/logs
-      BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
       CLEAN_INTERVAL: 300  # 5分钟清理一次空间
       B2_BACKUP_BUCKET: "casaos-backup"
       BACKUP_MARKER: "latest_backup.txt"
@@ -97,7 +96,17 @@ jobs:
           if [ -f "$BACKUP_MARKER_FILE" ]; then
             LATEST_BACKUP=$(cat "$BACKUP_MARKER_FILE")
             echo "最新备份文件名称：$LATEST_BACKUP"
-            echo "$BACKUP_EXCLUDE" | tr ' ' '\n' | sed 's/--exclude=//g' > $BACKUP_DIR/exclude-list.txt
+            # 恢复时用的exclude列表（和打包时一致）
+            cat > $BACKUP_DIR/exclude-list.txt << EOF
+/proc
+/sys
+/tmp
+/dev
+/run
+/var/run
+/home/runner/actions-runner
+/var/lib/docker/overlay2
+EOF
             if rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null; then
               echo "备份数据恢复完成，开始校验关键目录..."
               if [ -d "/etc/casaos" ] && [ -d "/var/lib/docker" ]; then
@@ -242,19 +251,20 @@ jobs:
             fi
             sleep 3
 
-            # 步骤2: 打包关键数据（彻底修复exclude参数传递问题）
+            # 步骤2: 打包关键数据（终极修复：直接写死exclude参数）
             echo "[$(date)] 步骤2/6: 开始打包数据，目标文件: $BK_NAME" | tee -a $BK_TEMP_LOG
-            echo "[$(date)] 打包范围: /etc/casaos /var/lib/docker | 排除项: $BACKUP_EXCLUDE" | tee -a $BK_TEMP_LOG
+            echo "[$(date)] 打包范围: /etc/casaos /var/lib/docker | 排除项: /proc /sys /tmp /dev /run /var/run /home/runner/actions-runner /var/lib/docker/overlay2" | tee -a $BK_TEMP_LOG
             
-            # 核心修复：将exclude拆分为数组，逐个传递参数
-            EXCLUDE_ARGS=()
-            while IFS= read -r arg; do
-              EXCLUDE_ARGS+=("$arg")
-            done < <(echo "$BACKUP_EXCLUDE" | xargs -n1)
-
-            # 执行tar命令（数组传递参数，避免字符串拼接错误）
+            # 直接写死每个exclude参数，彻底避免变量解析问题
             sudo tar -z1cf /tmp/$BK_NAME \
-              "${EXCLUDE_ARGS[@]}" \
+              --exclude=/proc \
+              --exclude=/sys \
+              --exclude=/tmp \
+              --exclude=/dev \
+              --exclude=/run \
+              --exclude=/var/run \
+              --exclude=/home/runner/actions-runner \
+              --exclude=/var/lib/docker/overlay2 \
               --directory=/ \
               etc/casaos \
               var/lib/docker 2>> $BK_TEMP_LOG
