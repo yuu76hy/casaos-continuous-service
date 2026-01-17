@@ -36,7 +36,6 @@ jobs:
           echo "2. 正在升级系统软件包..."
           sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "系统升级失败！"; exit 1; }
           echo "3. 正在安装核心依赖工具（含VNC桌面环境）..."
-          # 核心修复：添加fluxbox（轻量级桌面）和xterm（备用终端）
           pkgs="tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release bc x11-apps fluxbox xterm"
           sudo apt install -y $pkgs || { echo "依赖工具安装失败！"; exit 1; }
           echo "4. 正在设置Runner用户密码..."
@@ -154,32 +153,26 @@ jobs:
           echo "2. 正在设置VNC访问密码..."
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
           echo "3. 正在生成VNC启动脚本（使用fluxbox桌面）..."
-          # 核心修复：使用fluxbox轻量级桌面环境，确保会话不退出
-          cat > $VNCDIR/xstartup << EOF
-#!/bin/bash
-export DISPLAY=:0
-export XDG_RUNTIME_DIR=/tmp/runtime-runner
-mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
-# 启动fluxbox桌面环境（稳定不退出）
-exec fluxbox
-EOF
+          # 修复YAML语法：改用echo逐行写入，避免EOF多行格式问题
+          echo '#!/bin/bash' > $VNCDIR/xstartup
+          echo 'export DISPLAY=:0' >> $VNCDIR/xstartup
+          echo 'export XDG_RUNTIME_DIR=/tmp/runtime-runner' >> $VNCDIR/xstartup
+          echo 'mkdir -p $XDG_RUNTIME_DIR && chmod 700 $XDG_RUNTIME_DIR' >> $VNCDIR/xstartup
+          echo 'exec fluxbox' >> $VNCDIR/xstartup
+          
           chmod +x $VNCDIR/xstartup
           echo "4. 正在配置VNC环境变量（避免权限问题）..."
-          # 修复：设置VNC不检查会话退出时间，增加环境变量
           export VNCSERVER_ARGS="-localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth"
           export USER=runner
           export HOME=/home/runner
           touch /home/runner/.Xauthority
           chown runner:runner /home/runner/.Xauthority
-          # 修复：设置DISPLAY权限，允许所有用户访问
           xhost + > /dev/null 2>&1 || true
           echo "5. 正在停止已有VNC实例（如有）..."
           pgrep -x Xvnc && vncserver -kill $DISPLAY || echo "无已有VNC实例，跳过停止"
           echo "6. 正在启动VNC服务（使用fluxbox桌面）..."
-          # 核心修复：直接指定xstartup路径，强制使用fluxbox
           if ! vncserver $DISPLAY $VNCSERVER_ARGS -xstartup $VNCDIR/xstartup; then
             echo "VNC服务启动失败，尝试终极备用方案..."
-            # 备用方案：直接启动xterm（已安装）
             vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth -xstartup /usr/bin/xterm || { echo "错误：VNC服务启动失败！"; exit 1; }
           fi
           echo "VNC远程桌面部署成功！使用fluxbox轻量级桌面环境"
@@ -300,30 +293,25 @@ EOF
             run_mins=$(( (now - start_time) / 60 ))
             free_space=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
             
-            # 定时清理空间
             if [ $((now - last_clean)) -ge $CLEAN_INTERVAL ]; then
               auto_clean
               last_clean=$now
             fi
 
-            # 低空间紧急清理
             if (( $(echo "$free_space < 1" | bc -l) )); then
               echo "[$(date)] 系统剩余空间不足1G，执行紧急清理..."
               auto_clean
               last_clean=$now
             fi
 
-            # 剩余10分钟执行备份和续跑
             if [ $((MAX_RUN_MINUTES - run_mins)) -eq 10 ] && [ "$backup_done" = false ]; then
               do_backup
               trigger_renew
             fi
 
-            # 服务健康检查与重启
             if ! pgrep -x Xvnc; then
               echo "[$(date)] VNC服务未运行，执行重启..."
               touch /home/runner/.Xauthority
-              # 重启时使用fluxbox配置
               vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth -xstartup $VNCDIR/xstartup || echo "VNC重启失败"
             fi
             if ! sudo systemctl is-active --quiet casaos; then
@@ -335,7 +323,6 @@ EOF
               sudo systemctl restart tailscaled
             fi
 
-            # 输出运行状态
             echo "[$(date)] 服务已运行 $run_mins 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
             sleep 300
           done
