@@ -1,4 +1,4 @@
-name: CasaOS+VNC+Tailscale 持续服务（到期备份+续跑恢复优化版）
+name: CasaOS+VNC+Tailscale 持续服务（到期备份+续跑恢复最终版）
 on:
   workflow_dispatch:        # 手动触发
   repository_dispatch:
@@ -285,4 +285,93 @@ EOF
             TIMESTAMP=$(date +%Y%m%d_%H%M%S)
             FULL_BACKUP_NAME="casaos_full_${TIMESTAMP}.tar.gz"
             
-            # 2. 停止核心服务确保数据
+            # 2. 停止核心服务确保数据一致性
+            sudo systemctl stop casaos
+            sudo systemctl stop docker
+            sleep 3
+            
+            # 3. 执行全量备份（内存直传至B2，不落地）
+            sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/${FULL_BACKUP_NAME} --timeout 60s --retries 3
+            
+            # 4. 验证备份结果并更新标记文件
+            if [ $? -eq 0 ]; then
+              echo "✅ 到期备份成功：b2_backend:${B2_BACKUP_BUCKET}/${FULL_BACKUP_NAME}"
+              # 更新备份标记文件（供续跑恢复）
+              echo "${FULL_BACKUP_NAME}" > $BACKUP_DIR/${BACKUP_MARKER}
+              rclone copy $BACKUP_DIR/${BACKUP_MARKER} b2_backend:${B2_BACKUP_BUCKET}/ --timeout 30s
+            else
+              echo "❌ 到期备份失败"
+            fi
+            
+            # 5. 重启核心服务
+            sudo systemctl start docker
+            sleep 5 && sudo systemctl start casaos
+            backup_executed=true
+          }
+
+          #######################################
+          # 子函数3：触发续跑（启动新工作流）
+          #######################################
+          trigger_renew() {
+            echo "===== 触发续跑请求 ====="
+            curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" \
+              -d '{"event_type":"renew_vnc"}' \
+              --connect-timeout 30s || echo "❌ 续跑触发失败（请检查USER_GITHUB_PAT密钥）"
+          }
+
+          #######################################
+          # 主循环：保活+定时清理+到期备份+续跑
+          #######################################
+          while true; do
+            current_time=$(date +%s)
+            run_minutes=$(( (current_time - start_time) / 60 ))
+            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
+            
+            # 1. 每小时执行垃圾清理
+            if [ $((current_time - last_clean_time)) -ge $CLEAN_INTERVAL ]; then
+              auto_clean
+              last_clean_time=$current_time
+            fi
+
+            # 2. 空间应急清理（不足1GB立即清理）
+            if (( $(echo "$FREE_SPACE < 1" | bc -l) )); then
+              echo "⚠️  空间不足1GB，紧急清理..."
+              auto_clean
+              last_clean_time=$current_time
+            fi
+
+            # 3. 剩余10分钟：执行备份+触发续跑（仅一次）
+            if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ] && [ "$backup_executed" = false ]; then
+              expire_full_backup  # 执行到期备份
+              trigger_renew       # 触发续跑
+            fi
+
+            # 4. 服务健康检查（异常自动重启）
+            pgrep -x Xvnc || { echo "⚠️ VNC异常，重启"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
+            sudo systemctl is-active --quiet docker || { echo "⚠️ Docker异常，重启"; sudo systemctl restart docker; }
+            sudo systemctl is-active --quiet casaos || { echo "⚠️ CasaOS异常，重启"; sudo systemctl restart casaos; }
+            sudo systemctl is-active --quiet tailscaled || { echo "⚠️ Tailscale异常，重启"; sudo systemctl restart tailscaled; }
+
+            # 5. 运行状态日志
+            echo "[$(date)] 运行时长：${run_minutes}分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}') | 下次清理：$(( (last_clean_time + CLEAN_INTERVAL - current_time) / 60 ))分钟后"
+            sleep 300 # 每5分钟检查一次
+          done
+
+      ###########################################################################
+      # 第九步：优雅清理环境（无论成功/失败都执行）
+      ###########################################################################
+      - name: 9. 优雅清理环境
+        id: clean_env
+        if: always()
+        run: |
+          echo "===== 开始清理环境 ====="
+          # 1. 停止VNC服务
+          vncserver -kill $DISPLAY || true && pkill -9 Xvnc || true
+          # 2. 停止核心服务
+          sudo systemctl stop docker casaos tailscaled || true
+          sudo tailscale down || true
+          # 3. 清理本地临时文件（备份已存B2）
+          rm -rf $BACKUP_DIR $VNCDIR $NETDISK_ROOT || true
+          echo "✅ 环境清理完成"
