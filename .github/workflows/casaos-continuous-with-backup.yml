@@ -1,11 +1,11 @@
-name: CasaOS+VNC+Tailscale 持续服务（到期备份+续跑恢复最终版）
+name: CasaOS-VNC-Tailscale-Service
 on:
   workflow_dispatch:
   repository_dispatch:
     types: [renew_vnc]
 
 jobs:
-  casaos-vnc-continuous:
+  run-service:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
@@ -26,28 +26,28 @@ jobs:
       BACKUP_MARKER: "latest_backup.txt"
 
     steps:
-      - name: 1. 系统环境初始化
-        id: init_system
+      - name: Step1 - Init System
+        id: step1
         continue-on-error: false
         run: |
-          echo "===== 开始系统环境初始化 ====="
-          sudo apt update -y 2>&1 | grep -v "restart" || { echo "ERROR: 系统更新失败"; exit 1; }
-          sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "ERROR: 系统升级失败"; exit 1; }
-          required_packages="tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release bc"
-          sudo apt install -y $required_packages || { echo "ERROR: 核心依赖安装失败"; exit 1; }
+          echo "Init system start"
+          sudo apt update -y 2>&1 | grep -v "restart" || { echo "Update failed"; exit 1; }
+          sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "Upgrade failed"; exit 1; }
+          pkgs="tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release bc"
+          sudo apt install -y $pkgs || { echo "Install pkgs failed"; exit 1; }
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
           sudo mkdir -p $BACKUP_DIR $NETDISK_ROOT
           sudo chown -R runner:runner $BACKUP_DIR $NETDISK_ROOT
           sudo chmod -R 755 $BACKUP_DIR $NETDISK_ROOT
-          echo "INFO: 系统环境初始化完成"
+          echo "Init system done"
 
-      - name: 2. 配置 Backblaze B2 存储（rclone）
-        id: config_b2_storage
+      - name: Step2 - Config B2 Storage
+        id: step2
         continue-on-error: false
         run: |
-          echo "===== 开始配置 B2 存储 ====="
+          echo "Config B2 start"
           if [ -z "$B2_KEY_ID" ] || [ -z "$B2_APPLICATION_KEY" ]; then
-            echo "ERROR: B2存储密钥未配置"; exit 1;
+            echo "B2 key empty"; exit 1;
           fi
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf << EOF
@@ -60,73 +60,74 @@ timeout = 30s
 retries = 3
 EOF
           chmod 600 ~/.config/rclone/rclone.conf
-          echo "===== 测试 B2 存储连接 ====="
-          rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/ || echo "INFO: 备份桶已存在"
+          rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/ || echo "Bucket exists"
           if rclone lsd b2_backend:${B2_BACKUP_BUCKET}/ --verbose --retries 3; then
-            echo "INFO: B2存储连接成功"
-            echo "B2_CONNECT_STATUS=success" >> $GITHUB_ENV
+            echo "B2 connect success"
+            echo "B2_STATUS=success" >> $GITHUB_ENV
           else
-            echo "ERROR: B2存储连接失败"; exit 1;
+            echo "B2 connect failed"; exit 1;
           fi
-          echo "INFO: B2存储配置完成"
+          echo "Config B2 done"
 
-      - name: 3. 检查历史备份
-        id: check_history_backup
+      - name: Step3 - Check Backup
+        id: step3
         continue-on-error: false
         run: |
-          echo "===== 检查历史备份 ====="
+          echo "Check backup start"
           if rclone copy b2_backend:${B2_BACKUP_BUCKET}/${BACKUP_MARKER} $BACKUP_DIR/ --timeout 30s; then
             LATEST_BACKUP=$(cat $BACKUP_DIR/${BACKUP_MARKER})
-            echo "INFO: 找到最新备份：$LATEST_BACKUP"
+            echo "Found backup: $LATEST_BACKUP"
             echo "LATEST_BACKUP=$LATEST_BACKUP" >> $GITHUB_ENV
-            echo "HAS_HISTORY_BACKUP=true" >> $GITHUB_ENV
+            echo "HAS_BACKUP=true" >> $GITHUB_ENV
           else
-            echo "INFO: 未找到历史备份"
-            echo "HAS_HISTORY_BACKUP=false" >> $GITHUB_ENV
+            echo "No backup found"
+            echo "HAS_BACKUP=false" >> $GITHUB_ENV
           fi
+          echo "Check backup done"
 
-      - name: 4. 安装基础服务（Docker + CasaOS）
-        id: install_base_services
+      - name: Step4 - Install Docker & CasaOS
+        id: step4
         continue-on-error: false
         run: |
-          echo "===== 安装 Docker 引擎 ====="
+          echo "Install Docker start"
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/docker.gpg
           echo "deb [arch=$(dpkg --print-architecture)] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
           sudo apt update -y 2>&1 | grep -v "restart"
-          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin || { echo "ERROR: Docker安装失败"; exit 1; }
+          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin || { echo "Docker install failed"; exit 1; }
           sudo systemctl enable docker && sudo systemctl start docker
-          echo "INFO: Docker安装成功"
+          echo "Docker install done"
           
-          echo "===== 安装 CasaOS ====="
-          curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || { echo "WARNING: CasaOS安装警告"; }
+          echo "Install CasaOS start"
+          curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || { echo "CasaOS warn"; }
           sudo systemctl stop casaos
           sudo systemctl stop docker
-          echo "INFO: CasaOS安装完成"
+          echo "CasaOS install done"
 
-      - name: 5. 续跑恢复 - 从B2恢复最新备份
-        id: restore_from_backup
-        if: env.HAS_HISTORY_BACKUP == 'true'
+      - name: Step5 - Restore Backup
+        id: step5
+        if: env.HAS_BACKUP == 'true'
         continue-on-error: false
         run: |
-          echo "===== 恢复最新备份：${LATEST_BACKUP} ====="
+          echo "Restore backup start: $LATEST_BACKUP"
           echo "$BACKUP_EXCLUDE" | tr ' ' '\n' | sed 's/--exclude=//g' > $BACKUP_DIR/exclude-list.txt
           rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null
           if [ $? -eq 0 ]; then
-            echo "INFO: 备份恢复成功"
+            echo "Restore success"
             sudo systemctl start docker
             sleep 5 && sudo systemctl start casaos
           else
-            echo "ERROR: 备份恢复失败"
-            echo "HAS_HISTORY_BACKUP=false" >> $GITHUB_ENV
+            echo "Restore failed"
+            echo "HAS_BACKUP=false" >> $GITHUB_ENV
             sudo systemctl start docker
             sleep 5 && sudo systemctl start casaos
           fi
+          echo "Restore backup done"
 
-      - name: 6. 部署核心服务（VNC + Tailscale）
-        id: deploy_core_services
+      - name: Step6 - Deploy VNC & Tailscale
+        id: step6
         continue-on-error: false
         run: |
-          echo "===== 配置 VNC 服务 ====="
+          echo "Deploy VNC start"
           mkdir -p $VNCDIR && chmod 700 $VNCDIR
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
           cat > $VNCDIR/xstartup << EOF
@@ -134,132 +135,131 @@ EOF
 export DISPLAY=:0
 export XDG_RUNTIME_DIR=/tmp/runtime-runner
 mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
-exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title "CasaOS 控制台"
+exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title "CasaOS Console"
 EOF
           chmod +x $VNCDIR/xstartup
           pgrep -x Xvnc && vncserver -kill $DISPLAY || true
-          vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth || { echo "ERROR: VNC启动失败"; exit 1; }
-          echo "INFO: VNC服务启动成功"
+          vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth || { echo "VNC start failed"; exit 1; }
+          echo "VNC deploy done"
           
-          echo "===== 配置 Tailscale ====="
-          curl -fsSL https://tailscale.com/install.sh | sudo sh 2>&1 | grep -v "restart" || { echo "ERROR: Tailscale安装失败"; exit 1; }
+          echo "Deploy Tailscale start"
+          curl -fsSL https://tailscale.com/install.sh | sudo sh 2>&1 | grep -v "restart" || { echo "Tailscale install failed"; exit 1; }
           sudo systemctl enable --now tailscaled && sleep 3
           MAX_RETRIES=3
           while [ $MAX_RETRIES -gt 0 ]; do
             if sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=casaos-${{ github.run_id }} --accept-routes=false; then
               TAILSCALE_IP=$(sudo tailscale ip -4)
-              echo "INFO: Tailscale连接成功，IP：$TAILSCALE_IP"
+              echo "Tailscale IP: $TAILSCALE_IP"
               echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
               break
             fi
             MAX_RETRIES=$((MAX_RETRIES-1))
-            echo "WARNING: Tailscale连接失败，剩余重试：$MAX_RETRIES"
+            echo "Tailscale retry: $MAX_RETRIES"
             sleep 5
           done
           if [ -z "$TAILSCALE_IP" ]; then
-            echo "ERROR: Tailscale连接失败"; exit 1;
+            echo "Tailscale failed"; exit 1;
           fi
+          echo "Tailscale deploy done"
 
-      - name: 7. 输出服务访问信息
-        id: output_access_info
+      - name: Step7 - Show Info
+        id: step7
         continue-on-error: false
         run: |
-          echo -e "\n=================================================="
-          echo -e " CasaOS+VNC+Tailscale 持续服务"
-          echo -e "=================================================="
-          echo -e " 系统信息：运行时长${MAX_RUN_MINUTES}分钟，可用空间$(df -h / | awk 'NR==2{print $4}')"
-          echo -e " Runner密码：${RUNNER_PASSWORD}"
-          echo -e " 存储状态：$(if [ $B2_CONNECT_STATUS = 'success' ]; then echo 'B2连接成功'; else echo 'B2连接失败'; fi)"
-          echo -e " 访问地址：VNC(${TAILSCALE_IP}:${VNC_PORT})，CasaOS(http://${TAILSCALE_IP}:${CASAOS_PORT})"
-          echo -e " 备份策略：剩余10分钟备份，续跑自动恢复"
-          echo -e " 数据状态：$(if [ $HAS_HISTORY_BACKUP = 'true' ]; then echo '已恢复历史数据'; else echo '首次部署'; fi)"
-          echo -e "==================================================\n"
+          echo "====================================="
+          echo "Service Info"
+          echo "====================================="
+          echo "Run time: $MAX_RUN_MINUTES mins"
+          echo "Free space: $(df -h / | awk 'NR==2{print $4}')"
+          echo "Runner PWD: $RUNNER_PASSWORD"
+          echo "B2 Status: $B2_STATUS"
+          echo "VNC: $TAILSCALE_IP:$VNC_PORT (PWD: $FIXED_VNC_PWD)"
+          echo "CasaOS: http://$TAILSCALE_IP:$CASAOS_PORT"
+          echo "Backup: Only at last 10 mins"
+          echo "Data: $(if [ $HAS_BACKUP = 'true' ]; then echo "Restored"; else echo "New"; fi)"
+          echo "====================================="
 
-      - name: 8. 核心逻辑 - 保活+清理+备份+续跑
-        id: core_logic
+      - name: Step8 - Core Logic
+        id: step8
         continue-on-error: true
         run: |
-          echo "===== 启动核心监控 ====="
+          echo "Core logic start"
           start_time=$(date +%s)
-          last_clean_time=$start_time
-          backup_executed=false
+          last_clean=$start_time
+          backup_done=false
 
           auto_clean() {
-            echo "===== 执行垃圾清理 ====="
-            BEFORE_CLEAN=$(df -h / | awk 'NR==2{print $4}')
+            echo "Clean start"
+            BEFORE=$(df -h / | awk 'NR==2{print $4}')
             sudo apt clean -y && sudo apt autoremove -y --purge
             sudo docker system prune -af --volumes 2>/dev/null || true
             sudo rm -rf /tmp/* /var/tmp/* /home/runner/.cache/* 2>/dev/null
-            AFTER_CLEAN=$(df -h / | awk 'NR==2{print $4}')
-            echo "INFO: 清理完成：$BEFORE_CLEAN → $AFTER_CLEAN"
+            AFTER=$(df -h / | awk 'NR==2{print $4}')
+            echo "Clean done: $BEFORE -> $AFTER"
           }
 
-          expire_full_backup() {
-            echo "===== 剩余10分钟，执行备份 ====="
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            FULL_BACKUP_NAME="casaos_full_${TIMESTAMP}.tar.gz"
+          do_backup() {
+            echo "Backup start (last 10 mins)"
+            TS=$(date +%Y%m%d_%H%M%S)
+            BK_NAME="casaos_$TS.tar.gz"
             sudo systemctl stop casaos
             sudo systemctl stop docker
             sleep 3
-            sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/${FULL_BACKUP_NAME} --timeout 60s --retries 3
+            sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --timeout 60s --retries 3
             if [ $? -eq 0 ]; then
-              echo "INFO: 备份成功：$FULL_BACKUP_NAME"
-              echo "${FULL_BACKUP_NAME}" > $BACKUP_DIR/${BACKUP_MARKER}
-              rclone copy $BACKUP_DIR/${BACKUP_MARKER} b2_backend:${B2_BACKUP_BUCKET}/ --timeout 30s
+              echo "Backup success: $BK_NAME"
+              echo "$BK_NAME" > $BACKUP_DIR/$BACKUP_MARKER
+              rclone copy $BACKUP_DIR/$BACKUP_MARKER b2_backend:${B2_BACKUP_BUCKET}/ --timeout 30s
             else
-              echo "ERROR: 备份失败"
+              echo "Backup failed"
             fi
             sudo systemctl start docker
             sleep 5 && sudo systemctl start casaos
-            backup_executed=true
+            backup_done=true
           }
 
           trigger_renew() {
-            echo "===== 触发续跑 ====="
-            curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" \
-              -d '{"event_type":"renew_vnc"}' \
-              --connect-timeout 30s || echo "ERROR: 续跑触发失败"
+            echo "Trigger renew"
+            curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" -d '{"event_type":"renew_vnc"}' --connect-timeout 30s || echo "Renew failed"
           }
 
           while true; do
-            current_time=$(date +%s)
-            run_minutes=$(( (current_time - start_time) / 60 ))
-            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
+            now=$(date +%s)
+            run_mins=$(( (now - start_time) / 60 ))
+            free_space=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
             
-            if [ $((current_time - last_clean_time)) -ge $CLEAN_INTERVAL ]; then
+            if [ $((now - last_clean)) -ge $CLEAN_INTERVAL ]; then
               auto_clean
-              last_clean_time=$current_time
+              last_clean=$now
             fi
 
-            if (( $(echo "$FREE_SPACE < 1" | bc -l) )); then
-              echo "WARNING: 空间不足1GB，紧急清理"
+            if (( $(echo "$free_space < 1" | bc -l) )); then
+              echo "Low space, clean now"
               auto_clean
-              last_clean_time=$current_time
+              last_clean=$now
             fi
 
-            if [ $((MAX_RUN_MINUTES - run_minutes)) -eq 10 ] && [ "$backup_executed" = false ]; then
-              expire_full_backup
+            if [ $((MAX_RUN_MINUTES - run_mins)) -eq 10 ] && [ "$backup_done" = false ]; then
+              do_backup
               trigger_renew
             fi
 
-            pgrep -x Xvnc || { echo "WARNING: VNC异常，重启"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
-            sudo systemctl is-active --quiet docker || { echo "WARNING: Docker异常，重启"; sudo systemctl restart docker; }
-            sudo systemctl is-active --quiet casaos || { echo "WARNING: CasaOS异常，重启"; sudo systemctl restart casaos; }
-            sudo systemctl is-active --quiet tailscaled || { echo "WARNING: Tailscale异常，重启"; sudo systemctl restart tailscaled; }
+            pgrep -x Xvnc || { echo "VNC restart"; vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth; }
+            sudo systemctl is-active --quiet docker || { echo "Docker restart"; sudo systemctl restart docker; }
+            sudo systemctl is-active --quiet casaos || { echo "CasaOS restart"; sudo systemctl restart casaos; }
+            sudo systemctl is-active --quiet tailscaled || { echo "Tailscale restart"; sudo systemctl restart tailscaled; }
 
-            echo "[$(date)] 运行时长：${run_minutes}分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
+            echo "[$(date)] Run mins: $run_mins | Free: $(df -h / | awk 'NR==2{print $4}')"
             sleep 300
           done
 
-      - name: 9. 优雅清理环境
-        id: clean_env
+      - name: Step9 - Clean Env
+        id: step9
         if: always()
         run: |
-          echo "===== 清理环境 ====="
+          echo "Clean env start"
           vncserver -kill $DISPLAY || true && pkill -9 Xvnc || true
           sudo systemctl stop docker casaos tailscaled || true
           sudo tailscale down || true
           rm -rf $BACKUP_DIR $VNCDIR $NETDISK_ROOT || true
-          echo "INFO: 环境清理完成"
+          echo "Clean env done"
