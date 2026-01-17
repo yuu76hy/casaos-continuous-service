@@ -242,10 +242,14 @@ jobs:
             fi
             sleep 3
 
-            # 步骤2: 打包关键数据（带进度和错误捕获）
+            # 步骤2: 打包关键数据（修复tar参数顺序+移除通配符）
             echo "[$(date)] 步骤2/6: 开始打包数据，目标文件: $BK_NAME" | tee -a $BK_TEMP_LOG
             echo "[$(date)] 打包范围: /etc/casaos /var/lib/docker | 排除项: $BACKUP_EXCLUDE" | tee -a $BK_TEMP_LOG
-            sudo tar -z1cf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>> $BK_TEMP_LOG > /tmp/$BK_NAME
+            sudo tar -z1cf /tmp/$BK_NAME \
+              $BACKUP_EXCLUDE \
+              --directory=/ \
+              etc/casaos \
+              var/lib/docker 2>> $BK_TEMP_LOG
             tar_exit=$?
             if [ $tar_exit -ne 0 ]; then
               echo "[$(date)] ERROR: 数据打包失败，错误码: $tar_exit | 查看临时日志: $BK_TEMP_LOG"
@@ -337,7 +341,7 @@ jobs:
             fi
           }
 
-          # 检查新容器健康状态
+          # 检查新容器健康状态（精简轮询逻辑）
           check_new_container() {
             echo "[$(date)] 开始检查新容器健康状态，超时${HEALTH_CHECK_TIMEOUT}秒..."
             start_check=$(date +%s)
