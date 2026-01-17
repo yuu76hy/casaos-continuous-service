@@ -13,17 +13,14 @@ jobs:
       VNCDIR: /home/runner/.vnc
       VNC_PORT: 5900
       MAX_RUN_MINUTES: 340
-      FIXED_VNC_PWD: "123456789"  # 若需保密，可迁移到 Secrets，命名为 VNC_PWD
-      RUNNER_PASSWORD: "runner123" # 若需保密，可迁移到 Secrets，命名为 RUNNER_PWD
+      FIXED_VNC_PWD: "123456789"
+      RUNNER_PASSWORD: "runner123"
       CASAOS_PORT: 80
       NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
       CLEAN_INTERVAL: 3600
-      # 从 GitHub Secrets 读取密钥（核心修改）
-      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-      B2_BACKUP_BUCKET: "casaos-backup" # 存储桶名非密钥，可保留硬编码
+      B2_BACKUP_BUCKET: "casaos-backup"
       BACKUP_MARKER: "latest_backup.txt"
 
     steps:
@@ -36,7 +33,6 @@ jobs:
           sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "Upgrade failed"; exit 1; }
           pkgs="tar gzip rsync rclone tigervnc-standalone-server netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release bc"
           sudo apt install -y $pkgs || { echo "Install pkgs failed"; exit 1; }
-          # 若迁移 RUNNER_PASSWORD 到 Secrets，需改为：echo "runner:${{ secrets.RUNNER_PWD }}" | sudo chpasswd
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
           sudo mkdir -p $BACKUP_DIR $NETDISK_ROOT
           sudo chown -R runner:runner $BACKUP_DIR $NETDISK_ROOT
@@ -48,20 +44,19 @@ jobs:
         continue-on-error: false
         run: |
           echo "Config B2 start"
-          # 验证 Secrets 中的密钥是否配置
+          B2_KEY_ID=${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY=${{ secrets.B2_APPLICATION_KEY }}
           if [ -z "$B2_KEY_ID" ] || [ -z "$B2_APPLICATION_KEY" ]; then
-            echo "ERROR: B2 secrets not configured (B2_KEY_ID/B2_APPLICATION_KEY)"; exit 1;
+            echo "B2 key empty"; exit 1;
           fi
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
-[b2_backend]
-type = b2
-account = $B2_KEY_ID
-key = $B2_APPLICATION_KEY
-hard_delete = true
-timeout = 30s
-retries = 3
-EOF
+          echo "[b2_backend]" > ~/.config/rclone/rclone.conf
+          echo "type = b2" >> ~/.config/rclone/rclone.conf
+          echo "account = $B2_KEY_ID" >> ~/.config/rclone/rclone.conf
+          echo "key = $B2_APPLICATION_KEY" >> ~/.config/rclone/rclone.conf
+          echo "hard_delete = true" >> ~/.config/rclone/rclone.conf
+          echo "timeout = 30s" >> ~/.config/rclone/rclone.conf
+          echo "retries = 3" >> ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/ || echo "Bucket exists"
           if rclone lsd b2_backend:${B2_BACKUP_BUCKET}/ --verbose --retries 3; then
@@ -132,15 +127,12 @@ EOF
         run: |
           echo "Deploy VNC start"
           mkdir -p $VNCDIR && chmod 700 $VNCDIR
-          # 若迁移 VNC 密码到 Secrets，需改为：echo "${{ secrets.VNC_PWD }}" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
           echo "$FIXED_VNC_PWD" | vncpasswd -f > $VNCDIR/passwd && chmod 600 $VNCDIR/passwd
-          cat > $VNCDIR/xstartup << EOF
-#!/bin/bash
-export DISPLAY=:0
-export XDG_RUNTIME_DIR=/tmp/runtime-runner
-mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR
-exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title "CasaOS Console"
-EOF
+          echo "#!/bin/bash" > $VNCDIR/xstartup
+          echo "export DISPLAY=:0" >> $VNCDIR/xstartup
+          echo "export XDG_RUNTIME_DIR=/tmp/runtime-runner" >> $VNCDIR/xstartup
+          echo "mkdir -p \$XDG_RUNTIME_DIR && chmod 700 \$XDG_RUNTIME_DIR" >> $VNCDIR/xstartup
+          echo "exec /usr/bin/xterm -geometry 140x40+0+0 -ls -title \"CasaOS Console\"" >> $VNCDIR/xstartup
           chmod +x $VNCDIR/xstartup
           pgrep -x Xvnc && vncserver -kill $DISPLAY || true
           vncserver $DISPLAY -localhost no -geometry 1280x720 -depth 16 -SecurityTypes VncAuth || { echo "VNC start failed"; exit 1; }
@@ -150,9 +142,9 @@ EOF
           curl -fsSL https://tailscale.com/install.sh | sudo sh 2>&1 | grep -v "restart" || { echo "Tailscale install failed"; exit 1; }
           sudo systemctl enable --now tailscaled && sleep 3
           MAX_RETRIES=3
+          TS_AUTH_KEY=${{ secrets.TAILSCALE_AUTH_KEY }}
           while [ $MAX_RETRIES -gt 0 ]; do
-            # Tailscale Auth Key 已通过 Secrets 配置（原有逻辑不变）
-            if sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=casaos-${{ github.run_id }} --accept-routes=false; then
+            if sudo tailscale up --authkey=$TS_AUTH_KEY --hostname=casaos-${{ github.run_id }} --accept-routes=false; then
               TAILSCALE_IP=$(sudo tailscale ip -4)
               echo "Tailscale IP: $TAILSCALE_IP"
               echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
@@ -176,9 +168,9 @@ EOF
           echo "====================================="
           echo "Run time: $MAX_RUN_MINUTES mins"
           echo "Free space: $(df -h / | awk 'NR==2{print $4}')"
-          echo "Runner PWD: $RUNNER_PASSWORD" # 若迁移到 Secrets，需改为：echo "Runner PWD: ${{ secrets.RUNNER_PWD }}"
+          echo "Runner PWD: $RUNNER_PASSWORD"
           echo "B2 Status: $B2_STATUS"
-          echo "VNC: $TAILSCALE_IP:$VNC_PORT (PWD: $FIXED_VNC_PWD)" # 若迁移到 Secrets，需改为：echo "VNC: $TAILSCALE_IP:$VNC_PORT (PWD: ${{ secrets.VNC_PWD }})"
+          echo "VNC: $TAILSCALE_IP:$VNC_PORT (PWD: $FIXED_VNC_PWD)"
           echo "CasaOS: http://$TAILSCALE_IP:$CASAOS_PORT"
           echo "Backup: Only at last 10 mins"
           echo "Data: $(if [ $HAS_BACKUP = 'true' ]; then echo "Restored"; else echo "New"; fi)"
@@ -192,6 +184,8 @@ EOF
           start_time=$(date +%s)
           last_clean=$start_time
           backup_done=false
+          GITHUB_PAT=${{ secrets.USER_GITHUB_PAT }}
+          REPO=${{ github.repository }}
 
           auto_clean() {
             echo "Clean start"
@@ -225,8 +219,7 @@ EOF
 
           trigger_renew() {
             echo "Trigger renew"
-            # GitHub PAT 已通过 Secrets 配置（原有逻辑不变）
-            curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches -H "Accept: application/vnd.github+json" -H "Authorization: Bearer ${{ secrets.USER_GITHUB_PAT }}" -d '{"event_type":"renew_vnc"}' --connect-timeout 30s || echo "Renew failed"
+            curl -X POST https://api.github.com/repos/$REPO/dispatches -H "Accept: application/vnd.github+json" -H "Authorization: Bearer $GITHUB_PAT" -d '{"event_type":"renew_vnc"}' --connect-timeout 30s || echo "Renew failed"
           }
 
           while true; do
