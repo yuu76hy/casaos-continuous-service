@@ -242,14 +242,23 @@ jobs:
             fi
             sleep 3
 
-            # 步骤2: 打包关键数据（修复tar参数顺序+移除通配符）
+            # 步骤2: 打包关键数据（彻底修复exclude参数传递问题）
             echo "[$(date)] 步骤2/6: 开始打包数据，目标文件: $BK_NAME" | tee -a $BK_TEMP_LOG
             echo "[$(date)] 打包范围: /etc/casaos /var/lib/docker | 排除项: $BACKUP_EXCLUDE" | tee -a $BK_TEMP_LOG
+            
+            # 核心修复：将exclude拆分为数组，逐个传递参数
+            EXCLUDE_ARGS=()
+            while IFS= read -r arg; do
+              EXCLUDE_ARGS+=("$arg")
+            done < <(echo "$BACKUP_EXCLUDE" | xargs -n1)
+
+            # 执行tar命令（数组传递参数，避免字符串拼接错误）
             sudo tar -z1cf /tmp/$BK_NAME \
-              $BACKUP_EXCLUDE \
+              "${EXCLUDE_ARGS[@]}" \
               --directory=/ \
               etc/casaos \
               var/lib/docker 2>> $BK_TEMP_LOG
+            
             tar_exit=$?
             if [ $tar_exit -ne 0 ]; then
               echo "[$(date)] ERROR: 数据打包失败，错误码: $tar_exit | 查看临时日志: $BK_TEMP_LOG"
