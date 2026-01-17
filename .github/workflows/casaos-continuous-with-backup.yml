@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10  # 总运行时长10分钟
     env:
-      MAX_RUN_MINUTES: 5  # 运行5分钟后，剩余5分钟触发备份续跑
+      MAX_RUN_MINUTES: 1  # 运行1分钟后，剩余9分钟触发备份续跑
       RUNNER_PASSWORD: "runner123"
       CASAOS_PORT: 80
       NETDISK_ROOT: /home/runner/netdisk
@@ -186,7 +186,7 @@ jobs:
           echo "============= 服务访问信息 ============="
           echo "====================================="
           echo "服务总运行时长：10分钟"
-          echo "备份续跑触发时机：剩余5分钟时"
+          echo "备份续跑触发时机：剩余9分钟时"
           echo "系统剩余空间：$(df -h / | awk 'NR==2{print $4}')"
           echo "Runner用户密码：$RUNNER_PASSWORD"
           echo "B2存储连接状态：$B2_STATUS"
@@ -223,7 +223,7 @@ jobs:
           }
 
           do_backup() {
-            echo "[$(date)] 服务剩余5分钟，开始执行备份任务..."
+            echo "[$(date)] 服务剩余9分钟，开始执行备份任务..."
             TS=$(date +%Y%m%d_%H%M%S)
             BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
             sudo systemctl stop casaos
@@ -311,8 +311,8 @@ jobs:
               last_clean=$now
             fi
 
-            # 关键触发条件：剩余5分钟时执行备份+续跑
-            if [ $((MAX_RUN_MINUTES - run_mins)) -eq 0 ] && [ "$backup_done" = false ]; then
+            # 关键触发条件：运行1分钟后触发（剩余9分钟）
+            if [ $((run_mins)) -eq $MAX_RUN_MINUTES ] && [ "$backup_done" = false ]; then
               do_backup
               if trigger_renew; then
                 if check_new_container; then
