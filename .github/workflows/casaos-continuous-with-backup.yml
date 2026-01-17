@@ -71,28 +71,33 @@ jobs:
         id: step3
         continue-on-error: false
         run: |
-          echo "Check backup start"
-          # 核心逻辑：检查到备份就立即恢复，无备份则直接跳过
-          if rclone copy b2_backend:${B2_BACKUP_BUCKET}/${BACKUP_MARKER} $BACKUP_DIR/ --timeout 30s; then
-            LATEST_BACKUP=$(cat $BACKUP_DIR/${BACKUP_MARKER})
-            echo "Found backup: $LATEST_BACKUP → Start restore immediately"
+          echo "检查备份启动"
+          # 核心修复：先检查文件是否存在，再读取内容（避免cat报错）
+          BACKUP_MARKER_FILE="$BACKUP_DIR/$BACKUP_MARKER"
+          
+          # 尝试从B2下载备份标记文件（允许失败，无备份时不终止）
+          rclone copy b2_backend:${B2_BACKUP_BUCKET}/${BACKUP_MARKER} $BACKUP_DIR/ --timeout 30s || echo "未找到远程备份标记文件"
+          
+          # 先判断文件是否存在，再执行后续操作
+          if [ -f "$BACKUP_MARKER_FILE" ]; then
+            echo "找到备份标记文件 → 开始读取最新备份名称"
+            LATEST_BACKUP=$(cat "$BACKUP_MARKER_FILE")
+            echo "最新备份文件：$LATEST_BACKUP → 开始恢复"
             
-            # 立即执行恢复操作（无需后续步骤判断）
+            # 执行恢复操作
             echo "$BACKUP_EXCLUDE" | tr ' ' '\n' | sed 's/--exclude=//g' > $BACKUP_DIR/exclude-list.txt
-            rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null
-            
-            if [ $? -eq 0 ]; then
-              echo "Backup restore success!"
+            if rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null; then
+              echo "备份恢复成功！"
               echo "HAS_BACKUP=true" >> $GITHUB_ENV
             else
-              echo "Backup restore failed → Use new environment"
+              echo "备份恢复失败 → 使用全新环境"
               echo "HAS_BACKUP=false" >> $GITHUB_ENV
             fi
           else
-            echo "No backup found → Skip restore, use new environment"
+            echo "未找到备份标记文件 → 跳过恢复，使用全新环境"
             echo "HAS_BACKUP=false" >> $GITHUB_ENV
           fi
-          echo "Check & restore backup done"
+          echo "检查 & 恢复备份完成"
 
       - name: Step4 - Install CasaOS Only
         id: step4
@@ -100,7 +105,6 @@ jobs:
         run: |
           echo "Install CasaOS start"
           curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || { echo "CasaOS warn"; }
-          # 恢复场景：恢复后启动CasaOS；全新场景：直接启动CasaOS
           sudo systemctl start casaos
           echo "CasaOS install done (Docker auto-installed by CasaOS)"
 
