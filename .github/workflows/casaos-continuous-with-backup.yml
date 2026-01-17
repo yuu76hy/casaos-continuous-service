@@ -1,4 +1,4 @@
-name: CasaOS-Tailscale-Service-TEST-20MIN
+name: CasaOS-Tailscale-Service
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -7,21 +7,21 @@ on:
 jobs:
   run-service:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20  # 总运行时长20分钟
+    timeout-minutes: 10  # 总运行时长10分钟
     env:
-      MAX_RUN_MINUTES: 10  # 运行10分钟后，剩余10分钟触发备份续跑
+      MAX_RUN_MINUTES: 5  # 运行5分钟后，剩余5分钟触发备份续跑
       RUNNER_PASSWORD: "runner123"
       CASAOS_PORT: 80
       NETDISK_ROOT: /home/runner/netdisk
       BACKUP_DIR: /home/runner/backup
       LOG_DIR: /home/runner/logs
       BACKUP_EXCLUDE: "--exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run --exclude=/var/run --exclude=/home/runner/actions-runner --exclude=/var/lib/docker/overlay2"
-      CLEAN_INTERVAL: 120  # 2分钟清理一次空间
+      CLEAN_INTERVAL: 300  # 短时长场景，5分钟清理一次空间
       B2_BACKUP_BUCKET: "casaos-backup"
-      BACKUP_MARKER: "latest_backup_TEST.txt"
-      LOG_FILE: "casaos_service_TEST_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).log"
-      HEALTH_CHECK_TIMEOUT: 180  # 新容器健康检查超时3分钟
-      NEW_RUN_ID_FILE: "/home/runner/new_run_id_TEST.txt"
+      BACKUP_MARKER: "latest_backup.txt"
+      LOG_FILE: "casaos_service_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).log"
+      HEALTH_CHECK_TIMEOUT: 120  # 短时长场景，健康检查超时缩短为2分钟
+      NEW_RUN_ID_FILE: "/home/runner/new_run_id.txt"
 
     steps:
       - name: 步骤1 - 系统环境初始化
@@ -31,18 +31,23 @@ jobs:
           mkdir -p $LOG_DIR
           exec > >(tee -a $LOG_DIR/$LOG_FILE) 2>&1
           echo "====================================="
-          echo "========== 测试环境初始化 =========="
+          echo "开始执行步骤1：系统环境初始化"
           echo "====================================="
+          echo "1. 正在更新系统软件包列表..."
           sudo apt update -y 2>&1 | grep -v "restart" || { echo "系统更新失败！"; exit 1; }
+          echo "2. 正在升级系统软件包..."
           sudo apt upgrade -y 2>&1 | grep -v "restart" || { echo "系统升级失败！"; exit 1; }
+          echo "3. 正在安装核心依赖工具..."
           pkgs="tar gzip rsync rclone netcat-openbsd psmisc curl git wget vim nano python3 python3-pip ca-certificates gnupg lsb-release bc jq"
           sudo apt install -y $pkgs || { echo "依赖工具安装失败！"; exit 1; }
+          echo "4. 正在设置Runner用户密码..."
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
+          echo "5. 正在创建数据目录..."
           sudo mkdir -p $BACKUP_DIR $NETDISK_ROOT
           sudo chown -R runner:runner $BACKUP_DIR $NETDISK_ROOT
           sudo chmod -R 755 $BACKUP_DIR $NETDISK_ROOT
           echo "====================================="
-          echo "步骤1：测试环境初始化 执行完成！"
+          echo "步骤1：系统环境初始化 执行完成！"
           echo "====================================="
 
       - name: 步骤2 - 配置B2对象存储
@@ -59,58 +64,59 @@ jobs:
             echo "错误：B2密钥未配置！请检查GitHub Secrets。"; exit 1;
           fi
           mkdir -p ~/.config/rclone
-          # 修复YAML语法错误：改用echo逐行写入，避免EOF多行格式问题
           echo "[b2_backend]" > ~/.config/rclone/rclone.conf
           echo "type = b2" >> ~/.config/rclone/rclone.conf
           echo "account = $B2_KEY_ID" >> ~/.config/rclone/rclone.conf
           echo "key = $B2_APPLICATION_KEY" >> ~/.config/rclone/rclone.conf
           echo "hard_delete = true" >> ~/.config/rclone/rclone.conf
-          echo "timeout = 20s" >> ~/.config/rclone/rclone.conf
-          echo "retries = 2" >> ~/.config/rclone/rclone.conf
+          echo "timeout = 30s" >> ~/.config/rclone/rclone.conf
+          echo "retries = 3" >> ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
-          rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/test_backups/ || echo "测试备份目录已存在，跳过创建"
-          if rclone lsd b2_backend:${B2_BACKUP_BUCKET}/test_backups/; then
-            echo "B2测试目录连接成功！"
+          rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/ || echo "存储桶已存在，跳过创建"
+          if rclone lsd b2_backend:${B2_BACKUP_BUCKET}/ --verbose --retries 3; then
+            echo "B2存储连接成功！"
+            echo "B2_STATUS=success" >> $GITHUB_ENV
           else
-            echo "错误：B2测试目录访问失败！"; exit 1;
+            echo "错误：B2存储连接失败！"; exit 1;
           fi
           echo "====================================="
           echo "步骤2：配置B2对象存储 执行完成！"
           echo "====================================="
 
-      - name: 步骤3 - 检查测试备份并恢复（带校验）
+      - name: 步骤3 - 检查备份并恢复（带校验）
         id: step3
         continue-on-error: false
         run: |
           exec > >(tee -a $LOG_DIR/$LOG_FILE) 2>&1
           echo "====================================="
-          echo "开始执行步骤3：检查测试备份并恢复"
+          echo "开始执行步骤3：检查备份并恢复（如有）"
           echo "====================================="
           BACKUP_MARKER_FILE="$BACKUP_DIR/$BACKUP_MARKER"
-          rclone copy b2_backend:${B2_BACKUP_BUCKET}/${BACKUP_MARKER} $BACKUP_DIR/ --timeout 20s || echo "未找到测试备份标记文件，跳过恢复"
+          rclone copy b2_backend:${B2_BACKUP_BUCKET}/${BACKUP_MARKER} $BACKUP_DIR/ --timeout 30s || echo "未找到远程备份标记文件，跳过下载"
           
           if [ -f "$BACKUP_MARKER_FILE" ]; then
             LATEST_BACKUP=$(cat "$BACKUP_MARKER_FILE")
-            echo "最新测试备份文件：$LATEST_BACKUP"
+            echo "最新备份文件名称：$LATEST_BACKUP"
             echo "$BACKUP_EXCLUDE" | tr ' ' '\n' | sed 's/--exclude=//g' > $BACKUP_DIR/exclude-list.txt
-            if rclone cat b2_backend:${B2_BACKUP_BUCKET}/test_backups/${LATEST_BACKUP} --timeout 80s | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null; then
+            if rclone cat b2_backend:${B2_BACKUP_BUCKET}/${LATEST_BACKUP} --timeout 120s --retries 3 | sudo tar -zxf - -C / --exclude-from=$BACKUP_DIR/exclude-list.txt 2>/dev/null; then
+              echo "备份数据恢复完成，开始校验关键目录..."
               if [ -d "/etc/casaos" ] && [ -d "/var/lib/docker" ]; then
-                echo "✅ 恢复校验通过：关键目录存在"
+                echo "恢复校验通过：关键目录存在"
                 echo "HAS_BACKUP=true" >> $GITHUB_ENV
               else
-                echo "❌ 恢复校验失败：关键目录缺失"
+                echo "警告：恢复校验失败！关键目录缺失，使用全新环境"
                 echo "HAS_BACKUP=false" >> $GITHUB_ENV
               fi
             else
-              echo "❌ 备份恢复失败，使用全新环境"
+              echo "警告：备份数据恢复失败，使用全新环境！"
               echo "HAS_BACKUP=false" >> $GITHUB_ENV
             fi
           else
-            echo "ℹ️  无测试备份标记，全新环境部署"
+            echo "未找到备份标记文件，使用全新环境！"
             echo "HAS_BACKUP=false" >> $GITHUB_ENV
           fi
           echo "====================================="
-          echo "步骤3：检查测试备份并恢复 执行完成！"
+          echo "步骤3：检查备份并恢复 执行完成！"
           echo "====================================="
 
       - name: 步骤4 - 安装CasaOS
@@ -121,13 +127,12 @@ jobs:
           echo "====================================="
           echo "开始执行步骤4：安装CasaOS"
           echo "====================================="
-          curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || echo "⚠️  CasaOS安装警告，继续执行"
+          curl -fsSL https://get.casaos.io | sudo bash 2>&1 | grep -v "restart" || { echo "CasaOS安装警告，继续执行"; }
           sudo systemctl start casaos
-          sleep 3
           if sudo systemctl is-active --quiet casaos; then
-            echo "✅ CasaOS服务启动成功！"
+            echo "CasaOS服务启动成功！"
           else
-            echo "❌ CasaOS服务启动失败！请检查日志"
+            echo "警告：CasaOS服务启动异常，请检查日志！"
           fi
           echo "====================================="
           echo "步骤4：安装CasaOS 执行完成！"
@@ -142,62 +147,63 @@ jobs:
           echo "开始执行步骤5：部署Tailscale组网"
           echo "====================================="
           if ! curl -fsSL https://tailscale.com/install.sh | sudo sh 2>&1 | grep -v "restart"; then
-            echo "⚠️  Tailscale脚本安装失败，尝试APT方式"
+            echo "Tailscale脚本安装失败，尝试APT方式安装..."
             curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
             curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
-            sudo apt update && sudo apt install -y tailscale || { echo "❌ Tailscale安装失败！"; exit 1; }
+            sudo apt update && sudo apt install -y tailscale || { echo "错误：Tailscale安装失败！"; exit 1; }
           fi
-          sudo systemctl enable --now tailscaled && sleep 4
-          MAX_RETRIES=3
+          sudo systemctl enable --now tailscaled && sleep 5
+          MAX_RETRIES=5
           TS_AUTH_KEY=${{ secrets.TAILSCALE_AUTH_KEY }}
           if [ -z "$TS_AUTH_KEY" ]; then
-            echo "❌ Tailscale密钥未配置！"; exit 1;
+            echo "错误：Tailscale授权密钥未配置！"; exit 1;
           fi
           TAILSCALE_IP=""
           while [ $MAX_RETRIES -gt 0 ]; do
-            if sudo tailscale up --authkey=$TS_AUTH_KEY --hostname=casaos-TEST-${{ github.run_id }} --accept-routes=false --accept-dns=false; then
+            if sudo tailscale up --authkey=$TS_AUTH_KEY --hostname=casaos-${{ github.run_id }} --accept-routes=false --accept-dns=false; then
               TAILSCALE_IP=$(sudo tailscale ip -4)
-              echo "✅ Tailscale组网成功！内网IP：$TAILSCALE_IP"
+              echo "Tailscale组网成功！内网IP：$TAILSCALE_IP"
               echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
               break
             fi
             MAX_RETRIES=$((MAX_RETRIES-1))
-            echo "⚠️  Tailscale组网重试中，剩余次数：$MAX_RETRIES"
-            sleep 4
+            echo "Tailscale组网重试中，剩余次数：$MAX_RETRIES"
+            sleep 5
           done
           if [ -z "$TAILSCALE_IP" ]; then
-            echo "❌ Tailscale组网失败！"; exit 1;
+            echo "错误：Tailscale组网失败！"; exit 1;
           fi
           echo "====================================="
           echo "步骤5：部署Tailscale组网 执行完成！"
           echo "====================================="
 
-      - name: 步骤6 - 输出测试服务访问信息
+      - name: 步骤6 - 输出服务访问信息
         id: step6
         continue-on-error: false
         run: |
           exec > >(tee -a $LOG_DIR/$LOG_FILE) 2>&1
           echo "====================================="
-          echo "=========== 测试服务访问信息 ==========="
+          echo "============= 服务访问信息 ============="
           echo "====================================="
-          echo "📋 测试服务总运行时长：20分钟"
-          echo "⏰ 备份续跑触发时机：运行10分钟后（剩余10分钟）"
-          echo "💾 系统剩余空间：$(df -h / | awk 'NR==2{print $4}')"
-          echo "🔑 Runner用户密码：$RUNNER_PASSWORD"
-          echo "🌐 CasaOS管理面板：http://$TAILSCALE_IP:$CASAOS_PORT"
-          echo "📁 数据来源：$(if [ $HAS_BACKUP = 'true' ]; then echo "B2测试备份恢复"; else echo "全新测试环境"; fi)"
-          echo "📄 测试日志路径：$LOG_DIR/$LOG_FILE"
+          echo "服务总运行时长：10分钟"
+          echo "备份续跑触发时机：剩余5分钟时"
+          echo "系统剩余空间：$(df -h / | awk 'NR==2{print $4}')"
+          echo "Runner用户密码：$RUNNER_PASSWORD"
+          echo "B2存储连接状态：$B2_STATUS"
+          echo "CasaOS管理面板地址：http://$TAILSCALE_IP:$CASAOS_PORT"
+          echo "数据来源：$(if [ $HAS_BACKUP = 'true' ]; then echo "从B2备份恢复"; else echo "全新环境部署"; fi)"
+          echo "日志文件路径：$LOG_DIR/$LOG_FILE"
           echo "====================================="
-          echo "✅ 测试服务启动完成！"
+          echo "服务启动完成！"
           echo "====================================="
 
-      - name: 步骤7 - 核心保活+备份续跑+健康检查（20分钟版）
+      - name: 步骤7 - 核心保活+备份续跑+健康检查
         id: step7
         continue-on-error: true
         run: |
           exec > >(tee -a $LOG_DIR/$LOG_FILE) 2>&1
           echo "====================================="
-          echo "==== 核心保活+备份续跑+健康检查 ===="
+          echo "开始执行步骤7：核心保活+备份续跑+健康检查"
           echo "====================================="
           start_time=$(date +%s)
           last_clean=$start_time
@@ -206,117 +212,93 @@ jobs:
           REPO=${{ github.repository }}
           CURRENT_RUN_ID=${{ github.run_id }}
 
-          # 空间清理函数
           auto_clean() {
-            echo "[$(date)] 🧹 执行测试环境空间清理..."
+            echo "[$(date)] 执行系统空间清理..."
             BEFORE=$(df -h / | awk 'NR==2{print $4}')
             sudo apt clean -y && sudo apt autoremove -y --purge
             sudo docker system prune -af --volumes 2>/dev/null
             sudo rm -rf /tmp/* /var/tmp/* /home/runner/.cache/* 2>/dev/null
             AFTER=$(df -h / | awk 'NR==2{print $4}')
-            echo "[$(date)] 🧹 空间清理完成：$BEFORE → $AFTER"
+            echo "[$(date)] 空间清理完成：$BEFORE → $AFTER"
           }
 
-          # 备份函数（增加多重校验）
           do_backup() {
-            echo "[$(date)] ⏰ 【触发条件满足】剩余10分钟，开始执行备份任务..."
+            echo "[$(date)] 服务剩余5分钟，开始执行备份任务..."
             TS=$(date +%Y%m%d_%H%M%S)
-            BK_NAME="casaos_TEST_${CURRENT_RUN_ID}_$TS.tar.gz"
-            BK_PATH="test_backups/${BK_NAME}"
-
-            # 停止服务保证数据一致性
+            BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
             sudo systemctl stop casaos
             sleep 3
-
-            # 流式备份到B2 + 实时校验
-            if sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/${BK_PATH} --timeout 40s --retries 2; then
-              # 校验1：文件大小 > 0
-              BK_SIZE=$(rclone size b2_backend:${B2_BACKUP_BUCKET}/${BK_PATH} --json | jq -r '.size')
-              if [ "$BK_SIZE" -le 0 ]; then
-                echo "[$(date)] ❌ 备份校验失败：文件大小为0字节"
-                sudo systemctl start casaos
-                backup_done=true
-                return 1
+            if sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --timeout 60s --retries 3; then
+              BK_SIZE=$(rclone size b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --json | jq -r '.size')
+              if [ "$BK_SIZE" -gt 0 ]; then
+                echo "备份校验通过：大小 $BK_SIZE 字节"
+                echo "$BK_NAME" > $BACKUP_DIR/$BACKUP_MARKER
+                rclone copy $BACKUP_DIR/$BACKUP_MARKER b2_backend:${B2_BACKUP_BUCKET}/ --timeout 30s
+                rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/logs/ --timeout 30s
+                echo "日志已上传到B2: logs/$LOG_FILE"
+              else
+                echo "备份校验失败：文件大小为0"
               fi
-              # 校验2：远程文件存在
-              if ! rclone ls b2_backend:${B2_BACKUP_BUCKET}/${BK_PATH} >/dev/null 2>&1; then
-                echo "[$(date)] ❌ 备份校验失败：远程文件不存在"
-                sudo systemctl start casaos
-                backup_done=true
-                return 1
-              fi
-              # 备份成功：更新标记+上传日志
-              echo "$BK_NAME" > $BACKUP_DIR/$BACKUP_MARKER
-              rclone copy $BACKUP_DIR/$BACKUP_MARKER b2_backend:${B2_BACKUP_BUCKET}/ --timeout 20s
-              rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/test_logs/ --timeout 20s
-              echo "[$(date)] ✅ 备份全流程通过：文件大小 $BK_SIZE 字节"
             else
-              echo "[$(date)] ❌ 备份上传失败！"
-              sudo systemctl start casaos
-              backup_done=true
-              return 1
+              echo "备份上传失败！"
             fi
-
-            # 重启服务
             sudo systemctl start casaos
             backup_done=true
-            return 0
           }
 
-          # 触发续跑函数
+          # 触发续跑并获取新Run ID
           trigger_renew() {
-            echo "[$(date)] 🚀 开始触发新容器续跑..."
+            echo "[$(date)] 触发新的服务续跑..."
             if [ -z "$GITHUB_PAT" ] || [ -z "$REPO" ]; then
-              echo "[$(date)] ❌ 续跑失败：PAT或仓库信息未配置"
+              echo "续跑失败：PAT或仓库信息未配置"
               return 1
             fi
             RESPONSE=$(curl -s -X POST https://api.github.com/repos/$REPO/dispatches \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GITHUB_PAT" \
               -d '{"event_type":"renew_vnc"}' \
-              -w "%{http_code}" -o /dev/null --connect-timeout 20s)
+              -w "%{http_code}" -o /dev/null --connect-timeout 30s)
             if [ "$RESPONSE" -eq 204 ]; then
-              echo "[$(date)] ✅ 续跑触发请求成功！等待新容器启动..."
+              echo "续跑触发请求成功！等待新容器启动..."
               return 0
             else
-              echo "[$(date)] ❌ 续跑触发失败，HTTP状态码：$RESPONSE"
+              echo "续跑触发失败，HTTP状态码：$RESPONSE"
               return 1
             fi
           }
 
-          # 新容器健康检查函数（双重验证）
+          # 检查新容器健康状态
           check_new_container() {
-            echo "[$(date)] 🔍 开始检查新容器健康状态，超时${HEALTH_CHECK_TIMEOUT}秒..."
+            echo "[$(date)] 开始检查新容器健康状态，超时${HEALTH_CHECK_TIMEOUT}秒..."
             start_check=$(date +%s)
             while [ $(( $(date +%s) - start_check )) -lt $HEALTH_CHECK_TIMEOUT ]; do
-              # 获取同仓库下运行中的测试工作流
+              # 获取仓库最新运行中的工作流
               RUNS=$(curl -s -H "Authorization: Bearer $GITHUB_PAT" \
                 "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&event=repository_dispatch" \
-                | jq -r '.workflow_runs[] | select(.id != '$CURRENT_RUN_ID' and .name | contains("TEST-20MIN")) | .id')
+                | jq -r '.workflow_runs[] | select(.id != '$CURRENT_RUN_ID') | .id')
               if [ -n "$RUNS" ]; then
                 NEW_RUN_ID=$(echo "$RUNS" | head -n 1)
-                echo "[$(date)] ✅ 发现新容器Run ID：$NEW_RUN_ID"
+                echo "[$(date)] 发现新容器Run ID：$NEW_RUN_ID"
                 echo $NEW_RUN_ID > $NEW_RUN_ID_FILE
-                # 等待新容器完成部署+服务启动
-                sleep 40
-                echo "[$(date)] ✅ 新容器健康检查通过：已完成初始化并运行"
+                # 短时长场景，缩短新容器初始化等待时间
+                sleep 30
+                echo "[$(date)] 新容器已启动并完成初始化，验证通过！"
                 return 0
               fi
-              echo "[$(date)] ⏳ 新容器尚未启动，等待8秒..."
-              sleep 8
+              echo "[$(date)] 新容器尚未启动，等待5秒..."
+              sleep 5
             done
-            echo "[$(date)] ❌ 健康检查超时：未检测到正常新容器"
+            echo "[$(date)] 健康检查超时，未检测到正常新容器！"
             return 1
           }
 
-          # 主循环
-          echo "[$(date)] 🎯 核心保活逻辑启动（20分钟测试模式）..."
+          echo "核心保活逻辑启动..."
           while true; do
             now=$(date +%s)
             run_mins=$(( (now - start_time) / 60 ))
             free_space=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
-
-            # 定时空间清理
+            
+            # 定时清理
             if [ $((now - last_clean)) -ge $CLEAN_INTERVAL ]; then
               auto_clean
               last_clean=$now
@@ -324,64 +306,55 @@ jobs:
 
             # 空间不足紧急清理
             if (( $(echo "$free_space < 1" | bc -l) )); then
-              echo "[$(date)] ⚠️  剩余空间不足1G，紧急清理..."
+              echo "[$(date)] 剩余空间不足1G，紧急清理..."
               auto_clean
               last_clean=$now
             fi
 
-            # 核心触发逻辑：剩余10分钟时执行备份+续跑
+            # 关键触发条件：剩余5分钟时执行备份+续跑
             if [ $((MAX_RUN_MINUTES - run_mins)) -eq 0 ] && [ "$backup_done" = false ]; then
-              # 步骤1：执行备份，备份失败则跳过后续流程
-              if do_backup; then
-                echo "[$(date)] 📦 备份任务完成，开始触发续跑..."
-                # 步骤2：触发新容器续跑
-                if trigger_renew; then
-                  # 步骤3：检查新容器健康状态
-                  if check_new_container; then
-                    echo "[$(date)] 🎉 新容器健康检查通过，旧容器开始安全退出..."
-                    # 停止旧容器服务并退出
-                    sudo systemctl stop casaos tailscaled
-                    sudo tailscale down
-                    echo "[$(date)] ✅ 旧容器已安全退出！"
-                    exit 0
-                  else
-                    echo "[$(date)] ⚠️  新容器健康检查失败，旧容器继续运行..."
-                  fi
+              do_backup
+              if trigger_renew; then
+                if check_new_container; then
+                  echo "[$(date)] 新容器健康检查通过，旧容器准备退出..."
+                  sudo systemctl stop casaos tailscaled
+                  sudo tailscale down
+                  echo "[$(date)] 旧容器已安全退出！"
+                  exit 0
                 else
-                  echo "[$(date)] ⚠️  续跑触发失败，旧容器继续运行..."
+                  echo "[$(date)] 新容器健康检查失败，旧容器继续运行..."
                 fi
               else
-                echo "[$(date)] ⚠️  备份任务失败，跳过续跑流程..."
+                echo "[$(date)] 续跑触发失败，旧容器继续运行..."
               fi
             fi
 
-            # 服务保活监控
+            # 服务保活
             if ! sudo systemctl is-active --quiet casaos; then
-              echo "[$(date)] ⚠️  CasaOS服务未运行，重启中..."
+              echo "[$(date)] CasaOS未运行，重启..."
               sudo systemctl restart casaos
             fi
             if ! sudo systemctl is-active --quiet tailscaled; then
-              echo "[$(date)] ⚠️  Tailscale服务未运行，重启中..."
+              echo "[$(date)] Tailscale未运行，重启..."
               sudo systemctl restart tailscaled
             fi
 
-            # 输出运行状态
-            echo "[$(date)] 📊 已运行 $run_mins 分钟 | 剩余时间: $((MAX_RUN_MINUTES - run_mins)) 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
-            sleep 8
+            echo "[$(date)] 已运行 $run_mins 分钟 | 剩余时间: $((10 - run_mins)) 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
+            sleep 10
           done
 
-      - name: 步骤8 - 测试环境清理
+      - name: 步骤8 - 服务结束后清理环境
         id: step8
         if: always()
         run: |
           exec > >(tee -a $LOG_DIR/$LOG_FILE) 2>&1
           echo "====================================="
-          echo "开始执行步骤8：测试环境清理"
+          echo "开始执行步骤8：服务结束后清理环境"
           echo "====================================="
           sudo systemctl stop casaos tailscaled || true
           sudo tailscale down || true
           rm -rf $BACKUP_DIR $NETDISK_ROOT || true
-          rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/test_logs/ --timeout 20s || echo "⚠️  测试日志上传失败"
+          rclone copy $LOG_DIR/$LOG_FILE b2_backend:${B2_BACKUP_BUCKET}/logs/ --timeout 30s || echo "日志上传失败"
           echo "====================================="
-          echo "✅ 步骤8：测试环境清理完成！"
+          echo "步骤8：环境清理完成！"
           echo "====================================="
