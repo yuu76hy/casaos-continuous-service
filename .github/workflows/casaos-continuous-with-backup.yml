@@ -21,7 +21,7 @@ jobs:
         run: |
           mkdir -p $BACKUP_DIR $LOG_DIR
           sudo apt update && sudo apt install -y tar gzip rclone curl jq bc
-          # 【彻底修复】改用echo逐行写入，完全避开EOF多行文本问题
+          # 逐行写入rclone配置，避开EOF问题
           mkdir -p ~/.config/rclone
           echo "[b2_backend]" > ~/.config/rclone/rclone.conf
           echo "type = b2" >> ~/.config/rclone/rclone.conf
@@ -94,7 +94,7 @@ jobs:
           echo "Runner运行ID：${{ github.run_id }}"
           echo "====================================="
 
-      - name: 步骤4 - 保活+备份+续跑
+      - name: 步骤4 - 保活+备份+续跑（修复后）
         id: keep_alive
         run: |
           start_time=$(date +%s)
@@ -137,8 +137,8 @@ jobs:
               -d '{
                 "event_type":"renew_casaos",
                 "client_payload": {
-                  "backup_file": "${{ env.BACKUP_FILE }}",
-                  "prev_run_id": "${{ github.run_id }}"
+                  "backup_file": "'"${{ env.BACKUP_FILE }}"'",
+                  "prev_run_id": "'"${{ github.run_id }}"'"
                 }
               }' \
               -w "%{http_code}" -o /dev/null --connect-timeout 30s)
