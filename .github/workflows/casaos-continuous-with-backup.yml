@@ -38,20 +38,21 @@ jobs:
           sudo apt update -y && sudo apt upgrade -y -q
           sudo apt install -y rsync davfs2 curl wget jq iptables || { echo "依赖安装失败"; exit 1; }
 
+          # 授予 runner 免密 sudo（用于后续操作）
           echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           echo "✅ 系统初始化完成 (日志: $LOG_FILE)"
 
-      # ========== 步骤1.5：创建 roots 用户 ==========
+      # ========== 步骤1.5：创建 roots 用户（带 sudo 权限）==========
       - name: 步骤1.5 - 创建 roots 用户
         run: |
           echo "===== 步骤1.5：创建 roots 用户 ====="
+          # 创建用户
           sudo useradd -m -s /bin/bash roots
           echo "roots:roots1234" | sudo chpasswd
-          # 可选：赋予免密 sudo 权限（按需启用）
-          # echo "roots ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/roots
-          # sudo chmod 0440 /etc/sudoers.d/roots
-          echo "✅ 用户 'roots' 已创建，密码为 'roots1234'"
+          # 👇 关键：加入 sudo 组（Ubuntu 特权组）
+          sudo usermod -aG sudo roots
+          echo "✅ 用户 'roots' 已创建，密码为 'roots1234'，已具备 sudo 权限"
 
       # ========== 步骤2：挂载WebDAV ==========
       - name: 步骤2 - 挂载WebDAV并验证
@@ -75,7 +76,6 @@ jobs:
           if [ "$mount_success" = "true" ]; then
             echo "✅ WebDAV挂载成功 (路径: $WEBDAV_MOUNT_POINT)"
             echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-
             for dir in $BACKUP_DIRS; do
               target_path="$WEBDAV_MOUNT_POINT$dir"
               if [ -d "$target_path" ] && [ -n "$(ls -A "$target_path" 2>/dev/null)" ]; then
@@ -195,9 +195,9 @@ jobs:
           if [ -n "${{ env.TAILSCALE_IP }}" ]; then
             echo "🔒 内网访问：http://${{ env.TAILSCALE_IP }}:80"
           fi
-          echo "🔑 默认账号：admin / password"
-          echo "⚠️ 登录后请立即修改密码！"
-          echo "👤 调试用户：roots / roots1234 （仅限 Tailscale 内网 SSH）"
+          echo "🔑 CasaOS 默认账号：admin / password"
+          echo "👤 调试用户：roots / roots1234 （支持 sudo）"
+          echo "⚠️ 登录 CasaOS 后请立即修改默认密码！"
           echo "====================================="
 
       # ========== 步骤9：保活 + 备份 + 续跑 ==========
@@ -275,7 +275,7 @@ jobs:
             sleep 60
           done
 
-      # ========== 步骤10：清理环境（always 执行） ==========
+      # ========== 步骤10：清理环境（始终执行） ==========
       - name: 步骤10 - 清理环境
         id: step10
         if: ${{ always() }}
