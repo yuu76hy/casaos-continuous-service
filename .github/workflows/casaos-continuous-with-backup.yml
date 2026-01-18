@@ -7,9 +7,9 @@ on:
 jobs:
   run-service:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10  # 总运行时长10分钟（10分钟）
+    timeout-minutes: 360  # 总运行时长6小时（360分钟）
     env:
-      MAX_RUN_MINUTES: 1  # 运行1分钟后，剩余9分钟触发备份续跑
+      MAX_RUN_MINUTES: 330  # 运行330分钟后，剩余30分钟触发备份续跑
       RUNNER_PASSWORD: "runner123"
       CASAOS_PORT: 80
       NETDISK_ROOT: /home/runner/netdisk
@@ -63,15 +63,15 @@ jobs:
           if [ -z "$B2_KEY_ID" ] || [ -z "$B2_APPLICATION_KEY" ]; then
             echo "错误：B2密钥未配置！请检查GitHub Secrets。"; exit 1;
           fi
-          mkdir -p ～/.config/rclone
-          echo "[b2_backend]" > ～/.config/rclone/rclone.conf
-          echo "type = b2" >> ～/.config/rclone/rclone.conf
-          echo "account = $B2_KEY_ID" >> ～/.config/rclone/rclone.conf
-          echo "key = $B2_APPLICATION_KEY" >> ～/.config/rclone/rclone.conf
-          echo "hard_delete = true" >> ～/.config/rclone/rclone.conf
-          echo "timeout = 30s" >> ～/.config/rclone/rclone.conf
-          echo "retries = 3" >> ～/.config/rclone/rclone.conf
-          chmod 600 ～/.config/rclone/rclone.conf
+          mkdir -p ~/.config/rclone
+          echo "[b2_backend]" > ~/.config/rclone/rclone.conf
+          echo "type = b2" >> ~/.config/rclone/rclone.conf
+          echo "account = $B2_KEY_ID" >> ~/.config/rclone/rclone.conf
+          echo "key = $B2_APPLICATION_KEY" >> ~/.config/rclone/rclone.conf
+          echo "hard_delete = true" >> ~/.config/rclone/rclone.conf
+          echo "timeout = 30s" >> ~/.config/rclone/rclone.conf
+          echo "retries = 3" >> ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
           rclone mkdir b2_backend:${B2_BACKUP_BUCKET}/ || echo "存储桶已存在，跳过创建"
           if rclone lsd b2_backend:${B2_BACKUP_BUCKET}/ --verbose --retries 3; then
             echo "B2存储连接成功！"
@@ -185,8 +185,8 @@ jobs:
           echo "====================================="
           echo "============= 服务访问信息 ============="
           echo "====================================="
-          echo "服务总运行时长：10分钟"
-          echo "备份续跑触发时机：运行1分钟后（剩余9分钟）"
+          echo "服务总运行时长：360分钟（6小时）"
+          echo "备份续跑触发时机：剩余30分钟时"
           echo "系统剩余空间：$(df -h / | awk 'NR==2{print $4}')"
           echo "Runner用户密码：$RUNNER_PASSWORD"
           echo "B2存储连接状态：$B2_STATUS"
@@ -223,20 +223,12 @@ jobs:
           }
 
           do_backup() {
-            echo "[$(date)] 服务剩余9分钟，开始执行备份任务..."
+            echo "[$(date)] 服务剩余30分钟，开始执行备份任务..."
             TS=$(date +%Y%m%d_%H%M%S)
             BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
-            
-            # 检查系统空间
-            free_space=$(df -h / | awk 'NR==2{print $4}' | sed 's/[^0-9.]//g')
-            if (( $(echo "$free_space < 5" | bc -l) )); then
-              echo "错误：系统剩余空间不足5GB，无法执行备份！"
-              return 1
-            fi
-            
             sudo systemctl stop casaos
             sleep 3
-            if sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --timeout 120s --retries 5; then
+            if sudo tar -zcf - $BACKUP_EXCLUDE / --wildcards "*/casaos/*" "*/docker/*" 2>/dev/null | rclone rcat b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --timeout 60s --retries 3; then
               BK_SIZE=$(rclone size b2_backend:${B2_BACKUP_BUCKET}/$BK_NAME --json | jq -r '.size')
               if [ "$BK_SIZE" -gt 0 ]; then
                 echo "备份校验通过：大小 $BK_SIZE 字节"
@@ -319,8 +311,8 @@ jobs:
               last_clean=$now
             fi
 
-            # 关键触发条件：运行1分钟后执行备份+续跑（剩余9分钟）
-            if [ $run_mins -eq $MAX_RUN_MINUTES ] && [ "$backup_done" = false ]; then
+            # 关键触发条件：剩余30分钟时执行备份+续跑
+            if [ $((MAX_RUN_MINUTES - run_mins)) -eq 30 ] && [ "$backup_done" = false ]; then
               do_backup
               if trigger_renew; then
                 if check_new_container; then
@@ -347,7 +339,7 @@ jobs:
               sudo systemctl restart tailscaled
             fi
 
-            echo "[$(date)] 已运行 $run_mins 分钟 | 剩余时间: $((10 - run_mins)) 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
+            echo "[$(date)] 已运行 $run_mins 分钟 | 剩余时间: $((MAX_RUN_MINUTES - run_mins)) 分钟 | 剩余空间: $(df -h / | awk 'NR==2{print $4}')"
             sleep 60
           done
 
