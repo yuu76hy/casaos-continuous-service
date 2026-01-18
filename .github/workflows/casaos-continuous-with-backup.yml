@@ -1,4 +1,5 @@
 name: CasaOS-Tailscale-Full-Deploy
+
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -17,12 +18,12 @@ jobs:
       EXCLUDE_DIRS: "/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp"
       MAX_MOUNT_RETRIES: 2
       RETRY_DELAY: 10
-      WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
-      WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
-      WEBDAV_PASSWORD: "${{ secrets.WEBDAV_PASSWORD }}"
-      USER_PAT: "${{ secrets.USER_PAT }}"
-      TAILSCALE_AUTH_KEY: "${{ secrets.TAILSCALE_AUTH_KEY }}"
-      REPO: "${{ github.repository }}"
+      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      REPO: ${{ github.repository }}
 
     steps:
       # ========== 步骤1：系统环境初始化 ==========
@@ -30,16 +31,16 @@ jobs:
         id: step1
         run: |
           echo "===== 步骤1：系统环境初始化 ====="
-          mkdir -p /home/runner/logs $WEBDAV_MOUNT_POINT
+          mkdir -p /home/runner/logs "$WEBDAV_MOUNT_POINT"
           LOG_FILE="/home/runner/logs/casaos-tailscale-${{ github.run_id }}.log"
           exec > >(tee -a "$LOG_FILE") 2>&1
-          
+
           # 安装依赖
           sudo apt update -y && sudo apt upgrade -y -q
           sudo apt install -y rsync davfs2 curl wget jq iptables || { echo "依赖安装失败"; exit 1; }
-          
+
           # 配置sudo免密
-          echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
+          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           echo "✅ 系统初始化完成 (日志: $LOG_FILE)"
 
@@ -51,39 +52,40 @@ jobs:
           # 配置免密挂载
           echo "$WEBDAV_URL $WEBDAV_USER $WEBDAV_PASSWORD" | sudo tee -a /etc/davfs2/secrets
           sudo chmod 600 /etc/davfs2/secrets
-          
+
           # 挂载重试逻辑
           mount_success=false
           for retry in $(seq 1 $MAX_MOUNT_RETRIES); do
-            sudo umount $WEBDAV_MOUNT_POINT 2>/dev/null || true
+            sudo umount "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
             echo "🔄 尝试挂载 WebDAV (第 $retry/$MAX_MOUNT_RETRIES 次)"
-            if sudo mount -t davfs -o uid=runner,gid=runner $WEBDAV_URL $WEBDAV_MOUNT_POINT; then
+            if sudo mount -t davfs -o uid=runner,gid=runner "$WEBDAV_URL" "$WEBDAV_MOUNT_POINT"; then
               mount_success=true
               break
             fi
             sleep $RETRY_DELAY
           done
-          
+
           # 验证挂载点
           if [ "$mount_success" = "true" ]; then
             echo "✅ WebDAV挂载成功 (路径: $WEBDAV_MOUNT_POINT)"
-            echo "WEBDAV_AVAILABLE=true" >> $GITHUB_ENV
-            
-            # 检测备份目录
+            echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
+
             for dir in $BACKUP_DIRS; do
               target_path="$WEBDAV_MOUNT_POINT$dir"
-              if [ -d "$target_path" ] && [ "$(ls -A "$target_path")" ]; then
+              if [ -d "$target_path" ] && [ -n "$(ls -A "$target_path")" ]; then
                 echo "✅ 检测到 $dir 有效备份数据"
-                echo "HAS_${dir//\//_}=true" >> $GITHUB_ENV
+                key="HAS_${dir//\//_}"
+                echo "${key}=true" >> "$GITHUB_ENV"
               else
                 echo "⚠️ $dir 无备份数据，创建空目录"
                 sudo mkdir -p "$target_path"
-                echo "HAS_${dir//\//_}=false" >> $GITHUB_ENV
+                key="HAS_${dir//\//_}"
+                echo "${key}=false" >> "$GITHUB_ENV"
               fi
             done
           else
             echo "❌ WebDAV挂载失败，跳过备份恢复流程"
-            echo "WEBDAV_AVAILABLE=false" >> $GITHUB_ENV
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
           fi
           echo "✅ 步骤2完成"
 
@@ -114,7 +116,7 @@ jobs:
           if [ "$RESTORE_DONE" = "false" ]; then
             echo "⚠️ 无有效备份数据，跳过恢复"
           fi
-          echo "DATA_RESTORED=$RESTORE_DONE" >> $GITHUB_ENV
+          echo "DATA_RESTORED=$RESTORE_DONE" >> "$GITHUB_ENV"
 
       # ========== 步骤4：清空旧备份 ==========
       - name: 步骤4 - 清空WebDAV旧备份
@@ -177,7 +179,7 @@ jobs:
             exit 1
           fi
           echo "✅ Tailscale组网成功，内网IP: $TAILSCALE_IP"
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
 
       # ========== 步骤8：输出访问信息 ==========
       - name: 步骤8 - 输出访问信息
@@ -186,26 +188,26 @@ jobs:
           echo "===== 步骤8：访问信息 ====="
           RUNNER_PUBLIC_IP=$(curl -s ifconfig.me)
           echo "====================================="
-          echo "🔗 公网访问: http://$RUNNER_PUBLIC_IP:80"
+          echo "🔗 公网访问：http://$RUNNER_PUBLIC_IP:80"
           if [ -n "${{ env.TAILSCALE_IP }}" ]; then
-            echo "🔒 内网访问: http://${{ env.TAILSCALE_IP }}:80"
+            echo "🔒 内网访问：http://${{ env.TAILSCALE_IP }}:80"
           fi
-          echo "🔑 默认账号: admin / password"
+          echo "🔑 默认账号：admin / password"
           echo "⚠️ 登录后请立即修改密码！"
           echo "====================================="
 
       # ========== 步骤9：保活+备份+续跑 ==========
       - name: 步骤9 - 保活与续跑
         id: step9
+        shell: /usr/bin/bash
         run: |
           echo "===== 步骤9：保活与续跑 ====="
           start_time=$(date +%s)
           backup_done=false
           trigger_done=false
 
-          # 触发续跑任务
           trigger_renew() {
-            if [ "$trigger_done" = "true" ] || [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then 
+            if [ "$trigger_done" = "true" ] || [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               return 1
             fi
             curl -s -X POST -H "Authorization: token $USER_PAT" \
@@ -219,66 +221,14 @@ jobs:
             return 1
           }
 
-          # 备份函数（排除WebDAV挂载点）
           backup_single_dir() {
-            if [ "${{ env.WEBDAV_AVAILABLE }}" != "true" ]; then 
+            if [ "${{ env.WEBDAV_AVAILABLE }}" != "true" ]; then
               return 1
             fi
-            local dir=$1
+            local dir="$1"
             local target_path="$WEBDAV_MOUNT_POINT$dir"
             EXCLUDE_PARAMS=()
             for excl in $EXCLUDE_DIRS; do
               EXCLUDE_PARAMS+=("--exclude=$excl")
             done
-            # 关键修复：排除WebDAV挂载点避免循环
             EXCLUDE_PARAMS+=("--exclude=$WEBDAV_MOUNT_POINT")
-            
-            sudo rsync -av --delete "${EXCLUDE_PARAMS[@]}" / "$target_path/"
-            if [ $? -eq 0 ]; then
-              echo "✅ $dir 备份完成"
-              echo "backup_time=$(date +%Y%m%d_%H%M%S) runner_id=${{ github.run_id }}" | sudo tee "$target_path/backup_marker.txt" >/dev/null
-              return 0
-            fi
-            return 1
-          }
-
-          # 保活主循环
-          while true; do
-            run_mins=$(( (date +%s - start_time) / 60 ))
-            free_space=$(df -h / | awk 'NR==2{print $4}')
-            echo "📊 运行状态：$run_mins/$MAX_RUN_MINUTES 分钟 | 空间: $free_space"
-
-            # 剩余30分钟执行备份+续跑
-            if [ $((MAX_RUN_MINUTES - run_mins)) -eq 30 ]; then
-              echo "⚠️ 剩余30分钟，执行备份+续跑"
-              for dir in $BACKUP_DIRS; do
-                if backup_single_dir "$dir"; then
-                  trigger_renew
-                  backup_done=true
-                  break
-                fi
-              done
-              if [ "$backup_done" = "false" ]; then
-                echo "⚠️ 备份失败，尝试触发续跑"
-                trigger_renew
-              fi
-            fi
-
-            # 达到最大运行时间退出
-            if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
-              echo "⏰ 已达到最大运行时长 ($MAX_RUN_MINUTES 分钟)，退出保活"
-              exit 0
-            fi
-
-            sleep 60
-          done
-
-      # ========== 步骤10：环境清理 ==========
-      - name: 步骤10 - 清理环境
-        id: step10
-        if: ${{ always() }}
-        run: |
-          echo "===== 步骤10：清理环境 ====="
-          sudo umount $WEBDAV_MOUNT_POINT 2>/dev/null || true
-          sudo rm -rf /tmp/* /home/runner/*.log
-          echo "✅ 环境清理完成"
