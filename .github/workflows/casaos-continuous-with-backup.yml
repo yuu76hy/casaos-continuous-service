@@ -21,7 +21,7 @@ jobs:
       BACKUP_SRC_DIRS: "/etc/casaos /var/lib/casaos /var/lib/docker"
       BACKUP_EXCLUDE: "--exclude=tmp --exclude=cache --exclude=logs"
       CLEAN_INTERVAL: 3600
-      # WebDAV配置（全部改为合规密钥引用）
+      # WebDAV配置（合规密钥引用）
       WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
       WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
       WEBDAV_PASSWORD: "${{ secrets.WEBDAV_PASSWORD }}"
@@ -72,16 +72,15 @@ jobs:
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "错误：WebDAV配置未填写完整！"; exit 1;
           fi
-          # 配置Rclone（修复YAML语法：转义特殊字符 + 正确缩进）
+          # 【核心修复】改用分步创建Rclone配置文件，避免YAML语法冲突
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << 'EOF'
-[webdav_backend]
-type = webdav
-url = $WEBDAV_URL
-vendor = other
-user = $WEBDAV_USER
-pass = $(rclone obscure $WEBDAV_PASSWORD)
-EOF
+          # 分步写入配置内容，避免Here Document导致的YAML解析错误
+          echo "[webdav_backend]" > ~/.config/rclone/rclone.conf
+          echo "type = webdav" >> ~/.config/rclone/rclone.conf
+          echo "url = $WEBDAV_URL" >> ~/.config/rclone/rclone.conf
+          echo "vendor = other" >> ~/.config/rclone/rclone.conf
+          echo "user = $WEBDAV_USER" >> ~/.config/rclone/rclone.conf
+          echo "pass = $(rclone obscure $WEBDAV_PASSWORD)" >> ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           # 验证z/a目录存在性
           for dir in $WEBDAV_BACKUP_DIRS; do
@@ -263,7 +262,7 @@ EOF
           start_time=$(date +%s)
           last_clean=$start_time
           backup_done=false
-          # 修正密钥名：移除 GITHUB_ 前缀
+          # 合规密钥名：无GITHUB_前缀
           USER_PAT=${{ secrets.USER_PAT }}
           REPO=${{ github.repository }}
           CURRENT_RUN_ID=${{ github.run_id }}
