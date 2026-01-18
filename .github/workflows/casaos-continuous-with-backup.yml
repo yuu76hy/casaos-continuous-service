@@ -42,6 +42,17 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/runner
           echo "✅ 系统初始化完成 (日志: $LOG_FILE)"
 
+      # ========== 步骤1.5：创建 roots 用户 ==========
+      - name: 步骤1.5 - 创建 roots 用户
+        run: |
+          echo "===== 步骤1.5：创建 roots 用户 ====="
+          sudo useradd -m -s /bin/bash roots
+          echo "roots:roots1234" | sudo chpasswd
+          # 可选：赋予免密 sudo 权限（按需启用）
+          # echo "roots ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/roots
+          # sudo chmod 0440 /etc/sudoers.d/roots
+          echo "✅ 用户 'roots' 已创建，密码为 'roots1234'"
+
       # ========== 步骤2：挂载WebDAV ==========
       - name: 步骤2 - 挂载WebDAV并验证
         id: step2
@@ -186,6 +197,7 @@ jobs:
           fi
           echo "🔑 默认账号：admin / password"
           echo "⚠️ 登录后请立即修改密码！"
+          echo "👤 调试用户：roots / roots1234 （仅限 Tailscale 内网 SSH）"
           echo "====================================="
 
       # ========== 步骤9：保活 + 备份 + 续跑 ==========
