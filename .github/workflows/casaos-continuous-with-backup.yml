@@ -72,9 +72,9 @@ jobs:
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "错误：WebDAV配置未填写完整！"; exit 1;
           fi
-          # 配置Rclone
+          # 配置Rclone（修复YAML语法：转义特殊字符 + 正确缩进）
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
+          cat > ~/.config/rclone/rclone.conf << 'EOF'
 [webdav_backend]
 type = webdav
 url = $WEBDAV_URL
