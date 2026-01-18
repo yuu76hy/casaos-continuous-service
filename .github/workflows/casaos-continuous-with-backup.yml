@@ -1,46 +1,35 @@
 name: CasaOS 持续运行 + 自动续跑 + B2备份
 on:
-  # 1. 手动触发
   workflow_dispatch:
-  # 2. 续跑触发（由旧实例调用）
   repository_dispatch:
     types: [renew_casaos]
 
 jobs:
   run-casaos:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10  # 单次运行10分钟（GitHub Actions免费版限制）
+    timeout-minutes: 10
     env:
-      # 核心配置（可根据需要调整）
-      B2_BUCKET: "casaos-backup"  # 你的B2存储桶名称
+      B2_BUCKET: "casaos-backup"
       BACKUP_DIR: "/tmp/casaos-backup"
       LOG_DIR: "/tmp/casaos-logs"
-      # 备份触发时机：运行9分钟后触发（剩余1分钟缓冲）
       TRIGGER_BACKUP_MINS: 9
       TOTAL_RUN_MINS: 10
 
     steps:
-      ###########################################################################
-      # 步骤1：环境初始化 + 安装依赖
-      ###########################################################################
       - name: 步骤1 - 系统环境初始化
         id: init_env
         run: |
-          # 创建目录
           mkdir -p $BACKUP_DIR $LOG_DIR
-          # 安装核心依赖
           sudo apt update && sudo apt install -y tar gzip rclone curl jq bc
-          # 配置rclone（B2）- 修复第36行：<<EOF 无空格，EOF顶格写
+          # 【彻底修复】改用echo逐行写入，完全避开EOF多行文本问题
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-[b2_backend]
-type = b2
-account = ${{ secrets.B2_KEY_ID }}
-key = ${{ secrets.B2_APPLICATION_KEY }}
-hard_delete = true
-timeout = 30s
-retries = 3
-EOF
+          echo "[b2_backend]" > ~/.config/rclone/rclone.conf
+          echo "type = b2" >> ~/.config/rclone/rclone.conf
+          echo "account = ${{ secrets.B2_KEY_ID }}" >> ~/.config/rclone/rclone.conf
+          echo "key = ${{ secrets.B2_APPLICATION_KEY }}" >> ~/.config/rclone/rclone.conf
+          echo "hard_delete = true" >> ~/.config/rclone/rclone.conf
+          echo "timeout = 30s" >> ~/.config/rclone/rclone.conf
+          echo "retries = 3" >> ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
           # 验证B2连接
           if rclone lsd b2_backend:$B2_BUCKET; then
@@ -51,28 +40,18 @@ EOF
             exit 1
           fi
 
-      ###########################################################################
-      # 步骤2：恢复上一轮备份（仅续跑触发时执行）
-      ###########################################################################
       - name: 步骤2 - 恢复上一轮备份
         id: restore_backup
         if: github.event_name == 'repository_dispatch' && github.event.action == 'renew_casaos'
         run: |
-          # 获取上一轮备份文件名
           BACKUP_FILE=${{ github.event.client_payload.backup_file }}
           echo "开始恢复备份：$BACKUP_FILE"
-          
-          # 下载备份文件
           if ! rclone copy b2_backend:$B2_BUCKET/backups/$BACKUP_FILE $BACKUP_DIR/; then
             echo "备份文件下载失败！使用全新环境启动..."
             echo "RESTORE_SUCCESS=false" >> $GITHUB_ENV
             exit 0
           fi
-          
-          # 解压恢复（覆盖原有目录）
           sudo tar -zxf $BACKUP_DIR/$BACKUP_FILE -C / --overwrite --exclude=/proc --exclude=/sys --exclude=/tmp
-          
-          # 验证恢复结果
           if [ -d "/etc/casaos" ] && [ -d "/var/lib/docker" ]; then
             echo "备份恢复成功！"
             echo "RESTORE_SUCCESS=true" >> $GITHUB_ENV
@@ -81,25 +60,17 @@ EOF
             echo "RESTORE_SUCCESS=false" >> $GITHUB_ENV
           fi
 
-      ###########################################################################
-      # 步骤3：安装+启动CasaOS + Tailscale
-      ###########################################################################
       - name: 步骤3 - 启动CasaOS + Tailscale
         id: start_services
         run: |
-          # 安装CasaOS（全新环境/恢复失败时执行）
           if [ "${{ env.RESTORE_SUCCESS }}" != "true" ]; then
             curl -fsSL https://get.casaos.io | sudo bash
           fi
-          
-          # 启动CasaOS
           sudo systemctl start casaos && sleep 5
           if ! sudo systemctl is-active --quiet casaos; then
             echo "CasaOS启动失败！"
             exit 1
           fi
-          
-          # 启动Tailscale（组网）
           MAX_RETRIES=3
           TS_AUTH_KEY=${{ secrets.TAILSCALE_AUTH_KEY }}
           if [ -z "$TS_AUTH_KEY" ]; then
@@ -107,8 +78,6 @@ EOF
             echo "TAILSCALE_IP=未配置" >> $GITHUB_ENV
             exit 0
           fi
-          
-          # 重试连接Tailscale
           while [ $MAX_RETRIES -gt 0 ]; do
             if sudo tailscale up --authkey=$TS_AUTH_KEY --hostname=casaos-${{ github.run_id }} --accept-routes=false --accept-dns=false; then
               TAILSCALE_IP=$(sudo tailscale ip -4)
@@ -120,16 +89,11 @@ EOF
             echo "Tailscale组网重试中，剩余次数：$MAX_RETRIES"
             sleep 5
           done
-          
-          # 输出访问信息
           echo "====================================="
           echo "CasaOS访问地址：http://$TAILSCALE_IP:80"
           echo "Runner运行ID：${{ github.run_id }}"
           echo "====================================="
 
-      ###########################################################################
-      # 步骤4：核心保活 + 超时前备份 + 触发续跑
-      ###########################################################################
       - name: 步骤4 - 保活+备份+续跑
         id: keep_alive
         run: |
@@ -139,19 +103,13 @@ EOF
           GITHUB_PAT=${{ secrets.USER_GITHUB_PAT }}
           REPO=${{ github.repository }}
           
-          # 函数1：打包+上传备份
           do_backup() {
             echo "[$(date)] 开始备份数据..."
             BK_NAME="casaos_backup_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).tar.gz"
-            
-            # 打包关键数据（排除无用目录）
             sudo tar -zcf $BACKUP_DIR/$BK_NAME \
               --exclude=/proc --exclude=/sys --exclude=/tmp --exclude=/dev --exclude=/run \
               /etc/casaos /var/lib/docker
-            
-            # 上传到B2
             if rclone copy $BACKUP_DIR/$BK_NAME b2_backend:$B2_BUCKET/backups/; then
-              # 验证上传结果
               if rclone ls b2_backend:$B2_BUCKET/backups/$BK_NAME; then
                 echo "[$(date)] 备份上传成功！文件：$BK_NAME"
                 echo "BACKUP_FILE=$BK_NAME" >> $GITHUB_ENV
@@ -167,13 +125,11 @@ EOF
             fi
           }
           
-          # 函数2：触发新工作流续跑
           trigger_renew() {
             if [ -z "$GITHUB_PAT" ] || [ -z "$REPO" ]; then
               echo "[$(date)] 续跑失败：PAT/仓库信息未配置"
               return 1
             fi
-            
             echo "[$(date)] 触发新工作流续跑..."
             RESPONSE=$(curl -s -X POST https://api.github.com/repos/$REPO/dispatches \
               -H "Accept: application/vnd.github+json" \
@@ -186,7 +142,6 @@ EOF
                 }
               }' \
               -w "%{http_code}" -o /dev/null --connect-timeout 30s)
-            
             if [ "$RESPONSE" -eq 204 ]; then
               echo "[$(date)] 续跑触发成功！HTTP状态码：$RESPONSE"
               renew_triggered=true
@@ -197,30 +152,24 @@ EOF
             fi
           }
           
-          # 主循环：保活+检测备份时机
           echo "[$(date)] 核心保活逻辑启动..."
           while true; do
-            # 计算已运行时长（分钟）
             run_seconds=$(( $(date +%s) - start_time ))
             run_mins=$(( run_seconds / 60 ))
             remaining_mins=$(( TOTAL_RUN_MINS - run_mins ))
             
-            # 1. 服务保活：检测CasaOS是否运行
             if ! sudo systemctl is-active --quiet casaos; then
               echo "[$(date)] CasaOS已停止，重启..."
               sudo systemctl restart casaos
             fi
             
-            # 2. 触发备份：达到时机且未备份
             if [ $run_mins -ge $TRIGGER_BACKUP_MINS ] && [ "$backup_done" = false ]; then
               echo "[$(date)] 已运行$run_mins分钟（剩余$remaining_mins分钟），触发备份..."
               if do_backup; then
-                # 备份成功后触发续跑
                 trigger_renew
               fi
             fi
             
-            # 3. 兜底退出：剩余时间不足1分钟
             if [ $remaining_mins -le 1 ]; then
               echo "[$(date)] 剩余时间不足1分钟，安全退出..."
               sudo systemctl stop casaos
@@ -228,14 +177,10 @@ EOF
               exit 0
             fi
             
-            # 输出运行状态
             echo "[$(date)] 已运行$run_mins分钟 | 剩余$remaining_mins分钟 | 备份状态：$backup_done | 续跑状态：$renew_triggered"
             sleep 10
           done
 
-      ###########################################################################
-      # 步骤5：清理环境（无论成功/失败都执行）
-      ###########################################################################
       - name: 步骤5 - 清理临时文件
         id: clean_env
         if: always()
