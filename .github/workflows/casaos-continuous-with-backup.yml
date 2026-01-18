@@ -30,9 +30,9 @@ jobs:
           mkdir -p $BACKUP_DIR $LOG_DIR
           # 安装核心依赖
           sudo apt update && sudo apt install -y tar gzip rclone curl jq bc
-          # 配置rclone（B2）
+          # 配置rclone（B2）- 修复第36行：<<EOF 无空格，EOF顶格写
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
+          cat > ~/.config/rclone/rclone.conf <<EOF
 [b2_backend]
 type = b2
 account = ${{ secrets.B2_KEY_ID }}
