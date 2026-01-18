@@ -17,6 +17,9 @@ jobs:
       DOCKER_DATA: /var/lib/docker
       # 仅排除系统核心目录，其余全量备份恢复
       EXCLUDE_DIRS: "/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp"
+      # 重试配置
+      MAX_MOUNT_RETRIES: 2  # 最大重试次数
+      RETRY_DELAY: 10       # 重试间隔（秒）
       # Secrets 引用（需在仓库配置）
       WEBDAV_URL: "${{ secrets.WEBDAV_URL }}"
       WEBDAV_USER: "${{ secrets.WEBDAV_USER }}"
@@ -45,7 +48,7 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/runner
           echo "✅ 系统初始化完成"
 
-      # ========== 步骤2：挂载WebDAV并检测备份目录 ==========
+      # ========== 步骤2：挂载WebDAV并检测备份目录（带2次重试+目录空判断修复） ==========
       - name: 步骤2 - 挂载WebDAV并检测备份目录
         id: step2
         run: |
@@ -54,20 +57,52 @@ jobs:
           echo "$WEBDAV_URL $WEBDAV_USER $WEBDAV_PASSWORD" | sudo tee -a /etc/davfs2/secrets
           sudo chmod 600 /etc/davfs2/secrets
           
-          # 先卸载旧挂载，再挂载新的
-          sudo umount $WEBDAV_MOUNT_POINT 2>/dev/null || true
-          sudo mount -t davfs -o uid=runner,gid=runner $WEBDAV_URL $WEBDAV_MOUNT_POINT || { echo "WebDAV挂载失败"; exit 1; }
+          # ========== 核心：WebDAV挂载重试逻辑 ==========
+          mount_success=false
+          retry_count=0
           
-          # 只检测目录状态，不清除旧数据（为步骤3恢复保留源）
+          while [ $retry_count -le $MAX_MOUNT_RETRIES ]; do
+            # 先卸载旧挂载
+            sudo umount $WEBDAV_MOUNT_POINT 2>/dev/null || true
+            
+            echo "🔄 尝试挂载WebDAV（第 $((retry_count+1)) 次）"
+            if sudo mount -t davfs -o uid=runner,gid=runner $WEBDAV_URL $WEBDAV_MOUNT_POINT; then
+              echo "✅ WebDAV挂载成功！"
+              mount_success=true
+              break
+            else
+              echo "❌ WebDAV挂载失败（第 $((retry_count+1)) 次）"
+              retry_count=$((retry_count+1))
+              if [ $retry_count -le $MAX_MOUNT_RETRIES ]; then
+                echo "⏳ 等待 $RETRY_DELAY 秒后重试..."
+                sleep $RETRY_DELAY
+              fi
+            fi
+          done
+          
+          # 重试后仍失败则退出
+          if [ "$mount_success" = "false" ]; then
+            echo "❌ WebDAV挂载重试 $MAX_MOUNT_RETRIES 次后仍失败，终止任务"
+            exit 1
+          fi
+
+          # ========== 修复：目录存在但为空的判断逻辑 ==========
           for dir in $BACKUP_DIRS; do
             target_path=$WEBDAV_MOUNT_POINT$dir
-            if [ -d "$target_path" ] && [ "$(ls -A $target_path)" ]; then
-              echo "✅ 检测到 $dir 存在有效备份数据（恢复源可用）"
-              echo "HAS_${dir//\//_}=true" >> $GITHUB_ENV
-            else
-              echo "⚠️ $dir 无备份数据或目录不存在，自动创建空目录"
+            # 第一步：判断目录是否存在
+            if [ ! -d "$target_path" ]; then
+              echo "⚠️ $dir 目录不存在，自动创建空目录"
               sudo mkdir -p "$target_path"
               echo "HAS_${dir//\//_}=false" >> $GITHUB_ENV
+            else
+              # 第二步：目录存在，判断是否有有效数据
+              if [ "$(ls -A $target_path)" ]; then
+                echo "✅ 检测到 $dir 存在有效备份数据（恢复源可用）"
+                echo "HAS_${dir//\//_}=true" >> $GITHUB_ENV
+              else
+                echo "⚠️ $dir 目录存在但无备份数据"
+                echo "HAS_${dir//\//_}=false" >> $GITHUB_ENV
+              fi
             fi
           done
           echo "✅ WebDAV挂载+备份目录检测完成"
@@ -166,7 +201,7 @@ jobs:
           echo "⚠️ 登录后请立即修改默认密码！"
           echo "✅ 访问信息输出完成"
 
-      # ========== 步骤9：保活+单目录备份完成即触发续跑 ==========
+      # ========== 步骤9：保活+单目录备份完成触发续跑 ==========
       - name: 步骤9 - 保活+单目录备份完成触发续跑
         id: step9
         run: |
