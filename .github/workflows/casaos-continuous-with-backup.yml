@@ -142,7 +142,7 @@ jobs:
       - name: 步骤4 - 安装或跳过 CasaOS
         run: |
           echo "===== 步骤4：安装 CasaOS ====="
-          # 修正：移除了 {{ }} 语法，直接使用环境变量
+          # 修正：= 两边添加了空格
           if [ -d "$CASAOS_DATA" ] && [ "$DATA_RESTORED" = "true" ]; then
             echo "✅ 检测到已恢复 CasaOS 数据，跳过安装"
           else
