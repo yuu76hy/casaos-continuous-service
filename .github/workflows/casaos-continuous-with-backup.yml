@@ -88,7 +88,7 @@ jobs:
           fi
           echo "✅ Debug user 'roots' is ready"
 
-      # ========== 步骤2：使用 rclone 挂载 WebDAV（增强重试） ==========
+      # ========== 步骤2：使用 rclone 挂载 WebDAV（修复参数错误） ==========
       - name: Step 2 - Mount WebDAV with rclone
         run: |
           set -e
@@ -112,17 +112,10 @@ jobs:
             pass="$ENCRYPTED_PASS" \
             --config /home/runner/.rclone.conf
 
-          # 后台挂载WebDAV（增强稳定性配置）
-          nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
-            --config /home/runner/.rclone.conf \
-            --vfs-cache-mode full \  # full缓存提升文件操作稳定性
-            --daemon-timeout 1h \    # 延长守护进程超时时间
-            --allow-other \          # 允许其他用户访问挂载点
-            --umask 022 \            # 设置文件权限掩码
-            --log-file /tmp/rclone.log \
-            --log-level DEBUG \      # 调试日志便于排查问题
-            --retries 3 \
-            >/dev/null 2>&1 &
+          # ========== 核心修复：rclone mount 命令参数格式 ==========
+          # 合并命令行参数为单行，避免换行/空格导致的空参数
+          nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" --config /home/runner/.rclone.conf --vfs-cache-mode full --daemon-timeout 1h --allow-other --umask 022 --log-file /tmp/rclone.log --log-level DEBUG --retries 3 >/dev/null 2>&1 &
+          # ========== 修复结束 ==========
 
           # 增强型挂载检查（多次重试）
           MOUNT_SUCCESS=false
