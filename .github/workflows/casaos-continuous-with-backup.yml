@@ -138,11 +138,12 @@ jobs:
           done
           echo "DATA_RESTORED=$RESTORE_DONE" >> "$GITHUB_ENV"
 
-      # ========== 步骤4：安装 CasaOS ==========
+      # ========== 步骤4：安装 CasaOS（已修正语法错误） ==========
       - name: 步骤4 - 安装或跳过 CasaOS
         run: |
           echo "===== 步骤4：安装 CasaOS ====="
-          if [ -d "$CASAOS_DATA" ] && [ "${{ env.DATA_RESTORED }}" = "true" ]; then
+          # 修正：移除了 {{ }} 语法，直接使用环境变量
+          if [ -d "$CASAOS_DATA" ] && [ "$DATA_RESTORED" = "true" ]; then
             echo "✅ 检测到已恢复 CasaOS 数据，跳过安装"
           else
             curl -fsSL https://get.casaos.io | sudo bash || { echo "❌ CasaOS 安装失败"; exit 1; }
