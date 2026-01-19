@@ -300,7 +300,7 @@ jobs:
           echo "👤 Debug User: roots (password from secrets or random generated)"
           echo "⚠️ Please change CasaOS default password immediately!"
 
-      # ========== 步骤8：保活 + 备份 + 续跑（修复逻辑） ==========
+      # ========== 步骤8：保活 + 备份 + 续跑（修改触发时间为350分钟） ==========
       - name: Step 8 - Keep Alive + Backup + Renew
         shell: bash
         run: |
@@ -370,15 +370,15 @@ jobs:
             fi
           }
           
-          # 保活主循环（修复重复触发问题）
+          # 保活主循环（核心修改：触发时间改为350分钟）
           while true; do
             current_time=$(date +%s)
             run_mins=$(( (current_time - start_time) / 60 ))
             echo "📊 Running for $run_mins/$MAX_RUN_MINUTES minutes"
             
-            # 剩余60分钟时触发备份和续跑（仅触发一次）
-            if [ $run_mins -ge 300 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰ 60 minutes remaining, starting backup and renew..."
+            # ========== 核心修改：运行到350分钟触发，剩余10分钟 ==========
+            if [ $run_mins -ge 350 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
+              echo "⏰ 10 minutes remaining, starting backup and renew..."
               for dir in $BACKUP_DIRS; do
                 if backup_single_dir "$dir"; then
                   trigger_renew
