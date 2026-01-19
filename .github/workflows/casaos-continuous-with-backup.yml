@@ -1,84 +1,103 @@
 name: CasaOS-Tailscale-Full-Deploy
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 手动触发
   repository_dispatch:
-    types: [renew_casaos_tailscale]
+    types: [renew_casaos_tailscale]  # 续跑触发
 
 jobs:
   deploy-casaos-tailscale:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 360  # 最大运行6小时
     permissions:
       contents: read
-      actions: write
+      actions: write  # 取消旧工作流权限
     env:
+      # ========== 核心配置（无需修改） ==========
       MAX_RUN_MINUTES: 360
       SYNC_INTERVAL: 60
       WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
-      BACKUP_DIRS: "/z/Ubu"  # 固定写入/z/Ubu目录
+      BACKUP_DIRS: "/z/Ubu"               # 固定写入/z/Ubu
       CASAOS_DATA: /var/lib/casaos
       DOCKER_DATA: /var/lib/docker
       KEEP_BACKUP_COUNT: 2
+      # ========== 系统排除目录（无需修改） ==========
       EXCLUDE_DIRS: >-
         /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
         /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
         /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs
         /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
+      # ========== WebDAV挂载重试配置（适配Cloud Run） ==========
       MOUNT_RETRY_COUNT: 5
-      MOUNT_RETRY_DELAY: 5
+      MOUNT_RETRY_DELAY: 10  # 延长重试间隔到10秒，适配Cloud Run冷启动
+      # ========== GitHub自动注入变量（无需修改） ==========
       REPO: ${{ github.repository }}
       CURRENT_RUN_ID: ${{ github.run_id }}
       WORKFLOW_NAME: ${{ github.workflow }}
 
     steps:
+      # ========== 步骤1：系统初始化 + 依赖安装 ==========
       - name: Step 1 - System Init & Dependency Install
         run: |
           echo "===== 系统环境初始化 ====="
+          # 更新系统并安装基础依赖
           sudo apt update -y && sudo apt install -y rsync curl wget jq fuse3 openssl || { echo "❌ 依赖安装失败"; exit 1; }
+          # 安装rclone（适配Cloud Run的最新版本）
           curl -fsSL https://rclone.org/install.sh | sudo bash
+          # 配置fuse允许非root用户挂载
           echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+          # 配置runner免密sudo
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
+          # 优化Docker配置（限制日志大小）
           sudo mkdir -p /etc/systemd/system/docker.service.d
           echo '[Service]
           ExecStart=
           ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock --log-opt max-size=10m --log-opt max-file=2' | sudo tee /etc/systemd/system/docker.service.d/override.conf
           sudo systemctl daemon-reload
+          # 初始垃圾清理
           sudo rm -rf /tmp/* /var/tmp/*
           sudo apt clean && sudo apt autoclean && sudo apt autoremove -y
           sudo journalctl --vacuum-time=1d
           sudo find /var/log -type f -mtime +1 -delete
           echo "✅ 系统初始化完成"
 
+      # ========== 步骤2：创建调试用户（安全随机密码） ==========
       - name: Step 2 - Create Debug User
         run: |
           echo "===== 创建调试用户 ====="
+          # 创建带sudo权限的调试用户
           sudo useradd -m -s /bin/bash roots
           ROOT_PASSWORD=$(openssl rand -base64 12)
           echo "roots:$ROOT_PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo roots
+          # 密码安全存储（不输出到日志）
           echo "$ROOT_PASSWORD" | sudo tee /root/debug_password.txt > /dev/null
           sudo chmod 600 /root/debug_password.txt
           echo "✅ 调试用户创建完成 | 账号：roots | 密码已保存至 /root/debug_password.txt"
 
-      - name: Step 3 - Mount WebDAV (Fix /z/Ubu Write)
+      # ========== 步骤3：WebDAV挂载（适配Cloud Run，指定/z/Ubu写入） ==========
+      - name: Step 3 - Mount WebDAV (Cloud Run适配 + /z/Ubu写入)
         env:
           WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
           WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
           WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
         run: |
-          echo "===== 挂载 WebDAV 存储（指定/z/Ubu写入） ====="
-          if [[ ! "$WEBDAV_URL" =~ ^https?:// ]]; then
-            echo "❌ WebDAV URL 格式错误，必须以 http:// 或 https:// 开头"
-            exit 1
+          echo "===== 挂载 WebDAV 存储（指定/z/Ubu写入，适配Cloud Run） ====="
+          # 验证URL格式（适配Cloud Run域名）
+          if [[ ! "$WEBDAV_URL" =~ ^https://.*\.ap-northeast-1\.clawcloudrun\.com/$ ]]; then
+            echo "⚠️ 检测到非标准Cloud Run URL格式，当前URL: $WEBDAV_URL"
+            echo "建议格式：https://xxx.ap-northeast-1.clawcloudrun.com/"
           fi
-          WEBDAV_URL_FIXED="${WEBDAV_URL%/}/"
-          echo "🔧 修正后的WebDAV URL: $WEBDAV_URL_FIXED"
 
+          # 确保URL末尾带/（兼容用户输入）
+          WEBDAV_URL_FIXED="${WEBDAV_URL%/}/"
+          echo "🔧 最终使用的WebDAV URL: $WEBDAV_URL_FIXED"
+
+          # 创建本地挂载点
           mkdir -p "$WEBDAV_MOUNT_POINT"
           
-          # 配置rclone
+          # 配置rclone（适配Cloud Run HTTPS + 基本认证）
           rclone config create mywebdav webdav \
             url="$WEBDAV_URL_FIXED" \
             vendor="other" \
@@ -86,70 +105,96 @@ jobs:
             pass="$WEBDAV_PASSWORD" \
             --obscure \
             --config /home/runner/.rclone.conf
+
+          # 打印脱敏配置（排查用）
+          echo "📝 rclone配置摘要（脱敏）："
+          rclone config show mywebdav --config /home/runner/.rclone.conf | sed 's/pass = .*/pass = *** ENCRYPTED ***/'
+
+          # 测试Cloud Run WebDAV连接（优化超时/重试，适配冷启动）
+          echo "🔍 测试Cloud Run WebDAV连接（允许冷启动延迟）..."
+          if ! rclone ls mywebdav: --config /home/runner/.rclone.conf \
+            --log-level DEBUG \
+            --timeout 30s \     # 延长超时到30秒，适配Cloud Run冷启动
+            --retries 3 \       # 增加重试次数
+            --low-level-retries 10 \
+            2>/tmp/rclone_test.log; then
             
-          # 测试基础连接
-          echo "🔍 测试WebDAV连接..."
-          if ! rclone ls mywebdav: --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-            echo "❌ WebDAV 基础连接失败，请检查URL/账号密码"
+            echo "❌ Cloud Run WebDAV连接失败"
+            echo "📚 详细错误日志（脱敏）："
+            cat /tmp/rclone_test.log | sed 's/Authorization: .*/Authorization: *** REDACTED ***/'
+            echo "💡 排查建议："
+            echo "  1. 确认Cloud Run服务已启动（无服务器服务可能冷启动）"
+            echo "  2. 检查WEBDAV_USER/WEBDAV_PASSWORD是否正确"
+            echo "  3. 确认Cloud Run安全组允许443端口访问"
             exit 1
           fi
 
-          # 后台挂载WebDAV
+          # 后台挂载WebDAV（优化Cloud Run适配参数）
           nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
             --config /home/runner/.rclone.conf \
-            --vfs-cache-mode full \
+            --vfs-cache-mode full \          # 全缓存模式，解决写入404
             --vfs-cache-max-age 24h \
             --vfs-cache-max-size 10G \
             --buffer-size 64M \
-            --daemon-timeout 5m \
+            --daemon-timeout 10m \           # 延长守护进程超时
             --allow-other \
             --allow-non-empty \
             --umask 022 \
             --log-file /tmp/rclone.log \
-            --log-level INFO >/dev/null 2>&1 &
+            --log-level INFO \
+            --timeout 30s \                  # 延长网络超时
+            --retries 3 \                    # 增加重试次数
+            --low-level-retries 10 \         # 底层连接重试
+            >/dev/null 2>&1 &
           
-          # 挂载验证（重点：直接测试/z/Ubu目录写入）
-          sleep 15
+          # 挂载验证（延长等待，适配Cloud Run冷启动）
+          sleep 20  # 比默认多等5秒，确保服务就绪
           MOUNT_SUCCESS=false
           WRITE_TEST_SUCCESS=false
           
           for i in $(seq 1 $MOUNT_RETRY_COUNT); do
             echo "🔍 检查 WebDAV 挂载状态 (尝试 $i/$MOUNT_RETRY_COUNT)..."
             
-            if timeout 10 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
-              echo "✅ 目录可读，验证/z/Ubu写入权限..."
+            if timeout 15 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then  # 延长ls超时
+              echo "✅ 目录可读，验证/z/Ubu写入权限（Cloud Run）..."
               
-              # ========== 关键修改1：直接创建/z/Ubu并测试写入 ==========
+              # 显式创建/z/Ubu/test目录并测试写入
               TEST_DIR="$WEBDAV_MOUNT_POINT/z/Ubu/test"
-              mkdir -p "$TEST_DIR"  # 显式创建/z/Ubu/test目录
-              test_file="$TEST_DIR/mount_test_$(date -u +%s).txt"
-              echo "mount_test_$(date -u +%s)" > "$test_file"
+              mkdir -p "$TEST_DIR"
+              test_file="$TEST_DIR/mount_test_$(date -u +%s)_cloudrun.txt"
+              echo "mount_test_$(date -u +%s)_cloudrun" > "$test_file"
               
               # 验证文件写入成功
               if [ -f "$test_file" ]; then
-                # 远程验证/z/Ubu目录下的文件
-                if rclone ls mywebdav:z/Ubu/test/ --config /home/runner/.rclone.conf | grep -q "$(basename $test_file)"; then
+                # 远程验证（延长超时，适配跨区域延迟）
+                if rclone ls mywebdav:z/Ubu/test/ --config /home/runner/.rclone.conf \
+                  --timeout 20s \
+                  | grep -q "$(basename $test_file)"; then
+                  
                   # 清理测试文件
                   rm -rf "$WEBDAV_MOUNT_POINT/z/Ubu/test"
-                  rclone delete mywebdav:z/Ubu/test/ --config /home/runner/.rclone.conf >/dev/null 2>&1
+                  rclone delete mywebdav:z/Ubu/test/ --config /home/runner/.rclone.conf \
+                    --timeout 20s >/dev/null 2>&1
+                  
                   MOUNT_SUCCESS=true
                   WRITE_TEST_SUCCESS=true
-                  echo "✅ /z/Ubu 目录写入验证通过"
+                  echo "✅ /z/Ubu 目录写入验证通过（Cloud Run适配成功）"
                   break
                 fi
               fi
               
+              # 清理测试目录（重试时）
               rm -rf "$WEBDAV_MOUNT_POINT/z/Ubu/test"
             fi
             
-            echo "⚠️ /z/Ubu 写入验证失败，等待 $MOUNT_RETRY_DELAY 秒后重试"
+            echo "⚠️ /z/Ubu 写入验证失败，等待 $MOUNT_RETRY_DELAY 秒后重试（Cloud Run）"
             sleep $MOUNT_RETRY_DELAY
           done
           
           if [ "$WRITE_TEST_SUCCESS" = "false" ]; then
-            echo "❌ /z/Ubu 目录写入验证失败"
-            echo "📊 挂载日志:"
-            cat /tmp/rclone.log 2>/dev/null || echo "无日志文件"
+            echo "❌ /z/Ubu 目录写入验证失败（Cloud Run）"
+            echo "📊 挂载日志（脱敏）:"
+            cat /tmp/rclone.log 2>/dev/null | sed 's/Authorization: .*/Authorization: *** REDACTED ***/' || echo "无日志文件"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -160,19 +205,21 @@ jobs:
           target_path="${WEBDAV_MOUNT_POINT}/z/Ubu"
           mkdir -p "${target_path}/tmp_incremental" "${target_path}/sync_logs"
           if [ -n "$(ls -A "${target_path}" 2>/dev/null)" ]; then
-            echo "✅ 检测到/z/Ubu已有备份数据"
+            echo "✅ 检测到/z/Ubu已有备份数据（Cloud Run）"
             echo "HAS_z_Ubu=true" >> "$GITHUB_ENV"
           else
-            echo "⚠️ 初始化/z/Ubu备份目录"
+            echo "⚠️ 初始化/z/Ubu备份目录（Cloud Run）"
             echo "HAS_z_Ubu=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Step 4 - Smart Data Restore
+      # ========== 步骤4：智能数据恢复（从/z/Ubu恢复） ==========
+      - name: Step 4 - Smart Data Restore (从/z/Ubu恢复)
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          echo "===== 从/z/Ubu恢复数据 ====="
+          echo "===== 从/z/Ubu恢复数据（Cloud Run） ====="
           RESTORE_DONE=false
           
+          # 仅恢复关键数据目录
           RESTORE_DIRS=(
             "/var/lib/casaos"
             "/var/lib/docker/volumes"
@@ -184,6 +231,7 @@ jobs:
             latest_full_backup=$(ls -dt "${target_path}"/[0-9]* 2>/dev/null | head -n 1)
             incremental_dir="${target_path}/tmp_incremental"
             
+            # 恢复优先级：全量备份 > 增量目录
             if [ -n "$latest_full_backup" ] && [ -d "$latest_full_backup" ]; then
               echo "🔄 从/z/Ubu全量备份恢复：$latest_full_backup"
               restore_source="${latest_full_backup}/"
@@ -201,39 +249,45 @@ jobs:
                   echo "🔄 恢复目录: $restore_dir"
                   sudo mkdir -p "$(dirname "${restore_dir}")"
                   
+                  # 构建排除参数
                   EXCLUDE_PARAMS=()
                   for excl in $EXCLUDE_DIRS; do
                     EXCLUDE_PARAMS+=("--exclude=${excl}")
                   done
                   
+                  # 执行恢复
                   sudo rsync -av --copy-links --sparse --numeric-ids \
                     "${EXCLUDE_PARAMS[@]}" \
                     "${restore_source}${restore_dir#/}/" "${restore_dir}/"
                 fi
               done
               
-              echo "✅ /z/Ubu数据恢复完成"
+              echo "✅ /z/Ubu数据恢复完成（Cloud Run）"
               RESTORE_DONE=true
             fi
           fi
           
           echo "DATA_RESTORED=${RESTORE_DONE}" >> "$GITHUB_ENV"
 
+      # ========== 步骤5：安装/跳过 CasaOS ==========
       - name: Step 5 - Install or Skip CasaOS
         run: |
           echo "===== 部署 CasaOS 服务 ====="
           if [ -d "${CASAOS_DATA}" ] && [ "${DATA_RESTORED}" = "true" ]; then
             echo "✅ 检测到恢复数据，跳过安装"
           else
+            # 安装CasaOS（官方脚本）
             curl -fsSL https://get.casaos.io | sudo bash || { echo "❌ CasaOS 安装失败"; exit 1; }
             echo "✅ CasaOS 安装完成"
           fi
 
+      # ========== 步骤6：启动核心服务（带重试） ==========
       - name: Step 6 - Start Docker & CasaOS with Retry
         run: |
           echo "===== 启动核心服务 ====="
           sudo systemctl enable --now docker casaos
           
+          # 服务启动重试机制
           max_retries=10
           retry_count=0
           services=("docker" "casaos")
@@ -267,6 +321,7 @@ jobs:
             exit 1
           fi
           
+          # 等待CasaOS API就绪
           echo "⏳ 等待 CasaOS API 就绪..."
           timeout=60
           start_time=$(date +%s)
@@ -289,7 +344,8 @@ jobs:
             echo -n "."
           done
 
-      - name: Step 7 - Deploy Tailscale (Only IPv4)
+      # ========== 步骤7：Tailscale配置（仅IPv4，适配Cloud Run） ==========
+      - name: Step 7 - Deploy Tailscale (Only IPv4 + Cloud Run适配)
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
@@ -300,19 +356,21 @@ jobs:
             exit 0
           fi
           
+          # 安装Tailscale
           curl -fsSL https://tailscale.com/install.sh | sudo bash
           
-          HOSTNAME="casaos-${GITHUB_RUN_ID:0:12}"
-          # ========== 关键修改2：Tailscale 仅使用IPv4 ==========
+          # 设置主机名（包含Cloud Run标识）
+          HOSTNAME="casaos-${GITHUB_RUN_ID:0:12}-cloudrun"
+          # 强制仅使用IPv4，适配Cloud Run网络
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" \
             --accept-routes \
             --accept-dns \
             --hostname="$HOSTNAME" \
-            --advertise-routes=0.0.0.0/0 \  # 仅声明IPv4路由
-            --force-ipv4=true \              # 强制使用IPv4
-            --timeout=30s                    # 无需|| true，无IPv6警告
+            --advertise-routes=0.0.0.0/0 \  # 仅IPv4路由
+            --force-ipv4=true \              # 强制IPv4
+            --timeout=30s                    # 延长超时
             
-          # 获取Tailscale IPv4地址
+          # 获取Tailscale IPv4地址（带重试）
           max_retries=5
           retry_count=0
           TAILSCALE_IP=""
@@ -337,6 +395,7 @@ jobs:
             echo "TAILSCALE_IP=" >> "$GITHUB_ENV"
           fi
 
+      # ========== 步骤8：输出访问信息 ==========
       - name: Step 8 - Print Access Info
         run: |
           echo "===== 服务访问信息 ====="
@@ -352,16 +411,18 @@ jobs:
           echo "👤 调试用户：roots（密码位于 /root/debug_password.txt）"
           echo "⚠️ 安全提示：立即修改roots密码，不要暴露公网IP"
 
-      - name: Step 9 - Keep Alive + Sync + Backup + Renew
+      # ========== 步骤9：保活+同步+备份+续跑（适配Cloud Run） ==========
+      - name: Step 9 - Keep Alive + Sync + Backup + Renew (Cloud Run适配)
         env:
           USER_PAT: ${{ secrets.USER_PAT }}
         shell: bash
         run: |
-          echo "===== 进入保活循环（数据同步至/z/Ubu） ====="
+          echo "===== 进入保活循环（数据同步至/z/Ubu，适配Cloud Run） ====="
           start_time=$(date +%s)
           last_sync_minute=-$SYNC_INTERVAL
           health_check_interval=60
 
+          # 函数1：触发续跑
           trigger_renew() {
             echo "===== 触发续跑工作流 ====="
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
@@ -399,6 +460,7 @@ jobs:
             fi
           }
 
+          # 函数2：Docker垃圾清理
           clean_docker_garbage() {
             echo "===== Docker 垃圾清理 ====="
             sudo docker stop $(sudo docker ps -aq -f status=exited 2>/dev/null) 2>/dev/null || true
@@ -407,9 +469,10 @@ jobs:
             sudo docker volume prune -f --filter "until=24h" >/dev/null 2>&1 || true
           }
 
+          # 函数3：清理/z/Ubu旧备份（Cloud Run适配）
           clean_old_backups() {
             if [ "${WEBDAV_AVAILABLE:-false}" != "true" ]; then return 1; fi
-            echo "===== 清理/z/Ubu旧备份 ====="
+            echo "===== 清理/z/Ubu旧备份（Cloud Run） ====="
             target_path="${WEBDAV_MOUNT_POINT}/z/Ubu"
             backup_folders=$(find "${target_path}" -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -r)
             total_backups=$(echo "$backup_folders" | wc -l)
@@ -426,16 +489,18 @@ jobs:
             fi
           }
 
+          # 函数4：增量同步至/z/Ubu（Cloud Run适配）
           incremental_sync() {
             if [ "${WEBDAV_AVAILABLE:-false}" != "true" ]; then return 1; fi
-            echo "===== 增量同步至/z/Ubu ====="
+            echo "===== 增量同步至/z/Ubu（Cloud Run） ====="
             SYNC_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
             
             target_path="${WEBDAV_MOUNT_POINT}/z/Ubu"
             sync_dir="${target_path}/tmp_incremental"
-            log_file="${target_path}/sync_logs/sync_$(date -u +%Y%m%d_%H%M%S).log"
+            log_file="${target_path}/sync_logs/sync_$(date -u +%Y%m%d_%H%M%S)_cloudrun.log"
             mkdir -p "$(dirname "${log_file}")"
             
+            # 仅同步关键目录
             SYNC_DIRS=(
               "/var/lib/casaos"
               "/var/lib/docker/volumes"
@@ -443,6 +508,7 @@ jobs:
               "/etc/casaos"
             )
             
+            # 构建排除参数（排除挂载点和系统目录）
             EXCLUDE_PARAMS=("--exclude=${WEBDAV_MOUNT_POINT}")
             for excl in $EXCLUDE_DIRS; do
               EXCLUDE_PARAMS+=("--exclude=${excl}")
@@ -452,7 +518,9 @@ jobs:
             for sync_dir_entry in "${SYNC_DIRS[@]}"; do
               if [ -d "$sync_dir_entry" ]; then
                 echo "🔄 同步: $sync_dir_entry" >> "$log_file"
+                # 增量同步（适配Cloud Run网络延迟）
                 sudo rsync -av --update --compress --copy-links --sparse --numeric-ids \
+                  --timeout 30s \
                   "${EXCLUDE_PARAMS[@]}" \
                   "${sync_dir_entry}/" "${sync_dir}/${sync_dir_entry#/}/" >> "$log_file" 2>&1
                   
@@ -463,32 +531,35 @@ jobs:
             done
             
             if $sync_success; then
-              echo "incremental_sync_time=${SYNC_TIME}" > "${sync_dir}/sync_info.txt"
-              echo "✅ /z/Ubu增量同步完成"
+              echo "incremental_sync_time=${SYNC_TIME}" > "${sync_dir}/sync_info_cloudrun.txt"
+              echo "✅ /z/Ubu增量同步完成（Cloud Run）"
               return 0
             else
-              echo "❌ /z/Ubu增量同步失败"
+              echo "❌ /z/Ubu增量同步失败（Cloud Run）"
               return 1
             fi
           }
 
+          # 函数5：全量备份至/z/Ubu（Cloud Run适配）
           full_backup() {
             if [ "${WEBDAV_AVAILABLE:-false}" != "true" ]; then return 1; fi
             clean_docker_garbage
-            echo "===== 全量备份至/z/Ubu ====="
+            echo "===== 全量备份至/z/Ubu（Cloud Run） ====="
             BACKUP_SUCCESS=false
             
             target_path="${WEBDAV_MOUNT_POINT}/z/Ubu"
-            full_backup_dir="${target_path}/$(date -u +%Y%m%d_%H%M%S)"
+            full_backup_dir="${target_path}/$(date -u +%Y%m%d_%H%M%S)_cloudrun"
             incremental_dir="${target_path}/tmp_incremental"
             mkdir -p "$full_backup_dir"
             
+            # 数据源：增量目录 > 系统目录
             if [ -n "$(ls -A "${incremental_dir}" 2>/dev/null)" ]; then
               backup_source="${incremental_dir}/"
             else
               backup_source="/"
             fi
             
+            # 仅备份关键目录
             BACKUP_DIRS=(
               "/var/lib/casaos"
               "/var/lib/docker/volumes"
@@ -496,6 +567,7 @@ jobs:
               "/etc/casaos"
             )
             
+            # 构建排除参数
             EXCLUDE_PARAMS=("--exclude=${WEBDAV_MOUNT_POINT}")
             for excl in $EXCLUDE_DIRS; do
               EXCLUDE_PARAMS+=("--exclude=${excl}")
@@ -507,7 +579,9 @@ jobs:
               if [ -d "$source_path" ]; then
                 echo "📦 备份: $backup_dir"
                 mkdir -p "${full_backup_dir}${backup_dir}"
+                # 全量备份（适配Cloud Run网络）
                 sudo rsync -av --copy-links --sparse --numeric-ids \
+                  --timeout 30s \
                   "${EXCLUDE_PARAMS[@]}" \
                   "${source_path}/" "${full_backup_dir}${backup_dir}/" >/dev/null 2>&1
                   
@@ -518,10 +592,11 @@ jobs:
             done
             
             if $backup_success; then
-              printf "backup_time=%s\nrunner_id=%s\ntype=full_backup\n" \
+              # 写入备份信息（包含Cloud Run标识）
+              printf "backup_time=%s\nrunner_id=%s\ntype=full_backup\nplatform=cloudrun\n" \
                 "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
                 "$CURRENT_RUN_ID" > "${full_backup_dir}/backup_info.txt"
-              echo "✅ /z/Ubu全量备份完成：$full_backup_dir"
+              echo "✅ /z/Ubu全量备份完成（Cloud Run）：$full_backup_dir"
               clean_old_backups
               BACKUP_SUCCESS=true
             else
@@ -531,26 +606,29 @@ jobs:
             $BACKUP_SUCCESS
           }
 
+          # 函数6：服务健康检查（适配Cloud Run）
           check_service_health() {
             local service_name=$1
             local url=$2
             local port=$3
             
+            # 检查端口监听
             if [ -n "$port" ] && ! sudo lsof -i :"$port" >/dev/null 2>&1; then
               echo "❌ $service_name 端口 $port 未监听"
               return 1
             fi
             
-            if [ -n "$url" ] && ! curl -m 5 -s "$url" >/dev/null 2>&1; then
-              echo "❌ $service_name HTTP 不可用"
+            # 检查HTTP可用性（延长超时）
+            if [ -n "$url" ] && ! curl -m 10 -s "$url" >/dev/null 2>&1; then
+              echo "❌ $service_name HTTP 不可用（Cloud Run网络延迟）"
               return 1
             fi
             
-            echo "✅ $service_name 健康"
+            echo "✅ $service_name 健康（Cloud Run）"
             return 0
           }
 
-          # 取消旧工作流
+          # 初始化：取消旧工作流实例
           if [ -n "$USER_PAT" ]; then
             echo "===== 取消旧工作流实例 ====="
             response=$(curl -fsS \
@@ -558,7 +636,7 @@ jobs:
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=100")
             
-            old_runs=$(echo "$response" | jq -r --arg WF_NAME "$WORKFLOW_NAME" --arg CURRENT_ID "$CURRENT_RUN_ID" \
+            old_runs=$(echo "$response" | jq -r --arg WF_NAME "$WORKFLOW_NAME" --arg CURRENT_ID "$CURRENT_ID" \
               '.workflow_runs[] | select(.name == $WF_NAME and .id != ($CURRENT_ID | tonumber)) | .id')
             
             if [ -n "$old_runs" ] && [ "$old_runs" != "null" ]; then
@@ -574,49 +652,63 @@ jobs:
             fi
           fi
 
+          # 捕获终止信号，优雅退出
           trap 'echo "🛑 收到终止信号，退出..."; exit 1' TERM INT
-          echo "✅ 进入保活循环，数据同步至/z/Ubu，最大运行 $MAX_RUN_MINUTES 分钟"
+          echo "✅ 进入保活循环，数据同步至/z/Ubu，最大运行 $MAX_RUN_MINUTES 分钟（Cloud Run适配）"
           
+          # 保活主循环
           while true; do
             current_time=$(date +%s)
             run_mins=$(( (current_time - start_time) / 60 ))
             current_sec=$((current_time - start_time))
             
-            echo "⏱️ 运行时长: $run_mins / $MAX_RUN_MINUTES 分钟 | $(date -u)"
+            echo "⏱️ 运行时长: $run_mins / $MAX_RUN_MINUTES 分钟 | $(date -u)（Cloud Run）"
             
+            # 每5分钟监控资源
             if [ $((current_sec % 300)) -eq 0 ]; then
-              echo "===== 资源监控 ====="
+              echo "===== 资源监控（Cloud Run） ====="
               free -h
               df -h / "${WEBDAV_MOUNT_POINT}" 2>/dev/null || df -h /
               uptime
               sudo docker ps --format "table {{.Names}}\t{{.Status}}"
             fi
             
+            # 健康检查（每分钟）
             if [ $((current_sec % health_check_interval)) -eq 0 ]; then
               check_service_health "CasaOS" "http://localhost:80/api/v1/sys/version" "80"
               check_service_health "Docker" "" "2375"
               
+              # 检查WebDAV挂载（适配Cloud Run重连）
               if ! mountpoint -q "${WEBDAV_MOUNT_POINT}"; then
-                echo "❌ WebDAV挂载断开，重新挂载"
-                nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" --config /home/runner/.rclone.conf --vfs-cache-mode full --allow-other --daemon >/dev/null 2>&1 &
+                echo "❌ WebDAV挂载断开，重新挂载（Cloud Run）"
+                nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
+                  --config /home/runner/.rclone.conf \
+                  --vfs-cache-mode full \
+                  --timeout 30s \
+                  --retries 3 \
+                  --allow-other \
+                  --daemon >/dev/null 2>&1 &
                 sleep 10
               fi
               
+              # 重启异常服务
               if ! sudo systemctl is-active --quiet casaos; then
-                echo "🔄 重启CasaOS"
+                echo "🔄 重启CasaOS（Cloud Run）"
                 sudo systemctl restart casaos
                 sleep 10
               fi
             fi
 
+            # 增量同步（每SYNC_INTERVAL分钟）
             if [ $((run_mins % SYNC_INTERVAL)) -eq 0 ] && [ $run_mins -ne $last_sync_minute ] && [ $run_mins -ne 0 ]; then
-              echo "⏰ 执行/z/Ubu增量同步"
+              echo "⏰ 执行/z/Ubu增量同步（Cloud Run）"
               incremental_sync
               last_sync_minute=$run_mins
             fi
 
+            # 300分钟执行全量备份+续跑
             if [ $run_mins -eq 300 ]; then
-              echo "⏰ 300分钟，/z/Ubu全量备份+续跑"
+              echo "⏰ 300分钟，/z/Ubu全量备份+续跑（Cloud Run）"
               if full_backup; then
                 trigger_renew
               else
@@ -624,8 +716,9 @@ jobs:
               fi
             fi
 
+            # 达到上限退出
             if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
-              echo "⏹️ 达到运行上限，/z/Ubu最终备份+续跑"
+              echo "⏹️ 达到运行上限，/z/Ubu最终备份+续跑（Cloud Run）"
               full_backup
               trigger_renew
               exit 1
@@ -634,18 +727,24 @@ jobs:
             sleep 30
           done
 
-      - name: Step 10 - Final Cleanup
+      # ========== 步骤10：最终清理（无论成败） ==========
+      - name: Step 10 - Final Cleanup (Cloud Run适配)
         if: ${{ always() }}
         run: |
-          echo "===== 最终环境清理 ====="
+          echo "===== 最终环境清理（Cloud Run） ====="
+          # 卸载WebDAV（适配Cloud Run）
           if mountpoint -q "$WEBDAV_MOUNT_POINT" 2>/dev/null; then
-            echo "🔄 卸载WebDAV"
+            echo "🔄 卸载WebDAV（Cloud Run）"
             timeout 30 fusermount3 -uz "$WEBDAV_MOUNT_POINT" 2>/dev/null || sudo umount -l "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
           fi
-          sudo rm -rf /tmp/* /var/tmp/* /home/runner/.rclone.conf /tmp/rclone.log
+          # 清理临时文件
+          sudo rm -rf /tmp/* /var/tmp/* /home/runner/.rclone.conf /tmp/rclone.log /tmp/rclone_test.log
+          # 移除调试用户
           if id "roots" &>/dev/null; then
             sudo userdel -r roots 2>/dev/null || true
           fi
+          # 清理sudo配置
           sudo rm -f /etc/sudoers.d/runner
+          # 清理Docker资源
           sudo docker system prune -af --filter "until=1h" >/dev/null 2>&1 || true
-          echo "✅ 清理完成"
+          echo "✅ 清理完成（Cloud Run）"
