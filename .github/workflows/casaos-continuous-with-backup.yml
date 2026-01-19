@@ -187,15 +187,18 @@ jobs:
           start_time=$(date +%s)
 
           trigger_renew() {
-            [ -n "$USER_PAT" ] && [ -n "$REPO" ] && \
-            curl -fsS -X POST -H "Authorization: token $USER_PAT" \
-              "https://api.github.com/repos/$REPO/dispatches" \
-              -d '{"event_type":"renew_casaos_tailscale"}' && \
-            echo "✅ 续跑任务已触发"
+            if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
+              curl -fsS -X POST -H "Authorization: token $USER_PAT" \
+                "https://api.github.com/repos/$REPO/dispatches" \
+                -d '{"event_type":"renew_casaos_tailscale"}' >/dev/null && \
+              echo "✅ 续跑任务已触发"
+            fi
           }
 
           backup_single_dir() {
-            [ "${WEBDAV_AVAILABLE}" != "true" ] && return 1
+            if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
+              return 1
+            fi
             local dir="$1"
             local target_path="$WEBDAV_MOUNT_POINT$dir"
             EXCLUDE_PARAMS=()
@@ -207,20 +210,18 @@ jobs:
             echo "🔄 开始备份到 $dir ..."
             if sudo rsync -av --delete --copy-links --sparse --numeric-ids \
                 "${EXCLUDE_PARAMS[@]}" / "$target_path/"; then
-              # 安全写入元数据：避免 YAML 中的 <<EOF 缩进问题
-              sudo sh -c "cat > '$target_path/backup_info.txt'" <<'SAFE_EOF'
-backup_time=
-runner_id=
-github_repo=
-workflow_run_url=
-SAFE_EOF
 
-              sudo sed -i \
-                -e "s|backup_time=|backup_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")|" \
-                -e "s|runner_id=|runner_id=${{ github.run_id }}|" \
-                -e "s|github_repo=|github_repo=${{ github.repository }}|" \
-                -e "s|workflow_run_url=|workflow_run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|" \
-                "$target_path/backup_info.txt"
+              BACKUP_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+              RUNNER_ID="${{ github.run_id }}"
+              GITHUB_REPO="${{ github.repository }}"
+              WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+              sudo sh -c "printf '%s\n' \
+                'backup_time=$BACKUP_TIME' \
+                'runner_id=$RUNNER_ID' \
+                'github_repo=$GITHUB_REPO' \
+                'workflow_run_url=$WORKFLOW_URL' \
+                > '$target_path/backup_info.txt'"
 
               echo "✅ 备份完成 ($dir)"
               return 0
