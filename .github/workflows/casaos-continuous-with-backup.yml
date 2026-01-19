@@ -12,10 +12,14 @@ jobs:
     env:
       MAX_RUN_MINUTES: 330
       WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
-      BACKUP_DIRS: "/z/Ubu /a/Ubu"
+      BACKUP_DIRS: "/z/Ubu"
       CASAOS_DATA: /var/lib/casaos
       DOCKER_DATA: /var/lib/docker
-      EXCLUDE_DIRS: "/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp"
+      # 扩展排除列表：跳过缓存、日志、临时文件，大幅提速
+      EXCLUDE_DIRS: >-
+        /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
+        /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
+        /usr/share/doc /usr/share/man /usr/share/locale
       MAX_MOUNT_RETRIES: 2
       RETRY_DELAY: 10
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
@@ -38,7 +42,6 @@ jobs:
           sudo apt update -y && sudo apt upgrade -y -q
           sudo apt install -y rsync davfs2 curl wget jq iptables || { echo "依赖安装失败"; exit 1; }
 
-          # 授予 runner 免密 sudo（用于后续操作）
           echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           echo "✅ 系统初始化完成 (日志: $LOG_FILE)"
@@ -47,12 +50,10 @@ jobs:
       - name: 步骤1.5 - 创建 roots 用户
         run: |
           echo "===== 步骤1.5：创建 roots 用户 ====="
-          # 创建用户
           sudo useradd -m -s /bin/bash roots
           echo "roots:roots1234" | sudo chpasswd
-          # 👇 关键：加入 sudo 组（Ubuntu 特权组）
           sudo usermod -aG sudo roots
-          echo "✅ 用户 'roots' 已创建，密码为 'roots1234'，已具备 sudo 权限"
+          echo "✅ 用户 'roots' 已创建，密码为 'roots1234'，具备 sudo 权限"
 
       # ========== 步骤2：挂载WebDAV ==========
       - name: 步骤2 - 挂载WebDAV并验证
@@ -111,7 +112,8 @@ jobs:
                 EXCLUDE_PARAMS+=("--exclude=$excl")
               done
               target_path="$WEBDAV_MOUNT_POINT$dir"
-              sudo rsync -av --delete "${EXCLUDE_PARAMS[@]}" "$target_path/" /
+              # 👇 使用 --copy-links 避免 symlink 错误
+              sudo rsync -av --delete --copy-links "${EXCLUDE_PARAMS[@]}" "$target_path/" /
               if [ $? -eq 0 ]; then
                 RESTORE_DONE=true
                 echo "✅ 数据恢复完成 ($dir)"
@@ -237,7 +239,8 @@ jobs:
             done
             EXCLUDE_PARAMS+=("--exclude=$WEBDAV_MOUNT_POINT")
 
-            sudo rsync -av --delete "${EXCLUDE_PARAMS[@]}" / "$target_path/"
+            # 👇 关键优化：使用 --copy-links 避免 symlink 错误
+            sudo rsync -av --delete --copy-links "${EXCLUDE_PARAMS[@]}" / "$target_path/"
             if [ $? -eq 0 ]; then
               echo "✅ $dir 备份完成"
               echo "backup_time=$(date +%Y%m%d_%H%M%S) runner_id=${{ github.run_id }}" | sudo tee "$target_path/backup_marker.txt" >/dev/null
