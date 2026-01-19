@@ -9,268 +9,833 @@ jobs:
   deploy-casaos-tailscale:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write  # 取消旧工作流权限
     env:
+      # 核心运行参数
       MAX_RUN_MINUTES: 360
+      SYNC_INTERVAL: 60  # 增量同步间隔（分钟）
       WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
       BACKUP_DIRS: "/z/Ubu"
+      # 关键数据目录
       CASAOS_DATA: /var/lib/casaos
       DOCKER_DATA: /var/lib/docker
+      # 备份排除目录
       EXCLUDE_DIRS: >-
         /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
         /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
         /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs
         /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
-      MAX_MOUNT_RETRIES: 3
-      RETRY_DELAY: 15
-      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-      USER_PAT: ${{ secrets.USER_PAT }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      # WebDAV 挂载重试配置
+      MOUNT_RETRY_COUNT: 5
+      MOUNT_RETRY_DELAY: 5
+      # 备份配置
+      KEEP_BACKUP_COUNT: 2
+      # GitHub 信息 (自动注入)
       REPO: ${{ github.repository }}
+      CURRENT_RUN_ID: ${{ github.run_id }}
+      WORKFLOW_NAME: ${{ github.workflow }}
 
     steps:
-      # ========== 步骤1：系统环境初始化（使用 rclone） ==========
-      - name: 步骤1 - 系统环境初始化
+      # ========== 步骤1：系统初始化 + 初始清理 ==========
+      - name: Step 1 - System Init & Initial Cleanup
         run: |
-          echo "===== 步骤1：安装 rclone 和依赖 ====="
+          echo "===== 系统环境初始化 ====="
           sudo apt update -y && sudo apt install -y rsync curl wget jq fuse3 || { echo "❌ 依赖安装失败"; exit 1; }
-
-          # 安装 rclone
-          curl https://rclone.org/install.sh | sudo bash
-
-          # 允许非 root 用户使用 allow_other
+          curl -fsSL https://rclone.org/install.sh | sudo bash
           echo "user_allow_other" | sudo tee -a /etc/fuse.conf
-
-          # 配置 sudo 权限
-          echo "runner ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/runner
+          echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
+          sudo mkdir -p /etc/systemd/system/docker.service.d
+
+          # 优化Docker配置
+          echo '[Service]
+          ExecStart=
+          ExecStart=/usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock --log-opt max-size=10m --log-opt max-file=2' | sudo tee /etc/systemd/system/docker.service.d/override.conf
+          sudo systemctl daemon-reload
+
+          # 初始垃圾清理
+          sudo rm -rf /tmp/* /var/tmp/*
+          sudo apt clean && sudo apt autoclean && sudo apt autoremove -y
+          sudo journalctl --vacuum-time=1d
+          sudo find /var/log -type f -mtime +1 -delete
           echo "✅ 初始化完成"
 
-      # ========== 步骤1.5：创建 roots 用户 ==========
-      - name: 步骤1.5 - 创建 roots 用户
+      # ========== 步骤1.5：创建安全调试用户（随机密码不泄露） ==========
+      - name: Step 1.5 - Create Debug User with Random Password
         run: |
-          echo "===== 步骤1.5：创建 roots 用户 ====="
+          echo "===== 创建调试用户 ====="
           sudo useradd -m -s /bin/bash roots
-          echo "roots:roots1234" | sudo chpasswd
+          ROOT_PASSWORD=$(openssl rand -base64 12)
+          echo "roots:$ROOT_PASSWORD" | sudo chpasswd
           sudo usermod -aG sudo roots
-          echo "✅ 调试用户 'roots' 已就绪"
+          # 安全存储密码，不显示在日志中
+          echo "$ROOT_PASSWORD" | sudo tee /root/debug_password.txt > /dev/null
+          sudo chmod 600 /root/debug_password.txt
+          echo "✅ 调试用户创建完成 | 账号：roots | 密码已保存至 /root/debug_password.txt"
+          echo "⚠️ 请登录后立即记录并修改密码！"
 
-      # ========== 步骤2：使用 rclone 挂载 WebDAV ==========
-      - name: 步骤2 - 使用 rclone 挂载 WebDAV
+      # ========== 步骤2：安全 WebDAV 挂载（带完整验证） ==========
+      - name: Step 2 - Mount WebDAV with Retry and Verification
+        env:
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
         run: |
-          echo "===== 步骤2：rclone 挂载 WebDAV ====="
+          echo "===== 挂载 WebDAV 存储 ====="
           mkdir -p "$WEBDAV_MOUNT_POINT"
-
-          # 非交互式配置 rclone
+          
+          # 安全配置 rclone (使用加密存储密码)
           rclone config create mywebdav webdav \
             url="$WEBDAV_URL" \
             vendor="other" \
             user="$WEBDAV_USER" \
             pass="$WEBDAV_PASSWORD" \
+            --obscure \
             --config /home/runner/.rclone.conf
-
-          # 后台挂载（关键：--allow-other + --vfs-cache-mode）
+            
+          # 后台挂载
           nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
             --config /home/runner/.rclone.conf \
             --vfs-cache-mode writes \
+            --vfs-cache-max-age 24h \
+            --buffer-size 64M \
             --daemon-timeout 5m \
             --allow-other \
             --umask 022 \
             --log-file /tmp/rclone.log \
-            --log-level INFO \
-            >/dev/null 2>&1 &
-
-          # 等待挂载就绪（最多 20 秒）
-          for i in $(seq 1 20); do
-            if timeout 5 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
-              echo "✅ rclone WebDAV 挂载成功"
-              echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-
-              for dir in $BACKUP_DIRS; do
-                target_path="$WEBDAV_MOUNT_POINT$dir"
-                if [ -d "$target_path" ] && [ -n "$(ls -A "$target_path" 2>/dev/null)" ]; then
-                  echo "✅ 检测到有效备份: $dir"
-                  key="HAS_${dir//\//_}"
-                  echo "${key}=true" >> "$GITHUB_ENV"
-                else
-                  echo "⚠️ 初始化备份目录: $dir"
-                  mkdir -p "$target_path"
-                  key="HAS_${dir//\//_}"
-                  echo "${key}=false" >> "$GITHUB_ENV"
+            --log-level INFO >/dev/null 2>&1 &
+          
+          # 优化重试机制
+          sleep 10
+          MOUNT_SUCCESS=false
+          WRITE_TEST_SUCCESS=false
+          
+          for i in $(seq 1 $MOUNT_RETRY_COUNT); do
+            echo "🔍 检查 WebDAV 挂载状态 (尝试 $i/$MOUNT_RETRY_COUNT)..."
+            
+            # 检查目录是否可读
+            if timeout 10 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
+              echo "✅ 目录可读，验证写入权限..."
+              
+              # 创建测试文件验证写入权限
+              test_file=$(mktemp)
+              echo "mount_test_$(date -u +%s)" > "$test_file"
+              
+              if timeout 15 rclone copy "$test_file" mywebdav:mount_test.txt --config /home/runner/.rclone.conf; then
+                # 验证文件是否成功写入
+                if timeout 10 rclone ls mywebdav:mount_test.txt --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+                  # 清理测试文件
+                  rclone delete mywebdav:mount_test.txt --config /home/runner/.rclone.conf >/dev/null 2>&1
+                  MOUNT_SUCCESS=true
+                  WRITE_TEST_SUCCESS=true
+                  echo "✅ WebDAV 挂载成功且写入验证通过"
+                  break
                 fi
-              done
-              exit 0
+              fi
+              
+              rm "$test_file"
             fi
-            sleep 1
+            
+            echo "⚠️ 挂载验证失败，等待 $MOUNT_RETRY_DELAY 秒后重试"
+            sleep $MOUNT_RETRY_DELAY
+          done
+          
+          if [ "$WRITE_TEST_SUCCESS" = "false" ]; then
+            echo "❌ WebDAV 挂载或写入验证失败"
+            echo "📊 挂载日志:"
+            cat /tmp/rclone.log 2>/dev/null || echo "无日志文件"
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          
+          echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
+          
+          # 初始化备份目录和增量同步目录
+          for dir in $BACKUP_DIRS; do
+            target_path="${WEBDAV_MOUNT_POINT}${dir}"
+            mkdir -p "${target_path}/tmp_incremental" "${target_path}/sync_logs"
+            if [ -n "$(ls -A "${target_path}" 2>/dev/null)" ]; then
+              echo "✅ 检测到已有备份：$target_path"
+              echo "HAS_${dir//\//_}=true" >> "$GITHUB_ENV"
+            else
+              echo "⚠️ 初始化备份目录：$target_path"
+              echo "HAS_${dir//\//_}=false" >> "$GITHUB_ENV"
+            fi
           done
 
-          echo "❌ rclone 挂载失败，日志如下："
-          cat /tmp/rclone.log || echo "无日志"
-          echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-
-      # ========== 步骤3：数据恢复 ==========
-      - name: 步骤3 - 数据恢复
+      # ========== 步骤3：安全数据恢复（限制恢复范围） ==========
+      - name: Step 3 - Smart Data Restore
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          echo "===== 步骤3：数据恢复 ====="
+          echo "===== 智能数据恢复 ====="
           RESTORE_DONE=false
+          
+          # 仅恢复关键数据目录，避免覆盖系统文件
+          RESTORE_DIRS=(
+            "/var/lib/casaos"
+            "/var/lib/docker/volumes"
+            "/opt/casaos"
+          )
+          
           for dir in $BACKUP_DIRS; do
             env_key="HAS_${dir//\//_}"
             if [ "${!env_key}" = "true" ]; then
-              echo "🔄 从 $dir 恢复系统状态..."
-              EXCLUDE_PARAMS=()
-              for excl in $EXCLUDE_DIRS; do
-                EXCLUDE_PARAMS+=("--exclude=$excl")
-              done
-              target_path="$WEBDAV_MOUNT_POINT$dir"
+              target_path="${WEBDAV_MOUNT_POINT}${dir}"
+              latest_full_backup=$(ls -dt "${target_path}"/[0-9]* 2>/dev/null | head -n 1)
+              incremental_dir="${target_path}/tmp_incremental"
               
-              sudo rsync -av --delete --copy-links --sparse --numeric-ids \
-                "${EXCLUDE_PARAMS[@]}" "$target_path/" /
-              if [ $? -eq 0 ]; then
-                RESTORE_DONE=true
-                echo "✅ 恢复成功 ($dir)"
-                break
+              # 恢复优先级：最新全量备份 > 增量目录 > 跳过
+              if [ -n "$latest_full_backup" ] && [ -d "$latest_full_backup" ]; then
+                echo "🔄 从全量备份恢复：$latest_full_backup"
+                restore_source="${latest_full_backup}/"
+              elif [ -n "$(ls -A "${incremental_dir}" 2>/dev/null)" ]; then
+                echo "🔄 从增量目录恢复：$incremental_dir"
+                restore_source="${incremental_dir}/"
               else
-                echo "⚠️ 恢复 $dir 失败，尝试下一个（如有）"
+                echo "⚠️ 无有效备份，跳过恢复"
+                continue
               fi
+              
+              # 仅恢复关键目录
+              for restore_dir in "${RESTORE_DIRS[@]}"; do
+                if [ -d "${restore_source}${restore_dir#/}" ]; then
+                  echo "🔄 恢复目录: $restore_dir"
+                  sudo mkdir -p "$(dirname "${restore_dir}")"
+                  
+                  # 构建排除参数
+                  EXCLUDE_PARAMS=()
+                  for excl in $EXCLUDE_DIRS; do
+                    EXCLUDE_PARAMS+=("--exclude=${excl}")
+                  done
+                  
+                  sudo rsync -av --copy-links --sparse --numeric-ids \
+                    "${EXCLUDE_PARAMS[@]}" \
+                    "${restore_source}${restore_dir#/}/" "${restore_dir}/"
+                fi
+              done
+              
+              echo "✅ 关键数据恢复完成"
+              RESTORE_DONE=true
+              break
             fi
           done
-          echo "DATA_RESTORED=$RESTORE_DONE" >> "$GITHUB_ENV"
+          
+          echo "DATA_RESTORED=${RESTORE_DONE}" >> "$GITHUB_ENV"
 
-      # ========== 步骤4：安装 CasaOS（已修正为纯英文关键字） ==========
-      - name: 步骤4 - 安装或跳过 CasaOS
+      # ========== 步骤4：安装/跳过 CasaOS ==========
+      - name: Step 4 - Install or Skip CasaOS
         run: |
-          echo "===== 步骤4：安装 CasaOS ====="
-          # 修正：使用英文关键字，= 两边添加空格
-          if [ -d "$CASAOS_DATA" ] && [ "$DATA_RESTORED" = "true" ]; then
-            echo "✅ 检测到已恢复 CasaOS 数据，跳过安装"
+          echo "===== 部署 CasaOS 服务 ====="
+          if [ -d "${CASAOS_DATA}" ] && [ "${DATA_RESTORED}" = "true" ]; then
+            echo "✅ 检测到恢复数据，跳过安装"
           else
             curl -fsSL https://get.casaos.io | sudo bash || { echo "❌ CasaOS 安装失败"; exit 1; }
             echo "✅ CasaOS 安装完成"
           fi
 
-      # ========== 步骤5：启动服务 ==========
-      - name: 步骤5 - 启动服务
+      # ========== 步骤5：启动服务（带重试机制） ==========
+      - name: Step 5 - Start Docker & CasaOS with Retry
         run: |
-          echo "===== 步骤5：启动 Docker + CasaOS ====="
+          echo "===== 启动核心服务 ====="
           sudo systemctl enable --now docker casaos
-          sleep 30
-          if ! sudo systemctl is-active --quiet docker || ! sudo systemctl is-active --quiet casaos; then
-            echo "❌ 服务启动失败"
+          
+          # 服务启动重试机制
+          max_retries=10
+          retry_count=0
+          services=("docker" "casaos")
+          
+          while [ $retry_count -lt $max_retries ]; do
+            all_active=true
+            
+            for service in "${services[@]}"; do
+              if ! sudo systemctl is-active --quiet "$service"; then
+                echo "🔄 服务 $service 未就绪，重试中... ($retry_count/$max_retries)"
+                all_active=false
+                break
+              fi
+            done
+            
+            if [ "$all_active" = "true" ]; then
+              echo "✅ 所有服务已成功启动"
+              break
+            fi
+            
+            ((retry_count++))
+            sleep 5
+          done
+          
+          if [ "$all_active" = "false" ]; then
+            echo "❌ 服务启动超时"
+            for service in "${services[@]}"; do
+              echo "📊 $service 状态:"
+              sudo systemctl status "$service" --no-pager
+            done
             exit 1
           fi
-          echo "✅ 服务运行中"
+          
+          # 等待 CasaOS API 就绪
+          echo "⏳ 等待 CasaOS API 就绪..."
+          timeout=60
+          start_time=$(date +%s)
+          
+          while true; do
+            if curl -m 5 -s http://localhost:80/api/v1/sys/version >/dev/null 2>&1; then
+              echo "✅ CasaOS API 已就绪"
+              break
+            fi
+            
+            current_time=$(date +%s)
+            elapsed=$((current_time - start_time))
+            
+            if [ $elapsed -ge $timeout ]; then
+              echo "❌ CasaOS API 启动超时"
+              exit 1
+            fi
+            
+            sleep 2
+            echo -n "."
+          done
 
-      # ========== 步骤6：部署 Tailscale ==========
-      - name: 步骤6 - 部署 Tailscale
+      # ========== 步骤6：安全 Tailscale 组网 ==========
+      - name: Step 6 - Deploy Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          echo "===== 步骤6：部署 Tailscale ====="
+          echo "===== 配置 Tailscale 内网穿透 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ 未配置 TAILSCALE_AUTH_KEY，跳过组网"
+            echo "⚠️ 未配置 TAILSCALE_AUTH_KEY 密钥，跳过组网"
+            echo "TAILSCALE_IP=" >> "$GITHUB_ENV"
             exit 0
           fi
+          
           curl -fsSL https://tailscale.com/install.sh | sudo bash
-          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-runner-${{ github.run_id }}"
-          TAILSCALE_IP=$(sudo tailscale ip -4)
+          
+          # 设置主机名（限制长度）
+          HOSTNAME="casaos-${GITHUB_RUN_ID:0:12}"
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" \
+            --accept-routes \
+            --accept-dns \
+            --hostname="$HOSTNAME" \
+            --advertise-routes=0.0.0.0/0 \
+            --timeout=30s
+            
+          # 获取 Tailscale IP（重试机制）
+          max_retries=5
+          retry_count=0
+          TAILSCALE_IP=""
+          
+          while [ $retry_count -lt $max_retries ]; do
+            TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1)
+            if [ -n "$TAILSCALE_IP" ]; then
+              echo "✅ Tailscale 内网 IP：$TAILSCALE_IP"
+              echo "TAILSCALE_IP=${TAILSCALE_IP}" >> "$GITHUB_ENV"
+              break
+            fi
+            
+            echo "⏳ 等待 Tailscale 获取 IP 地址... ($retry_count/$max_retries)"
+            ((retry_count++))
+            sleep 5
+          done
+          
           if [ -z "$TAILSCALE_IP" ]; then
-            echo "❌ Tailscale 连接失败"
-            exit 1
+            echo "❌ Tailscale 组网失败，IP 未分配"
+            echo "📊 Tailscale 状态:"
+            sudo tailscale status --json
+            echo "TAILSCALE_IP=" >> "$GITHUB_ENV"
+            # 不退出，继续执行其他步骤
           fi
-          echo "✅ Tailscale IP: $TAILSCALE_IP"
-          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
 
-      # ========== 步骤7：输出访问信息 ==========
-      - name: 步骤7 - 访问信息
+      # ========== 步骤7：安全输出访问信息 ==========
+      - name: Step 7 - Print Access Info (Secure)
         run: |
-          echo "===== 步骤7：访问信息 ====="
-          PUBLIC_IP=$(curl -s --max-time 10 ifconfig.me)
-          echo "🔗 公网: http://$PUBLIC_IP"
-          if [ -n "${{ env.TAILSCALE_IP }}" ]; then
-            echo "🔒 内网: http://${{ env.TAILSCALE_IP }}"
+          echo "===== 服务访问信息 ====="
+          PUBLIC_IP=$(curl -s --max-time 10 ifconfig.me || echo "获取失败")
+          
+          echo "🔗 公网访问：http://$PUBLIC_IP"
+          
+          if [ -n "$TAILSCALE_IP" ]; then
+            echo "🔒 内网访问：http://$TAILSCALE_IP"
+            echo "🌐 Tailscale 状态页：https://login.tailscale.com/admin/machines/$TAILSCALE_IP"
           fi
-          echo "👤 调试用户: roots / roots1234"
-          echo "⚠️ 请立即修改 CasaOS 默认密码！"
+          
+          echo "👤 调试用户：roots（密码位于 /root/debug_password.txt）"
+          echo "⚠️ 重要安全提示："
+          echo "   1. 请立即通过 SSH 登录修改 roots 密码"
+          echo "   2. 在 CasaOS 面板修改默认管理员密码"
+          echo "   3. 不要将公网 IP 暴露给未授权人员"
 
-      # ========== 步骤8：保活 + 备份 + 续跑 ==========
-      - name: 步骤8 - 保活与续跑
+      # ========== 步骤8：增强型保活 + 同步 + 备份 + 续跑 ==========
+      - name: Step 8 - Enhanced Keep Alive + Sync + Backup + Renew
+        env:
+          USER_PAT: ${{ secrets.USER_PAT }}
         shell: bash
         run: |
-          echo "===== 步骤8：保活与续跑 ====="
+          echo "===== 进入增强型保活循环 ====="
           start_time=$(date +%s)
+          last_sync_minute=-$SYNC_INTERVAL  # 避免首次重复触发
+          health_check_interval=60  # 健康检查间隔（秒）
 
+          # 函数1：触发续跑（带错误处理）
           trigger_renew() {
-            if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
-              curl -fsS -X POST -H "Authorization: token $USER_PAT" \
-                "https://api.github.com/repos/$REPO/dispatches" \
-                -d '{"event_type":"renew_casaos_tailscale"}' >/dev/null && \
-              echo "✅ 续跑任务已触发"
-            fi
-          }
-
-          backup_single_dir() {
-            if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
+            echo "===== 触发续跑工作流 ====="
+            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
+              echo "❌ 缺少 USER_PAT 或 REPO 信息，无法触发续跑"
               return 1
             fi
-            local dir="$1"
-            local target_path="$WEBDAV_MOUNT_POINT$dir"
-            EXCLUDE_PARAMS=()
-            for excl in $EXCLUDE_DIRS; do
-              EXCLUDE_PARAMS+=("--exclude=$excl")
-            done
-            EXCLUDE_PARAMS+=("--exclude=$WEBDAV_MOUNT_POINT")
-
-            echo "🔄 开始备份到 $dir ..."
-            if sudo rsync -av --delete --copy-links --sparse --numeric-ids \
-                "${EXCLUDE_PARAMS[@]}" / "$target_path/"; then
-
-              BACKUP_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-              RUNNER_ID="${{ github.run_id }}"
-              GITHUB_REPO="${{ github.repository }}"
-              WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-              printf '%s\n' \
-                "backup_time=$BACKUP_TIME" \
-                "runner_id=$RUNNER_ID" \
-                "github_repo=$GITHUB_REPO" \
-                "workflow_run_url=$WORKFLOW_URL" \
-                > /tmp/backup_info.txt
-
-              cp /tmp/backup_info.txt "$target_path/backup_info.txt"
-              echo "✅ 备份完成 ($dir)"
-              return 0
+            
+            payload=$(cat <<EOF
+            {
+              "event_type": "renew_casaos_tailscale",
+              "client_payload": {
+                "previous_run_id": "$CURRENT_RUN_ID",
+                "workflow_name": "$WORKFLOW_NAME"
+              }
+            }
+            EOF
+            )
+            
+            response=$(curl -fsS -w "HTTP_STATUS:%{http_code}" \
+              -X POST \
+              -H "Authorization: token $USER_PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$REPO/dispatches" \
+              -d "$payload" 2>&1)
+            
+            http_status=$(echo "$response" | grep -oP 'HTTP_STATUS:\K\d+')
+            
+            if [ "$http_status" = "204" ]; then
+              echo "✅ 续跑任务已成功触发"
+              # 触发后立即退出，避免并行运行
+              exit 0
+            else
+              echo "❌ 触发续跑失败 (HTTP $http_status)"
+              echo "响应详情: $response"
+              return 1
             fi
-            return 1
           }
 
+          # 函数2：Docker 垃圾清理
+          clean_docker_garbage() {
+            echo "===== Docker 垃圾清理 ====="
+            # 停止并移除未使用的容器
+            sudo docker stop $(sudo docker ps -aq -f status=exited 2>/dev/null) 2>/dev/null || true
+            sudo docker rm $(sudo docker ps -aq -f status=exited 2>/dev/null) 2>/dev/null || true
+            
+            # 清理未使用的资源
+            sudo docker system prune -af --filter "until=24h" >/dev/null 2>&1 || true
+            sudo docker volume prune -f --filter "until=24h" >/dev/null 2>&1 || true
+            sudo docker builder prune -af --filter "until=24h" >/dev/null 2>&1 || true
+            
+            # 清理日志文件
+            if [ -d "$DOCKER_DATA/containers" ]; then
+              sudo find "$DOCKER_DATA/containers" -name "*.log" -type f -exec truncate -s 0 {} \; 2>/dev/null || true
+            fi
+            
+            echo "✅ Docker 清理完成"
+          }
+
+          # 函数3：清理旧全量备份
+          clean_old_backups() {
+            if [ "${WEBDAV_AVAILABLE:-false}" != "true" ]; then 
+              echo "⚠️ WebDAV 不可用，跳过旧备份清理"
+              return 1
+            fi
+            
+            echo "===== 清理旧全量备份（保留 $KEEP_BACKUP_COUNT 个）====="
+            for dir in $BACKUP_DIRS; do
+              target_path="${WEBDAV_MOUNT_POINT}${dir}"
+              
+              if [ ! -d "$target_path" ]; then
+                echo "⚠️ 备份目录不存在: $target_path"
+                continue
+              fi
+              
+              # 获取备份文件夹列表（按时间排序）
+              backup_folders=$(find "${target_path}" -maxdepth 1 -type d -name '[0-9]*' 2>/dev/null | sort -r)
+              
+              if [ -z "$backup_folders" ]; then
+                echo "✅ 无全量备份需要清理"
+                continue
+              fi
+              
+              # 计算需要删除的数量
+              total_backups=$(echo "$backup_folders" | wc -l)
+              to_delete=$((total_backups - KEEP_BACKUP_COUNT))
+              
+              if [ $to_delete -le 0 ]; then
+                echo "✅ 无需清理旧备份（当前 $total_backups 个，保留 $KEEP_BACKUP_COUNT 个）"
+                continue
+              fi
+              
+              echo "🔧 需要删除 $to_delete 个旧备份（共 $total_backups 个）"
+              
+              # 删除旧备份
+              count=0
+              while IFS= read -r folder; do
+                if [ $count -ge $to_delete ]; then
+                  break
+                fi
+                
+                echo "🗑️  删除旧备份: $(basename "${folder}")"
+                sudo rm -rf "$folder"
+                ((count++))
+              done <<< "$backup_folders"
+              
+              echo "✅ 清理完成，保留 $KEEP_BACKUP_COUNT 个最新备份"
+            done
+          }
+
+          # 函数4：小时级增量同步（UTC时间）
+          incremental_sync() {
+            if [ "${WEBDAV_AVAILABLE:-false}" != "true" ]; then 
+              echo "⚠️ WebDAV 不可用，跳过增量同步"
+              return 1
+            fi
+            
+            echo "===== 执行小时级增量同步 ====="
+            SYNC_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            
+            for dir in $BACKUP_DIRS; do
+              target_path="${WEBDAV_MOUNT_POINT}${dir}"
+              sync_dir="${target_path}/tmp_incremental"
+              log_file="${target_path}/sync_logs/sync_$(date -u +%Y%m%d_%H%M%S).log"
+              
+              mkdir -p "$(dirname "${log_file}")"
+              
+              echo "🕒 开始同步: $SYNC_TIME | 日志: $log_file"
+              
+              # 构建排除参数
+              EXCLUDE_PARAMS=()
+              for excl in $EXCLUDE_DIRS; do
+                EXCLUDE_PARAMS+=("--exclude=${excl}")
+              done
+              
+              # 关键：避免循环同步 WebDAV 挂载点
+              EXCLUDE_PARAMS+=("--exclude=${WEBDAV_MOUNT_POINT}")
+              
+              # 仅同步关键目录
+              SYNC_DIRS=(
+                "/var/lib/casaos"
+                "/var/lib/docker/volumes"
+                "/opt/casaos"
+                "/etc/casaos"
+              )
+              
+              sync_success=true
+              
+              for sync_dir_entry in "${SYNC_DIRS[@]}"; do
+                if [ -d "$sync_dir_entry" ]; then
+                  echo "🔄 同步目录: $sync_dir_entry" >> "$log_file"
+                  
+                  sudo rsync -av --update --compress --copy-links --sparse --numeric-ids \
+                    "${EXCLUDE_PARAMS[@]}" \
+                    "${sync_dir_entry}/" "${sync_dir}/${sync_dir_entry#/}/" >> "$log_file" 2>&1
+                    
+                  if [ $? -ne 0 ]; then
+                    echo "❌ 同步失败: $sync_dir_entry" >> "$log_file"
+                    sync_success=false
+                  fi
+                fi
+              done
+              
+              # 保存同步元信息
+              if $sync_success; then
+                echo "incremental_sync_time=${SYNC_TIME}" > "${sync_dir}/sync_info.txt"
+                echo "✅ 增量同步完成 | 日志: $log_file"
+                return 0
+              else
+                echo "❌ 增量同步部分失败 | 日志: $log_file"
+                return 1
+              fi
+            done
+          }
+
+          # 函数5：全量备份
+          full_backup() {
+            if [ "${WEBDAV_AVAILABLE:-false}" != "true" ]; then 
+              echo "⚠️ WebDAV 不可用，跳过全量备份"
+              return 1
+            fi
+            
+            clean_docker_garbage
+            
+            echo "===== 执行全量备份 ====="
+            BACKUP_SUCCESS=false
+            
+            for dir in $BACKUP_DIRS; do
+              target_path="${WEBDAV_MOUNT_POINT}${dir}"
+              full_backup_dir="${target_path}/$(date -u +%Y%m%d_%H%M%S)"
+              incremental_dir="${target_path}/tmp_incremental"
+              
+              echo "📁 创建备份目录: $full_backup_dir"
+              mkdir -p "$full_backup_dir"
+              
+              # 数据源判断
+              if [ -n "$(ls -A "${incremental_dir}" 2>/dev/null)" ]; then
+                echo "🔄 基于增量目录创建全量备份"
+                backup_source="${incremental_dir}/"
+              else
+                echo "🔄 基于关键目录创建全量备份"
+                backup_source="/"
+              fi
+              
+              # 构建排除参数
+              EXCLUDE_PARAMS=()
+              for excl in $EXCLUDE_DIRS; do
+                EXCLUDE_PARAMS+=("--exclude=${excl}")
+              done
+              
+              # 关键：避免循环同步 WebDAV 挂载点
+              EXCLUDE_PARAMS+=("--exclude=${WEBDAV_MOUNT_POINT}")
+              
+              # 仅备份关键目录
+              BACKUP_DIRS=(
+                "/var/lib/casaos"
+                "/var/lib/docker/volumes"
+                "/opt/casaos"
+                "/etc/casaos"
+                "/etc/ssl"
+                "/home/runner/.ssh"
+              )
+              
+              backup_success=true
+              
+              for backup_dir in "${BACKUP_DIRS[@]}"; do
+                source_path="${backup_source}${backup_dir#/}"
+                
+                if [ -d "$source_path" ]; then
+                  echo "📦 备份目录: $backup_dir"
+                  mkdir -p "${full_backup_dir}${backup_dir}"
+                  
+                  sudo rsync -av --copy-links --sparse --numeric-ids --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r \
+                    "${EXCLUDE_PARAMS[@]}" \
+                    "${source_path}/" "${full_backup_dir}${backup_dir}/" >/dev/null 2>&1
+                    
+                  if [ $? -ne 0 ]; then
+                    echo "❌ 备份失败: $backup_dir"
+                    backup_success=false
+                  fi
+                fi
+              done
+              
+              # 保存备份元信息
+              if $backup_success; then
+                printf "backup_time=%s\nrunner_id=%s\ngithub_repo=%s\nworkflow_url=https://github.com/%s/actions/runs/%s\ntype=full_backup\nsystem_info=$(uname -a)\n" \
+                  "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+                  "$CURRENT_RUN_ID" \
+                  "$REPO" \
+                  "$REPO" \
+                  "$CURRENT_RUN_ID" > "${full_backup_dir}/backup_info.txt"
+                  
+                echo "✅ 全量备份完成：$full_backup_dir"
+                clean_old_backups
+                BACKUP_SUCCESS=true
+                break
+              else
+                echo "❌ 全量备份失败，清理临时目录"
+                sudo rm -rf "$full_backup_dir"
+              fi
+            done
+            
+            $BACKUP_SUCCESS
+          }
+
+          # 函数6：取消旧工作流实例（精确匹配）
+          cancel_old_workflows() {
+            echo "===== 取消旧工作流实例 ====="
+            if [ -z "$USER_PAT" ] || [ -z "$REPO" ] || [ -z "$CURRENT_RUN_ID" ] || [ -z "$WORKFLOW_NAME" ]; then
+              echo "⚠️ 缺少必要参数，无法取消旧工作流"
+              return 1
+            fi
+            
+            # 获取当前运行的同名工作流
+            response=$(curl -fsS \
+              -H "Authorization: token $USER_PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=100")
+            
+            old_runs=$(echo "$response" | jq -r --arg WF_NAME "$WORKFLOW_NAME" --arg CURRENT_ID "$CURRENT_RUN_ID" \
+              '.workflow_runs[] | select(.name == $WF_NAME and .id != ($CURRENT_ID | tonumber)) | .id')
+            
+            if [ -z "$old_runs" ] || [ "$old_runs" = "null" ]; then
+              echo "✅ 无旧实例需要取消"
+              return 0
+            fi
+            
+            echo "🔧 检测到 $(echo "$old_runs" | wc -l) 个旧工作流实例"
+            
+            while IFS= read -r RUN_ID; do
+              if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+                echo "🛑 取消工作流实例: $RUN_ID"
+                
+                cancel_response=$(curl -fsS -w "HTTP_STATUS:%{http_code}" \
+                  -X POST \
+                  -H "Authorization: token $USER_PAT" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel")
+                  
+                http_status=$(echo "$cancel_response" | grep -oP 'HTTP_STATUS:\K\d+')
+                
+                if [ "$http_status" = "202" ]; then
+                  echo "✅ 成功取消实例 $RUN_ID"
+                else
+                  echo "❌ 取消实例 $RUN_ID 失败 (HTTP $http_status)"
+                fi
+              fi
+            done <<< "$old_runs"
+          }
+
+          # 函数7：资源监控
+          monitor_resources() {
+            echo "===== 系统资源监控 ====="
+            echo "📊 内存使用:"
+            free -h
+            echo "📊 磁盘使用:"
+            df -h / "${WEBDAV_MOUNT_POINT}" 2>/dev/null || df -h /
+            echo "📊 CPU 负载:"
+            uptime
+            echo "📊 运行容器:"
+            sudo docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}"
+          }
+
+          # 函数8：服务健康检查
+          check_service_health() {
+            local service_name=$1
+            local url=$2
+            local port=$3
+            
+            echo "🩺 检查 $service_name 健康状态..."
+            
+            if [ -n "$port" ]; then
+              # 检查端口是否监听
+              if ! sudo lsof -i :"$port" >/dev/null 2>&1; then
+                echo "❌ $service_name 未监听端口 $port"
+                return 1
+              fi
+            fi
+            
+            if [ -n "$url" ]; then
+              # 检查 HTTP 端点
+              if ! curl -m 5 -s "$url" >/dev/null 2>&1; then
+                echo "❌ $service_name HTTP 端点不可用: $url"
+                return 1
+              fi
+            fi
+            
+            echo "✅ $service_name 服务健康"
+            return 0
+          }
+
+          # 初始化：取消旧工作流
+          cancel_old_workflows
+          
+          # 初始资源清理
+          sudo apt autoremove -y && sudo apt clean
+          monitor_resources
+
+          # 保活循环
+          trap 'echo "🛑 收到终止信号，准备退出..."; exit 1' TERM INT
+
+          echo "✅ 初始化完成，进入保活循环"
+          
           while true; do
             current_time=$(date +%s)
             run_mins=$(( (current_time - start_time) / 60 ))
-            echo "📊 运行 $run_mins/360 分钟"
+            current_sec=$((current_time - start_time))
+            
+            echo "⏱️  当前运行时长: $run_mins / $MAX_RUN_MINUTES 分钟 | $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            
+            # 定期资源监控
+            if [ $((current_sec % 300)) -eq 0 ]; then
+              monitor_resources
+            fi
+            
+            # 定期健康检查
+            if [ $((current_sec % health_check_interval)) -eq 0 ]; then
+              check_service_health "CasaOS" "http://localhost:80/api/v1/sys/version" "80"
+              check_service_health "Docker" "" "2375"
+              # 检查 rclone 挂载状态
+              if ! mountpoint -q "${WEBDAV_MOUNT_POINT}"; then
+                echo "❌ WebDAV 挂载已断开，尝试重新挂载"
+                nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" --config /home/runner/.rclone.conf --vfs-cache-mode writes --allow-other --daemon >/dev/null 2>&1 &
+                sleep 10
+              fi
+              
+              # 重启失败服务
+              if ! sudo systemctl is-active --quiet casaos; then
+                echo "🔄 CasaOS 服务异常，尝试重启"
+                sudo systemctl restart casaos
+                sleep 10
+              fi
+            fi
 
+            # 每隔 SYNC_INTERVAL 分钟执行增量同步
+            if [ $((run_mins % SYNC_INTERVAL)) -eq 0 ] && [ $run_mins -ne $last_sync_minute ] && [ $run_mins -ne 0 ]; then
+              echo "⏰ 触发计划的增量同步（每 $SYNC_INTERVAL 分钟）"
+              incremental_sync
+              last_sync_minute=$run_mins
+            fi
+
+            # 300分钟执行全量备份 + 续跑
             if [ $run_mins -eq 300 ]; then
-              echo "⏰ 触发备份与续跑（剩余 60 分钟）"
-              for dir in $BACKUP_DIRS; do
-                if backup_single_dir "$dir"; then
-                  trigger_renew
-                  break
-                fi
-              done
+              echo "⏰ 达到 300 分钟，执行全量备份并续跑..."
+              if full_backup; then
+                trigger_renew
+              else
+                echo "❌ 全量备份失败，但仍将尝试触发续跑"
+                trigger_renew
+              fi
             fi
 
-            if [ $run_mins -ge 360 ]; then
-              echo "⏹️ 达到 360 分钟上限，退出"
-              exit 0
+            # 达到上限退出
+            if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
+              echo "⏹️ 达到运行上限 $MAX_RUN_MINUTES 分钟，准备退出"
+              echo "✅ 执行最终全量备份"
+              full_backup
+              
+              echo "🔄 触发续跑工作流"
+              trigger_renew
+              
+              echo "✅ 所有任务完成，退出工作流"
+              exit 1
             fi
-
-            sleep 60
+            
+            sleep 30
           done
 
-      # ========== 步骤9：清理环境 ==========
-      - name: 步骤9 - 清理环境
+      # ========== 步骤9：最终环境清理 ==========
+      - name: Step 9 - Final Cleanup
         if: ${{ always() }}
         run: |
-          echo "===== 步骤9：清理 ====="
-          # 卸载 rclone
-          fusermount3 -u "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
-          sudo rm -rf /tmp/* /var/tmp/* /home/runner/.rclone.conf || true
+          echo "===== 最终环境清理 ====="
+          
+          # 优雅卸载 WebDAV
+          if mountpoint -q "$WEBDAV_MOUNT_POINT" 2>/dev/null; then
+            echo "🔄 卸载 WebDAV 挂载点..."
+            timeout 30 fusermount3 -uz "$WEBDAV_MOUNT_POINT" 2>/dev/null || \
+            sudo umount -l "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
+          fi
+          
+          # 清理临时文件
+          sudo rm -rf /tmp/* /var/tmp/* /home/runner/.rclone.conf /tmp/rclone.log
+          
+          # 移除调试用户
+          if id "roots" &>/dev/null; then
+            echo "👤 移除调试用户 roots"
+            sudo userdel -r roots 2>/dev/null || true
+          fi
+          
+          # 清理 sudoers 配置
+          sudo rm -f /etc/sudoers.d/runner
+          
+          # 清理 Docker 资源
+          sudo docker system prune -af --filter "until=1h" >/dev/null 2>&1 || true
+          sudo docker volume prune -f --filter "until=1h" >/dev/null 2>&1 || true
+          
+          # 重启 Docker 服务（完全清理资源）
+          sudo systemctl restart docker || true
+          
+          echo "✅ 最终清理完成"
