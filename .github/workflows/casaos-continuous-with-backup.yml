@@ -13,24 +13,24 @@ jobs:
       MAX_RUN_MINUTES: 360
       WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
       BACKUP_DIRS: "/z/Ubu"
-      CORE_BACKUP_DIR: /var/lib
-      # ========== 核心优化：精准排除Docker冗余文件 ==========
+      CORE_BACKUP_DIRS: "/var/lib /DATA"
+      # 全局过滤日志/无用文件规则（保留）
       EXCLUDE_DIRS: >-
-        /tmp /var/tmp /home/runner $WEBDAV_MOUNT_POINT
-        # 排除Docker overlay2中的冗余文件
-        /var/lib/docker/overlay2/*/home/dependabot
-        /var/lib/docker/overlay2/*/vendor/ruby
-        /var/lib/docker/overlay2/*/gems
-        /var/lib/docker/overlay2/*/bundler
-        /var/lib/docker/overlay2/*/faraday
-        /var/lib/docker/overlay2/*/opentelemetry
-        # 排除Docker其他非核心冗余（保留volumes/containers/images核心）
-        /var/lib/docker/tmp
-        /var/lib/docker/buildkit
-        /var/lib/docker/runtimes
-        /var/lib/docker/swarm
-        /var/lib/docker/plugins
-      # ========== 排除规则优化结束 ==========
+        # 1. 系统级无用目录
+        /var/log /var/log/* /var/cache /var/cache/* /var/backups /var/backups/*
+        /tmp/* /var/tmp/* /lost+found /proc /sys /dev /run /mnt /media
+        /home/*/.cache /home/*/.bash_history /home/*/.ssh/known_hosts /home/*/.npm
+        /home/*/.local/share/trash /home/*/.config/Code/Cache /home/*/.config/Code/CachedData
+        # 2. Docker 冗余文件
+        /var/lib/docker/overlay2/*/home/dependabot /var/lib/docker/overlay2/*/vendor/ruby
+        /var/lib/docker/overlay2/*/gems /var/lib/docker/overlay2/*/bundler /var/lib/docker/overlay2/*/faraday
+        /var/lib/docker/overlay2/*/opentelemetry /var/lib/docker/tmp /var/lib/docker/buildkit
+        /var/lib/docker/runtimes /var/lib/docker/swarm /var/lib/docker/plugins
+        /var/lib/docker/containers/*/*.log /var/lib/docker/containers/*/*.log.*
+        # 3. 备份/挂载相关
+        $WEBDAV_MOUNT_POINT /home/runner /root
+      # 文件后缀过滤规则（保留）
+      EXCLUDE_FILES: "*.log *.log.* *.tmp *.swp *.bak *.old *.cache *.trash *.DS_Store"
       MAX_MOUNT_RETRIES: 5
       RETRY_DELAY: 10
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
@@ -42,7 +42,7 @@ jobs:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
 
     steps:
-      # ========== 步骤1：系统环境初始化 ==========
+      # ========== 步骤1：系统环境初始化 + 创建/DATA ==========
       - name: Step 1 - Initialize System Environment
         run: |
           set -e
@@ -63,7 +63,9 @@ jobs:
             echo "❌ Sudo password-less configuration failed!"
             exit 1
           fi
-          echo "✅ Initialization completed"
+          sudo mkdir -p /DATA
+          sudo chmod 755 /DATA
+          echo "✅ Initialization completed (created /DATA directory)"
 
       # ========== 步骤1.5：创建 roots 用户 ==========
       - name: Step 1.5 - Create roots User
@@ -122,28 +124,35 @@ jobs:
           if [ "$MOUNT_SUCCESS" = true ]; then
             echo "✅ rclone WebDAV mount succeeded"
             echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-            target_path="$WEBDAV_MOUNT_POINT$CORE_BACKUP_DIR"
-            mkdir -p "$target_path"
-            if [ -n "$(ls -A "$target_path" 2>/dev/null)" ]; then
-              echo "✅ Valid backup detected: $CORE_BACKUP_DIR"
-              echo "HAS_CORE_BACKUP=true" >> "$GITHUB_ENV"
-            else
-              echo "⚠️ Empty backup directory: $CORE_BACKUP_DIR"
-              echo "HAS_CORE_BACKUP=false" >> "$GITHUB_ENV"
-            fi
+            HAS_ANY_BACKUP=false
+            for core_dir in $CORE_BACKUP_DIRS; do
+              target_path="$WEBDAV_MOUNT_POINT$core_dir"
+              mkdir -p "$target_path"
+              if [ -n "$(ls -A "$target_path" 2>/dev/null)" ]; then
+                echo "✅ Valid backup detected: $core_dir"
+                key="HAS_$(echo "$core_dir" | tr '/' '_' | tr -d '-')"
+                echo "${key}=true" >> "$GITHUB_ENV"
+                HAS_ANY_BACKUP=true
+              else
+                echo "⚠️ Empty backup directory: $core_dir"
+                key="HAS_$(echo "$core_dir" | tr '/' '_' | tr -d '-')"
+                echo "${key}=false" >> "$GITHUB_ENV"
+              fi
+            done
+            echo "HAS_CORE_BACKUP=$HAS_ANY_BACKUP" >> "$GITHUB_ENV"
           else
             echo "❌ rclone mount failed after $MAX_MOUNT_RETRIES retries"
             cat /tmp/rclone.log || echo "No rclone log found"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
           fi
 
-      # ========== 步骤3：恢复 /var/lib 核心数据（仅保留核心） ==========
-      - name: Step 3 - Restore /var/lib Core Data
+      # ========== 步骤3：恢复核心数据（修复rsync日志参数） ==========
+      - name: Step 3 - Restore Core Data (/var/lib + /DATA)
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_CORE_BACKUP == 'true' }}
         run: |
           set -e
-          echo "===== Step 3: Restore $CORE_BACKUP_DIR ====="
-          RESTORE_DONE=false
+          echo "===== Step 3: Restore core directories ($CORE_BACKUP_DIRS) ====="
+          RESTORE_DONE=true
           
           if ! command -v rsync &> /dev/null; then
             echo "❌ rsync not found"
@@ -151,25 +160,34 @@ jobs:
             exit 0
           fi
 
-          target_path="$WEBDAV_MOUNT_POINT$CORE_BACKUP_DIR"
+          # 构建全局排除参数（保留）
           EXCLUDE_PARAMS=()
           for excl in $EXCLUDE_DIRS; do
             EXCLUDE_PARAMS+=("--exclude=$excl")
           done
+          for excl_file in $EXCLUDE_FILES; do
+            EXCLUDE_PARAMS+=("--exclude=$excl_file")
+          done
 
-          # ========== 优化：仅记录错误日志，关闭详细文件传输日志 ==========
-          echo "🔄 Restoring $CORE_BACKUP_DIR from backup..."
-          sudo rsync -a --delete --copy-links --sparse --numeric-ids \
-            "${EXCLUDE_PARAMS[@]}" "$target_path/" "$CORE_BACKUP_DIR/" \
-            --log-file=/tmp/rsync_restore.log --log-level=ERROR
-          
-          if [ $? -eq 0 ]; then
-            RESTORE_DONE=true
-            echo "✅ Restore succeeded: $CORE_BACKUP_DIR"
-          else
-            echo "⚠️ Restore $CORE_BACKUP_DIR failed, log:"
-            cat /tmp/rsync_restore.log || echo "No restore log"
-          fi
+          for core_dir in $CORE_BACKUP_DIRS; do
+            target_path="$WEBDAV_MOUNT_POINT$core_dir"
+            env_key="HAS_$(echo "$core_dir" | tr '/' '_' | tr -d '-')"
+            if [ "${!env_key}" = "true" ]; then
+              echo "🔄 Restoring $core_dir from backup..."
+              # ========== 核心修复：替换--log-level=ERROR为兼容方式 ==========
+              # --quiet：仅输出错误；2>：将stderr重定向到日志文件（仅记录错误）
+              if ! sudo rsync -a --delete --copy-links --sparse --numeric-ids --quiet \
+                  "${EXCLUDE_PARAMS[@]}" "$target_path/" "$core_dir/" \
+                  --log-file=/tmp/rsync_restore_$(echo "$core_dir" | tr '/' '_').log 2>/tmp/rsync_restore_$(echo "$core_dir" | tr '/' '_').err.log; then
+                echo "⚠️ Restore $core_dir failed"
+                # 输出错误日志
+                cat /tmp/rsync_restore_$(echo "$core_dir" | tr '/' '_').err.log || echo "No restore error log"
+                RESTORE_DONE=false
+              else
+                echo "✅ Restore succeeded: $core_dir"
+              fi
+            fi
+          done
           echo "DATA_RESTORED=$RESTORE_DONE" >> "$GITHUB_ENV"
 
       # ========== 步骤4：安装 CasaOS ==========
@@ -177,7 +195,7 @@ jobs:
         run: |
           set -e
           echo "===== Step 4: Install or Skip CasaOS ====="
-          CASAOS_DATA_PATH="$CORE_BACKUP_DIR/casaos"
+          CASAOS_DATA_PATH="/var/lib/casaos"
           if [ -d "$CASAOS_DATA_PATH" ] && [ "$DATA_RESTORED" = "true" ]; then
             echo "✅ CasaOS data restored from $CASAOS_DATA_PATH, skip installation"
           else
@@ -263,12 +281,12 @@ jobs:
           echo "👤 Debug User: roots (password from secrets or random generated)"
           echo "⚠️ Please change CasaOS default password immediately!"
 
-      # ========== 步骤8：保活 + 备份 /var/lib（极简日志） ==========
-      - name: Step 8 - Keep Alive + Backup /var/lib + Renew
+      # ========== 步骤8：保活 + 备份（修复rsync日志参数） + 续跑 ==========
+      - name: Step 8 - Keep Alive + Backup Core Dirs + Renew
         shell: bash
         run: |
           set -e
-          echo "===== Step 8: Keep Alive + Backup $CORE_BACKUP_DIR + Renew ====="
+          echo "===== Step 8: Keep Alive + Backup $CORE_BACKUP_DIRS + Renew ====="
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
 
@@ -288,25 +306,42 @@ jobs:
             fi
           }
           
-          # 核心优化：仅备份核心数据，日志仅记录错误
-          backup_core_dir() {
+          backup_core_dirs() {
             if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
               echo "❌ WebDAV not available, skip backup"
               return 1
             fi
             
-            target_path="$WEBDAV_MOUNT_POINT$CORE_BACKUP_DIR"
-            mkdir -p "$target_path"
+            local backup_success=true
+            # 构建全局排除参数（保留）
             EXCLUDE_PARAMS=()
             for excl in $EXCLUDE_DIRS; do
               EXCLUDE_PARAMS+=("--exclude=$excl")
             done
-            
-            echo "🔄 Backing up $CORE_BACKUP_DIR (only core data)..."
-            # ========== 关键优化：--log-level=ERROR 仅记录错误，无文件传输日志 ==========
-            if sudo rsync -a --delete --copy-links --sparse --numeric-ids \
-                "${EXCLUDE_PARAMS[@]}" "$CORE_BACKUP_DIR/" "$target_path/" \
-                --log-file=/tmp/rsync_backup.log --log-level=ERROR; then
+            for excl_file in $EXCLUDE_FILES; do
+              EXCLUDE_PARAMS+=("--exclude=$excl_file")
+            done
+
+            for core_dir in $CORE_BACKUP_DIRS; do
+              target_path="$WEBDAV_MOUNT_POINT$core_dir"
+              mkdir -p "$target_path"
+              echo "🔄 Backing up $core_dir (filtered logs/temp files)..."
+              
+              # ========== 核心修复：替换--log-level=ERROR为兼容方式 ==========
+              # --quiet：仅输出错误；2>：将错误信息重定向到独立日志文件
+              if ! sudo rsync -a --delete --copy-links --sparse --numeric-ids --quiet \
+                  "${EXCLUDE_PARAMS[@]}" "$core_dir/" "$target_path/" \
+                  --log-file=/tmp/rsync_backup_$(echo "$core_dir" | tr '/' '_').log 2>/tmp/rsync_backup_$(echo "$core_dir" | tr '/' '_').err.log; then
+                echo "❌ Backup failed: $core_dir"
+                # 仅输出错误日志
+                cat /tmp/rsync_backup_$(echo "$core_dir" | tr '/' '_').err.log || echo "No backup error log"
+                backup_success=false
+              else
+                echo "✅ Backup completed: $core_dir (filtered useless files)"
+              fi
+            done
+
+            if [ "$backup_success" = true ]; then
               BACKUP_TIME="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
               RUNNER_ID="${{ github.run_id }}"
               GITHUB_REPO="${{ github.repository }}"
@@ -315,17 +350,16 @@ jobs:
               sudo printf '%s\n' \
                 "backup_time=$BACKUP_TIME" \
                 "runner_id=$RUNNER_ID" \
-                "github_repo=$GITHUB_REPO" \
+                "github_repo=$GITHUB_ENV" \
                 "workflow_run_url=$WORKFLOW_URL" \
-                "backup_target=$CORE_BACKUP_DIR" \
-                "excluded_items=Docker overlay2 redundant files (dependabot/ruby/gems etc.)" \
+                "backup_targets=$CORE_BACKUP_DIRS" \
+                "excluded_types=logs(*.log), temp(*.tmp), cache, docker redundant files, system garbage" \
                 > "$WEBDAV_MOUNT_POINT/backup_info.txt"
               
-              echo "✅ $CORE_BACKUP_DIR backup completed (core data only)"
+              echo "✅ All core directories backup completed (filtered useless files)"
               return 0
             else
-              echo "❌ $CORE_BACKUP_DIR backup failed, log:"
-              cat /tmp/rsync_backup.log || echo "No backup log"
+              echo "❌ Partial backup failed"
               return 1
             fi
           }
@@ -336,8 +370,8 @@ jobs:
             echo "📊 Running for $run_mins/$MAX_RUN_MINUTES minutes"
             
             if [ $run_mins -ge 10 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰ Running for 10 minutes, starting $CORE_BACKUP_DIR backup and renew..."
-              if backup_core_dir; then
+              echo "⏰ Running for 10 minutes, starting filtered backup and renew..."
+              if backup_core_dirs; then
                 trigger_renew
               fi
             fi
