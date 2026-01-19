@@ -15,14 +15,13 @@ jobs:
       BACKUP_DIRS: "/z/Ubu"
       CASAOS_DATA: /var/lib/casaos
       DOCKER_DATA: /var/lib/docker
-      # 👇 新增排除 fstab/mtab，避免恢复后系统挂载异常
       EXCLUDE_DIRS: >-
         /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
         /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
         /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs
         /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
-      MAX_MOUNT_RETRIES: 3          # 👈 增加重试次数
-      RETRY_DELAY: 15               # 👈 延长重试间隔
+      MAX_MOUNT_RETRIES: 3
+      RETRY_DELAY: 15
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -37,7 +36,6 @@ jobs:
           echo "===== 步骤1：系统环境初始化 ====="
           sudo apt update -y && sudo apt install -y rsync davfs2 curl wget jq iptables || { echo "❌ 依赖安装失败"; exit 1; }
 
-          # 👇 配置 davfs2：禁用文件锁（WebDAV 不支持），忽略 SSL 证书（兼容自签名）
           echo "use_locks 0" | sudo tee -a /etc/davfs2/davfs2.conf
           echo "trust_server_cert 1" | sudo tee -a /etc/davfs2/davfs2.conf
 
@@ -74,7 +72,6 @@ jobs:
           done
 
           if [ "$mount_success" = "true" ]; then
-            # 👇 关键：验证 WebDAV 是否可写！
             if timeout 10 touch "$WEBDAV_MOUNT_POINT/.write_test" 2>/dev/null && rm -f "$WEBDAV_MOUNT_POINT/.write_test"; then
               echo "✅ WebDAV 挂载成功且可写"
               echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
@@ -117,7 +114,6 @@ jobs:
               done
               target_path="$WEBDAV_MOUNT_POINT$dir"
               
-              # 👇 优化 rsync 参数
               sudo rsync -av --delete --copy-links --sparse --numeric-ids \
                 "${EXCLUDE_PARAMS[@]}" "$target_path/" /
               if [ $? -eq 0 ]; then
@@ -140,7 +136,6 @@ jobs:
           else
             curl -fsSL https://get.casaos.io | sudo bash || { echo "❌ CasaOS 安装失败"; exit 1; }
             echo "✅ CasaOS 安装完成"
-          fi
 
       # ========== 步骤5：启动服务 ==========
       - name: 步骤5 - 启动服务
@@ -212,14 +207,21 @@ jobs:
             echo "🔄 开始备份到 $dir ..."
             if sudo rsync -av --delete --copy-links --sparse --numeric-ids \
                 "${EXCLUDE_PARAMS[@]}" / "$target_path/"; then
-              # 👇 增强标记文件信息
-              cat > /tmp/backup_meta.txt <<EOF
-backup_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-runner_id=${{ github.run_id }}
-github_repo=${{ github.repository }}
-workflow_run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-EOF
-              sudo cp /tmp/backup_meta.txt "$target_path/backup_info.txt"
+              # 安全写入元数据：避免 YAML 中的 <<EOF 缩进问题
+              sudo sh -c "cat > '$target_path/backup_info.txt'" <<'SAFE_EOF'
+backup_time=
+runner_id=
+github_repo=
+workflow_run_url=
+SAFE_EOF
+
+              sudo sed -i \
+                -e "s|backup_time=|backup_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")|" \
+                -e "s|runner_id=|runner_id=${{ github.run_id }}|" \
+                -e "s|github_repo=|github_repo=${{ github.repository }}|" \
+                -e "s|workflow_run_url=|workflow_run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|" \
+                "$target_path/backup_info.txt"
+
               echo "✅ 备份完成 ($dir)"
               return 0
             fi
