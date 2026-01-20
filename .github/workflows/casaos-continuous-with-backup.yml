@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
-      WEBDAV_MOUNT_POINT: /home/runner/webdav_mount  # 基础路径直接写死，避免嵌套引用
+      WEBDAV_MOUNT_POINT: /home/runner/webdav_mount  # WebDAV根挂载点
       CORE_DIRS: "/var/lib /DATA"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/overlay2/*/home/dependabot
@@ -31,11 +31,17 @@ jobs:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
 
     steps:
-      # ========== 1. 环境初始化 + 创建WebDAV子目录 ==========
+      # ========== 1. 环境初始化 + 创建中文子目录 ==========
       - name: Env Init & Create Dirs
         run: |
           set -e
-          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip
+          # 安装依赖（确保中文编码支持）
+          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales
+          # 配置UTF-8编码，避免中文路径乱码
+          sudo locale-gen zh_CN.UTF-8
+          export LC_ALL=zh_CN.UTF-8
+          export LANG=zh_CN.UTF-8
+          
           curl https://rclone.org/install.sh | sudo bash
           echo "user_allow_other" | sudo tee -a /etc/fuse.conf
           sudo sed -i 's/^Defaults    requiretty/#Defaults    requiretty/' /etc/sudoers
@@ -43,12 +49,12 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
-          # 步骤内动态拼接子目录路径（核心修复）
-          WEBDAV_SNAPSHOT_DIR="${WEBDAV_MOUNT_POINT}/z/Ubu"
-          # 创建多级目录，确保存在
+          # 核心修改：拼接中文子目录路径 /对象存储/ubuntu
+          WEBDAV_SNAPSHOT_DIR="${WEBDAV_MOUNT_POINT}/对象存储/ubuntu"
+          # 创建多级中文目录（mkdir -p 支持中文路径）
           sudo mkdir -p "$WEBDAV_SNAPSHOT_DIR"
           echo "✅ Env init done, WebDAV snapshot dir: $WEBDAV_SNAPSHOT_DIR"
-          # 把路径写入环境变量，供后续步骤使用
+          # 写入环境变量供后续步骤使用
           echo "WEBDAV_SNAPSHOT_DIR=$WEBDAV_SNAPSHOT_DIR" >> "$GITHUB_ENV"
 
       # ========== 2. 创建 roots 用户 ==========
@@ -65,10 +71,14 @@ jobs:
             sudo usermod -aG sudo roots
           fi
 
-      # ========== 3. 挂载 WebDAV + 检测子目录快照 ==========
+      # ========== 3. 挂载 WebDAV + 检测中文目录快照 ==========
       - name: Mount WebDAV
         run: |
           set -e
+          # 确保中文编码生效
+          export LC_ALL=zh_CN.UTF-8
+          export LANG=zh_CN.UTF-8
+
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "❌ WebDAV secrets missing"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -78,13 +88,22 @@ jobs:
           mkdir -p "$WEBDAV_MOUNT_POINT"
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" vendor="other" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf
-          nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" --config /home/runner/.rclone.conf --vfs-cache-mode full --daemon-timeout 1h --allow-other --log-level ERROR >/dev/null 2>&1 &
+          # 挂载时指定编码，避免中文乱码
+          nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
+            --config /home/runner/.rclone.conf \
+            --vfs-cache-mode full \
+            --daemon-timeout 1h \
+            --allow-other \
+            --log-level ERROR \
+            --locale zh-CN \
+            >/dev/null 2>&1 &
 
+          # 检查挂载状态（重试5次）
           for i in $(seq 1 5); do
             if timeout 5 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
-              echo "✅ WebDAV mounted"
+              echo "✅ WebDAV mounted (UTF-8 encoding)"
               echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-              # 从步骤1定义的子目录检测快照
+              # 从中文目录检测历史快照
               if ls "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
                 LATEST_SNAPSHOT=$(ls -t "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz | head -n1)
                 echo "✅ Found latest snapshot: $LATEST_SNAPSHOT"
@@ -99,11 +118,14 @@ jobs:
           echo "❌ WebDAV mount failed"
           echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
 
-      # ========== 4. 从子目录恢复快照 + 删除已用文件 ==========
+      # ========== 4. 从中文目录恢复快照 + 删除已用文件 ==========
       - name: Restore Snapshot & Cleanup
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
           set -e
+          export LC_ALL=zh_CN.UTF-8
+          export LANG=zh_CN.UTF-8
+          
           echo "===== Restore from: $LATEST_SNAPSHOT ====="
           # 彻底停掉Docker/CasaOS
           sudo systemctl stop docker.service docker.socket casaos.service
@@ -111,13 +133,13 @@ jobs:
           sudo pkill -9 docker || true
           sync && sleep 3
 
-          # 解压快照，忽略所有错误
+          # 解压快照（忽略错误，支持中文路径）
           sudo tar -xzf "$LATEST_SNAPSHOT" -C / --overwrite --ignore-failed-read --warning=no-all $EXCLUDE_RULES
           
           if [ $? -eq 0 ]; then
             echo "✅ Restore success"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            # 删除子目录下的已用快照和元信息
+            # 删除中文目录下的已用快照和元信息
             sudo rm -f "$LATEST_SNAPSHOT" "$WEBDAV_SNAPSHOT_DIR/snapshot_meta.txt"
             sudo systemctl unmask docker.socket
           else
@@ -165,11 +187,15 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}"
           echo "✅ Tailscale IP: $(sudo tailscale ip -4)"
 
-      # ========== 8. 核心修复：快照保存到/z/Ubu目录 ==========
+      # ========== 8. 核心：快照保存到/对象存储/ubuntu目录 ==========
       - name: Create Snapshot & Upload & Renew
         shell: bash
         run: |
           set -e
+          # 确保中文编码生效
+          export LC_ALL=zh_CN.UTF-8
+          export LANG=zh_CN.UTF-8
+          
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
 
@@ -187,7 +213,7 @@ jobs:
             # 生成带时间戳的文件名
             SNAPSHOT_NAME="casaos-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
-            # 使用步骤1定义的子目录路径
+            # 中文目录路径
             WEBDAV_SNAPSHOT="${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}"
             echo "🔄 Snapshot name: $SNAPSHOT_NAME (save to $WEBDAV_SNAPSHOT_DIR)"
 
@@ -197,7 +223,7 @@ jobs:
             sudo pkill -9 docker || true
             sync && sleep 5
 
-            # 打包快照
+            # 打包快照（支持中文路径）
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
@@ -209,18 +235,18 @@ jobs:
             [ ! -f "${TMP_SNAPSHOT}" ] && echo "❌ Snapshot file not found" && return 1
             echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
 
-            # 检查WebDAV子目录可写性
+            # 检查中文目录可写性
             if ! sudo touch "${WEBDAV_SNAPSHOT_DIR}/.test-write" 2>/dev/null; then
               echo "❌ WebDAV dir $WEBDAV_SNAPSHOT_DIR is read-only"
               return 1
             fi
             sudo rm -f "${WEBDAV_SNAPSHOT_DIR}/.test-write"
 
-            # 上传快照到子目录
+            # 上传快照到中文目录
             sudo cp "${TMP_SNAPSHOT}" "${WEBDAV_SNAPSHOT}"
             if [ $? -eq 0 ]; then
               echo "✅ Snapshot uploaded to $WEBDAV_SNAPSHOT"
-              # 元信息文件也存到子目录
+              # 元信息文件也存到中文目录
               echo "snapshot_name=${SNAPSHOT_NAME}" | sudo tee "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
               echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee -a "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
             else
@@ -234,7 +260,7 @@ jobs:
             return 0
           }
 
-          # 保活循环（修复算术运算语法）
+          # 保活循环
           while true; do
             run_mins=$(( ($(date +%s) - start_time) / 60 ))
             echo "📊 Running for $run_mins minutes"
@@ -253,6 +279,9 @@ jobs:
         if: ${{ always() }}
         run: |
           set -e
+          export LC_ALL=zh_CN.UTF-8
+          export LANG=zh_CN.UTF-8
+          
           sudo systemctl unmask docker.socket || true
           if mount | grep -q "$WEBDAV_MOUNT_POINT"; then
             fusermount3 -u "$WEBDAV_MOUNT_POINT" || sudo fusermount3 -u "$WEBDAV_MOUNT_POINT"
