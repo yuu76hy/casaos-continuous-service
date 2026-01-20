@@ -1,6 +1,6 @@
 name: CasaOS Cloud Instance
 
-# 触发方式：手动触发 或 每5小时自动触发（防止过期）
+# 触发方式：手动触发 或 每5小时自动触发
 on:
   workflow_dispatch:
   schedule:
@@ -9,20 +9,15 @@ on:
 
 env:
   # ==========================================
-  # 🛠️ 核心配置（不需要改，除非你想换路径）
+  # 🛠️ 核心配置
   # ==========================================
-  # 你要备份的三个核心目录
   SOURCE_DIRS: "/var/lib/casaos /var/lib/docker /DATA"
-  
-  # 网盘里的统一根目录（这就是你想要的 /z/Ubu）
   BACKUP_BUCKET: "/z/Ubu"
-  
-  # 系统内部挂载点（不要动）
   WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
   WEBDAV_REMOTE_NAME: "mywebdav"
 
   # ==========================================
-  # 🗑️ 垃圾文件排除列表（不备份这些）
+  # 🗑️ 垃圾文件排除列表
   # ==========================================
   EXCLUDE_DIRS: >-
     # 系统基础目录
@@ -31,7 +26,7 @@ env:
     /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs
     /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
     
-    # Docker 运行时产生的垃圾（非常重要，不备份这些）
+    # Docker 运行时产生的垃圾
     /var/lib/docker/tmp
     /var/lib/docker/overlay2
     /var/lib/docker/containers/*/mounts
@@ -51,25 +46,21 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y rclone rsync curl wget fuse
-        # 允许非 root 用户挂载
         echo 'user_allow_other' | sudo tee -a /etc/fuse.conf > /dev/null
         mkdir -p ${{ env.WEBDAV_MOUNT_POINT }}
 
     - name: 🌐 2. 配置并挂载 WebDAV
       env:
-        # 👇 这里直接读取你设置的 Secrets
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
         WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
         WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       run: |
-        # 检查是否配置了 WebDAV
         if [ -z "$WEBDAV_URL" ]; then
-          echo "⚠️ 未配置 WEBDAV_URL，跳过挂载"
+          echo "⚠️ 未配置 WEBDAV_URL"
           echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
           exit 0
         fi
 
-        # 生成 rclone 配置文件（type 和 vendor 写死为 webdav/other）
         mkdir -p ～/.config/rclone
         cat > ～/.config/rclone/rclone.conf << EOF
 [${{ env.WEBDAV_REMOTE_NAME }}]
@@ -80,7 +71,6 @@ user = $WEBDAV_USER
 pass = $WEBDAV_PASSWORD
 EOF
 
-        # 启动挂载（后台运行）
         rclone mount ${{ env.WEBDAV_REMOTE_NAME }}:${{ env.WEBDAV_MOUNT_POINT }} \
           --allow-other \
           --vfs-cache-mode writes \
@@ -89,7 +79,6 @@ EOF
           --dir-cache-time 5m \
           --poll-interval 5m
 
-        # 等待挂载完成
         sleep 5
         if mountpoint -q ${{ env.WEBDAV_MOUNT_POINT }}; then
           echo "✅ WebDAV 挂载成功"
@@ -104,25 +93,17 @@ EOF
       run: |
         echo "📂 正在从网盘恢复数据..."
         IFS=' ' read -r -a dirs <<< "$SOURCE_DIRS"
-        
         for dir in "${dirs[@]}"; do
-          # 构建网盘上的路径：例如 /home/runner/.../z/Ubu/var/lib/casaos
           webdav_src="${WEBDAV_MOUNT_POINT}${BACKUP_BUCKET}${dir}"
-          
-          # 如果网盘里有这个目录，就恢复它
           if [ -d "$webdav_src" ] && [ -n "$(ls -A "$webdav_src" 2>/dev/null)" ]; then
             echo "🔄 恢复 $dir ..."
             sudo mkdir -p "$dir"
-            
-            # 智能排除：只排除当前目录下的垃圾（例如只排除 /var/lib/docker 下的 overlay2）
             EXCLUDE_PARAMS=()
             for excl in $EXCLUDE_DIRS; do
               if [[ "$excl" == "$dir"* ]]; then
                 EXCLUDE_PARAMS+=("--exclude=$excl")
               fi
             done
-
-            # 执行恢复命令
             sudo rsync -av --delete --copy-links --sparse --numeric-ids \
               "${EXCLUDE_PARAMS[@]}" "$webdav_src/" "$dir/"
           else
@@ -131,36 +112,29 @@ EOF
         done
 
     - name: 🏠 4. 安装 CasaOS
-      # 如果没有网盘，或者不是定时任务触发（即第一次手动触发），就安装
+      # ✅ 修复逻辑：如果 WebDAV 挂载失败，或者不是定时任务（即手动触发），则安装
       if: ${{ env.WEBDAV_AVAILABLE != 'true' || github.event_name != 'schedule' }}
       run: |
         echo "🚀 安装 CasaOS..."
-        # 检查是否已安装
         if ! command -v casaos-service &> /dev/null; then
           curl -fsSL https://get.casaos.io | sudo bash
         fi
-        # 确保 /DATA 目录存在
         sudo mkdir -p /DATA
         sudo chown -R runner:runner /DATA
 
     - name: ▶️ 5. 启动服务
       run: |
-        # 开机自启
         sudo systemctl enable docker casaos
-        # 启动服务
         sudo systemctl start docker casaos
-        # 等待一会确保服务起来
         sleep 10
         echo "✅ CasaOS 和 Docker 已启动"
 
     - name: 🔐 6. 连接 Tailscale
+      if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
       env:
         TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      if: env.TS_AUTH_KEY != ''
       run: |
-        # 安装 Tailscale
         curl -fsSL https://tailscale.com/install.sh | sh
-        # 登录并连接
         sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname=CasaOS-Cloud
         echo "🛡️ Tailscale IPv4: $(tailscale ip -4)"
         echo "🛡️ Tailscale IPv6: $(tailscale ip -6)"
@@ -170,17 +144,12 @@ EOF
         echo "⏳ 实例已启动，正在运行..."
         START_TIME=$(date +%s)
         
-        # 备份函数
         backup_dir() {
           local src="$1"
-          # 构建网盘目标路径
           local dst="${WEBDAV_MOUNT_POINT}${BACKUP_BUCKET}${src}"
           echo "📦 正在备份 $src ..."
-          
-          # 确保网盘目录存在
           mkdir -p "$dst"
           
-          # 构建排除参数
           local exclude_params=()
           for excl in $EXCLUDE_DIRS; do
             if [[ "$excl" == "$src"* ]]; then
@@ -188,12 +157,10 @@ EOF
             fi
           done
           
-          # 执行备份
           if sudo rsync -av --delete --copy-links --sparse --numeric-ids \
               "${exclude_params[@]}" "$src/" "$dst/"; then
-            echo "✅ $src 备份成功"
-            # 记录备份时间
             date -u +"%Y-%m-%dT%H:%M:%SZ" > "$dst/backup_timestamp.txt"
+            echo "✅ $src 备份成功"
             return 0
           else
             echo "❌ $src 备份失败"
@@ -201,7 +168,7 @@ EOF
           fi
         }
 
-        # 主循环：每5分钟检查一次，运行5小时后自动续杯
+        # 主循环：每5分钟检查一次
         while true; do
           CURRENT_TIME=$(date +%s)
           ELAPSED=$(( (CURRENT_TIME - START_TIME) / 60 ))
@@ -210,7 +177,6 @@ EOF
           if [ $ELAPSED -ge 300 ]; then
             echo "⏰ 时间即将耗尽，开始执行最终备份..."
             
-            # 执行备份
             IFS=' ' read -r -a dirs <<< "$SOURCE_DIRS"
             ALL_SUCCESS=true
             for dir in "${dirs[@]}"; do
@@ -221,28 +187,31 @@ EOF
               fi
             done
             
-            # 触发续杯（自动重启一个新的实例）
+            # 触发续杯（自动重启）
             if [ "$ALL_SUCCESS" = true ]; then
               echo "🔄 触发续杯..."
-              # 优先使用 USER_PAT，如果没有则尝试 USER_GITHUB_PAT
-              PAT=${{ secrets.USER_PAT }} 
-              if [ -z "$PAT" ]; then PAT=${{ secrets.USER_GITHUB_PAT }}; fi
-              
+              # 优先使用 USER_PAT
+              PAT=${{ secrets.USER_PAT }}
               if [ -z "$PAT" ]; then
-                echo "❌ 未找到 Personal Access Token，无法续杯"
-              else
+                PAT=${{ secrets.USER_GITHUB_PAT }}
+              fi
+              
+              if [ -n "$PAT" ]; then
                 curl -X POST \
                   -H "Authorization: Bearer $PAT" \
                   -H "Accept: application/vnd.github.v3+json" \
                   "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}.yml/dispatches" \
                   -d '{"ref": "main"}'
+                echo "✅ 续杯请求已发送"
+              else
+                echo "❌ 未找到 Personal Access Token，无法续杯"
               fi
             fi
             
             break
           fi
           
-          sleep 300 # 每5分钟检查一次
+          sleep 300
         done
 
     - name: 🧹 8. 清理挂载
