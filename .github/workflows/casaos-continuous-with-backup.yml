@@ -21,7 +21,6 @@ jobs:
         --exclude=/var/log --exclude=/var/cache
         --exclude=*.log --exclude=*.tmp --exclude=*.cache
         --exclude=/tmp --exclude=/var/tmp --exclude=$WEBDAV_MOUNT_POINT
-      # GitHub Secrets - 需在仓库 Settings -> Secrets and variables -> Actions 中配置
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -31,35 +30,24 @@ jobs:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
 
     steps:
-      # ========== 1. 环境初始化 + 创建中文目录 ==========
       - name: Env Init & Create Dirs
         run: |
           set -e
-          # 安装依赖 + 配置中文编码
           sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales
           sudo locale-gen zh_CN.UTF-8
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
-          
-          # 安装 rclone
           curl https://rclone.org/install.sh | sudo bash
-          
-          # 配置权限
           echo "user_allow_other" | sudo tee -a /etc/fuse.conf
           sudo sed -i 's/^Defaults    requiretty/#Defaults    requiretty/' /etc/sudoers
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
-          
-          # 创建数据目录
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          
-          # 拼接 WebDAV 中文子目录路径
           WEBDAV_SNAPSHOT_DIR="${WEBDAV_MOUNT_POINT}/对象存储/ubuntu"
           sudo mkdir -p "$WEBDAV_SNAPSHOT_DIR"
           echo "✅ Env init done, WebDAV snapshot dir: $WEBDAV_SNAPSHOT_DIR"
           echo "WEBDAV_SNAPSHOT_DIR=$WEBDAV_SNAPSHOT_DIR" >> "$GITHUB_ENV"
 
-      # ========== 2. 创建 roots 用户 ==========
       - name: Create roots User
         run: |
           set -e
@@ -75,24 +63,19 @@ jobs:
             sudo usermod -aG sudo roots
           fi
 
-      # ========== 3. 挂载 WebDAV（优化参数+强制同步） ==========
       - name: Mount WebDAV
         run: |
           set -e
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
 
-          # 检查密钥是否配置
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "❌ WebDAV secrets missing, please configure in GitHub Secrets"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
 
-          # 创建挂载点
           mkdir -p "$WEBDAV_MOUNT_POINT"
-          
-          # 配置 rclone WebDAV 远程
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav \
             url="$WEBDAV_URL" \
@@ -101,7 +84,7 @@ jobs:
             pass="$ENCRYPTED_PASS" \
             --config /home/runner/.rclone.conf
           
-          # 挂载 WebDAV（强制实时同步参数）
+          # 仅在mount时使用--locale参数，且确保日志文件生成
           nohup rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
             --config /home/runner/.rclone.conf \
             --vfs-cache-mode writes \
@@ -112,15 +95,13 @@ jobs:
             --allow-non-empty \
             --locale zh-CN \
             --log-level INFO \
-            --log-file /tmp/rclone.log >/dev/null 2>&1 &
+            --log-file /tmp/rclone_mount.log >/dev/null 2>&1 &
           
-          # 检查挂载状态（重试5次）
           for i in $(seq 1 5); do
             if timeout 5 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
               echo "✅ WebDAV mounted successfully (UTF-8 encoding)"
               echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
               
-              # 检测历史快照
               if ls "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
                 LATEST_SNAPSHOT=$(ls -t "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz | head -n1)
                 echo "✅ Found latest snapshot: $LATEST_SNAPSHOT"
@@ -134,12 +115,10 @@ jobs:
             sleep 10
           done
           
-          # 挂载失败，输出日志排查
           echo "❌ WebDAV mount failed after 5 attempts"
-          cat /tmp/rclone.log
+          cat /tmp/rclone_mount.log || echo "⚠️ No mount log file found"
           echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
 
-      # ========== 4. 从 WebDAV 恢复快照 ==========
       - name: Restore Snapshot & Cleanup Used File
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
@@ -149,13 +128,11 @@ jobs:
           
           echo "===== Start restoring from snapshot: $LATEST_SNAPSHOT ====="
           
-          # 彻底停止 Docker & CasaOS
           sudo systemctl stop docker.service docker.socket casaos.service
           sudo systemctl mask docker.socket
           sudo pkill -9 docker || true
           sync && sleep 3
           
-          # 解压快照
           sudo tar -xzf "$LATEST_SNAPSHOT" -C / \
             --overwrite \
             --ignore-failed-read \
@@ -165,10 +142,7 @@ jobs:
           if [ $? -eq 0 ]; then
             echo "✅ Snapshot restored successfully"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            
-            # 删除已使用的快照和元信息
             sudo rm -f "$LATEST_SNAPSHOT" "$WEBDAV_SNAPSHOT_DIR/snapshot_meta.txt"
-            # 恢复 Docker Socket
             sudo systemctl unmask docker.socket
           else
             echo "❌ Snapshot restore failed"
@@ -176,7 +150,6 @@ jobs:
             sudo systemctl unmask docker.socket
           fi
 
-      # ========== 5. 安装 CasaOS（无快照时执行） ==========
       - name: Install CasaOS If No Snapshot Restored
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
         run: |
@@ -188,13 +161,11 @@ jobs:
           }
           echo "✅ CasaOS installed successfully"
 
-      # ========== 6. 启动 Docker & CasaOS 服务 ==========
       - name: Start Docker & CasaOS Services
         run: |
           set -e
           sudo systemctl unmask docker.socket || true
           
-          # 重试启动服务（3次）
           for i in $(seq 1 3); do
             sudo systemctl enable --now docker.service docker.socket casaos.service
             sleep 10
@@ -208,7 +179,6 @@ jobs:
           echo "❌ Failed to start Docker & CasaOS services after 3 attempts"
           exit 1
 
-      # ========== 7. 部署 Tailscale 网络 ==========
       - name: Deploy Tailscale Network
         run: |
           set -e
@@ -217,9 +187,7 @@ jobs:
             exit 0
           fi
           
-          # 安装 Tailscale
           curl -fsSL https://tailscale.com/install.sh | sudo bash
-          # 登录 Tailscale
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTH_KEY" \
             --accept-routes \
@@ -227,7 +195,6 @@ jobs:
           
           echo "✅ Tailscale deployed successfully, IP address: $(sudo tailscale ip -4)"
 
-      # ========== 8. 核心功能：创建快照 + 强制同步 WebDAV + 自动续跑 ==========
       - name: Create Snapshot & Upload & Auto Renew
         shell: bash
         run: |
@@ -238,7 +205,6 @@ jobs:
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
 
-          # 🔧 函数1：触发 Workflow 续跑
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "⚠️ USER_PAT or REPO not configured, cannot trigger renew"
@@ -260,26 +226,22 @@ jobs:
             fi
           }
 
-          # 🔧 函数2：创建快照并强制同步到 WebDAV
           create_snapshot() {
             if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
               echo "❌ WebDAV not available, skipping snapshot creation"
               return 1
             fi
 
-            # 1. 生成带时间戳的快照文件名
             SNAPSHOT_NAME="casaos-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
             WEBDAV_SNAPSHOT="${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}"
             echo "🔄 Starting snapshot creation: $SNAPSHOT_NAME (target: $WEBDAV_SNAPSHOT_DIR)"
 
-            # 2. 彻底停止 Docker & CasaOS 避免文件占用
             sudo systemctl stop docker.service docker.socket casaos.service
             sudo systemctl mask docker.socket
             sudo pkill -9 docker || true
             sync && sleep 5
 
-            # 3. 打包核心目录（屏蔽所有警告）
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
@@ -287,7 +249,6 @@ jobs:
               $EXCLUDE_RULES \
               $CORE_DIRS
 
-            # 4. 检查快照文件是否生成
             if [ ! -f "${TMP_SNAPSHOT}" ]; then
               echo "❌ Snapshot file not found: $TMP_SNAPSHOT"
               sudo systemctl unmask docker.socket
@@ -296,7 +257,6 @@ jobs:
             fi
             echo "✅ Snapshot created successfully, size: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
 
-            # 5. 检查 WebDAV 中文目录可写性
             if ! sudo touch "${WEBDAV_SNAPSHOT_DIR}/.test-write" 2>/dev/null; then
               echo "❌ WebDAV directory $WEBDAV_SNAPSHOT_DIR is read-only"
               sudo systemctl unmask docker.socket
@@ -305,28 +265,30 @@ jobs:
             fi
             sudo rm -f "${WEBDAV_SNAPSHOT_DIR}/.test-write"
 
-            # 6. 复制快照到挂载目录 + 强制同步到 WebDAV 服务端
             sudo cp "${TMP_SNAPSHOT}" "${WEBDAV_SNAPSHOT}"
             if [ $? -eq 0 ]; then
               echo "✅ Snapshot copied to local mount directory"
               
-              # ⚡ 关键步骤：强制同步到 WebDAV 服务端
+              # 核心修复：移除sync命令的--locale参数，新增sync专属日志
               rclone sync "$WEBDAV_SNAPSHOT_DIR" "mywebdav:/对象存储/ubuntu" \
                 --config /home/runner/.rclone.conf \
-                --locale zh-CN \
-                --log-level INFO
+                --transfers 4 \
+                --log-level INFO \
+                --log-file /tmp/rclone_sync.log
               
               if [ $? -eq 0 ]; then
                 echo "✅ Snapshot synced to WebDAV server successfully: $WEBDAV_SNAPSHOT"
                 
-                # 写入快照元信息
                 echo "snapshot_name=${SNAPSHOT_NAME}" | sudo tee "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
                 echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee -a "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
-                # 同步元信息文件
-                rclone sync "$WEBDAV_SNAPSHOT_DIR" "mywebdav:/对象存储/ubuntu" --config /home/runner/.rclone.conf
+                rclone sync "$WEBDAV_SNAPSHOT_DIR" "mywebdav:/对象存储/ubuntu" \
+                  --config /home/runner/.rclone.conf \
+                  --log-level INFO \
+                  --log-file /tmp/rclone_meta_sync.log
               else
-                echo "❌ Failed to sync snapshot to WebDAV server, check log: /tmp/rclone.log"
-                cat /tmp/rclone.log
+                echo "❌ Failed to sync snapshot to WebDAV server, check logs below:"
+                cat /tmp/rclone_sync.log || echo "⚠️ No sync log file found"
+                cat /tmp/rclone_mount.log || echo "⚠️ No mount log file found"
                 sudo systemctl unmask docker.socket
                 sudo systemctl start docker.service docker.socket casaos.service
                 return 1
@@ -338,11 +300,9 @@ jobs:
               return 1
             fi
 
-            # 7. 恢复 Docker & CasaOS 服务
             sudo systemctl unmask docker.socket
             sudo systemctl start docker.service docker.socket casaos.service
 
-            # 8. 清理7天前的旧快照
             echo "🔄 Cleaning old snapshots (keeping last 7 days)..."
             find "$WEBDAV_SNAPSHOT_DIR" -name "casaos-server-snapshot-*.tar.gz" -mtime +7 -delete
             if [ $? -eq 0 ]; then
@@ -354,18 +314,15 @@ jobs:
             return 0
           }
 
-          # 🎯 主循环：定时创建快照 + 自动续跑
           while true; do
             run_mins=$(( ($(date +%s) - start_time) / 60 ))
             echo "📊 Workflow running for $run_mins minutes"
 
-            # 每10分钟创建一次快照并触发续跑（仅一次）
             if [ $run_mins -ge 10 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
               echo "⏰ Time to create snapshot (10 minutes reached)"
               create_snapshot && trigger_renew
             fi
 
-            # 达到最大运行时间时退出
             if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
               echo "⏹️ Workflow reached maximum run time ($MAX_RUN_MINUTES minutes), exiting"
               exit 0
@@ -374,7 +331,6 @@ jobs:
             sleep 60
           done
 
-      # ========== 9. 环境清理（无论成功失败都执行） ==========
       - name: Cleanup Environment
         if: ${{ always() }}
         run: |
@@ -382,15 +338,12 @@ jobs:
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
           
-          # 恢复 Docker Socket
           sudo systemctl unmask docker.socket || true
           
-          # 卸载 WebDAV
           if mount | grep -q "$WEBDAV_MOUNT_POINT"; then
             fusermount3 -u "$WEBDAV_MOUNT_POINT" || sudo fusermount3 -u "$WEBDAV_MOUNT_POINT"
             echo "✅ WebDAV unmounted successfully"
           fi
           
-          # 删除临时文件
-          sudo rm -rf /tmp/casaos-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone.log
+          sudo rm -rf /tmp/casaos-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
           echo "✅ Environment cleaned up successfully"
