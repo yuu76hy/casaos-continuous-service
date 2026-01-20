@@ -1,6 +1,5 @@
 name: CasaOS Cloud Instance
 
-# 触发方式：手动触发 或 每5小时自动触发
 on:
   workflow_dispatch:
   schedule:
@@ -8,25 +7,16 @@ on:
   workflow_call:
 
 env:
-  # ==========================================
-  # 🛠️ 核心配置
-  # ==========================================
   SOURCE_DIRS: "/var/lib/casaos /var/lib/docker /DATA"
   BACKUP_BUCKET: "/z/Ubu"
   WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
   WEBDAV_REMOTE_NAME: "mywebdav"
 
-  # ==========================================
-  # 🗑️ 垃圾文件排除列表
-  # ==========================================
   EXCLUDE_DIRS: >-
-    # 系统基础目录
     /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
     /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
     /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs
     /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
-    
-    # Docker 运行时产生的垃圾
     /var/lib/docker/tmp
     /var/lib/docker/overlay2
     /var/lib/docker/containers/*/mounts
@@ -89,7 +79,7 @@ EOF
         fi
 
     - name: 📥 3. 恢复数据（从 /z/Ubu）
-      if: env.WEBDAV_AVAILABLE == 'true'
+      if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
       run: |
         echo "📂 正在从网盘恢复数据..."
         IFS=' ' read -r -a dirs <<< "$SOURCE_DIRS"
@@ -112,8 +102,8 @@ EOF
         done
 
     - name: 🏠 4. 安装 CasaOS
-      # ✅ 修复逻辑：如果 WebDAV 挂载失败，或者不是定时任务（即手动触发），则安装
-      if: ${{ env.WEBDAV_AVAILABLE != 'true' || github.event_name != 'schedule' }}
+      # ✅【关键修复】第 66 行：使用合法的 GitHub Actions 表达式
+      if: ${{ !(env.WEBDAV_AVAILABLE == 'true' && github.event_name == 'schedule') }}
       run: |
         echo "🚀 安装 CasaOS..."
         if ! command -v casaos-service &> /dev/null; then
@@ -168,12 +158,10 @@ EOF
           fi
         }
 
-        # 主循环：每5分钟检查一次
         while true; do
           CURRENT_TIME=$(date +%s)
           ELAPSED=$(( (CURRENT_TIME - START_TIME) / 60 ))
           
-          # 运行了 300 分钟（5小时）后
           if [ $ELAPSED -ge 300 ]; then
             echo "⏰ 时间即将耗尽，开始执行最终备份..."
             
@@ -187,10 +175,8 @@ EOF
               fi
             done
             
-            # 触发续杯（自动重启）
             if [ "$ALL_SUCCESS" = true ]; then
               echo "🔄 触发续杯..."
-              # 优先使用 USER_PAT
               PAT=${{ secrets.USER_PAT }}
               if [ -z "$PAT" ]; then
                 PAT=${{ secrets.USER_GITHUB_PAT }}
