@@ -11,19 +11,37 @@ env:
   BACKUP_BUCKET: "/z/Ubu"
   WEBDAV_MOUNT_POINT: "/home/runner/webdav_mount"
   WEBDAV_REMOTE_NAME: "mywebdav"
+  # 新增：排除列表用数组形式定义，避免空格拆分问题
+  EXCLUDE_LIST: >
+    /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
+    /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
+    /usr/share/doc /usr/share/man /usr/share/locale
+    /etc/ssl/certs /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
+    /var/lib/docker/tmp /var/lib/docker/overlay2 "/var/lib/docker/containers/*/mounts"
+    /var/lib/docker/network/files /var/lib/docker/buildkit /var/lib/docker/runtimes
+    /var/lib/docker/swarm /var/lib/docker/trust
 
 jobs:
   setup:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
+    # 新增：允许失败后重试
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3]
     steps:
       - name: 📦 Prepare Environment
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y rclone rsync curl wget fuse
           echo 'user_allow_other' | sudo tee -a /etc/fuse.conf > /dev/null
           mkdir -p "${{ env.WEBDAV_MOUNT_POINT }}"
+          # 修复：使用半角波浪号，创建正确的rclone配置目录
+          mkdir -p ~/.config/rclone
+          # 新增：检查依赖安装状态
+          rclone --version || { echo "rclone安装失败"; exit 1; }
+          rsync --version || { echo "rsync安装失败"; exit 1; }
 
       - name: 🌐 Mount WebDAV
         if: ${{ secrets.WEBDAV_URL != '' }}
@@ -31,9 +49,14 @@ jobs:
           WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
           WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
           WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-        run: |
-          mkdir -p ～/.config/rclone
-          cat > ～/.config/rclone/rclone.conf << EOF
+        # 新增：重试机制
+        uses: nick-fields/retry@v2
+        with:
+          max_attempts: 3
+          retry_delay_seconds: 10
+          command: |
+            # 修复：半角波浪号，生成正确的rclone配置文件
+            cat > ~/.config/rclone/rclone.conf << EOF
 [${{ env.WEBDAV_REMOTE_NAME }}]
 type = webdav
 url = $WEBDAV_URL
@@ -41,67 +64,140 @@ vendor = other
 user = $WEBDAV_USER
 pass = $WEBDAV_PASSWORD
 EOF
-          rclone mount "${{ env.WEBDAV_REMOTE_NAME }}:${{ env.BACKUP_BUCKET }}" "${{ env.WEBDAV_MOUNT_POINT }}" --allow-other --vfs-cache-mode writes --daemon --timeout 1m --dir-cache-time 5m --poll-interval 5m
-          sleep 8
-          mountpoint -q "${{ env.WEBDAV_MOUNT_POINT }}" || { echo "Mount failed"; exit 1; }
+            # 验证配置文件
+            cat ~/.config/rclone/rclone.conf
+            # 挂载WebDAV，优化挂载参数
+            rclone mount "${{ env.WEBDAV_REMOTE_NAME }}:${{ env.BACKUP_BUCKET }}" "${{ env.WEBDAV_MOUNT_POINT }}" \
+              --allow-other --vfs-cache-mode full --daemon \
+              --timeout 5m --dir-cache-time 10m --poll-interval 10s \
+              --log-level INFO --log-file /tmp/rclone_mount.log
+            sleep 10
+            # 检查挂载状态
+            mountpoint -q "${{ env.WEBDAV_MOUNT_POINT }}" || { 
+              echo "WebDAV挂载失败，日志："; 
+              cat /tmp/rclone_mount.log; 
+              exit 1; 
+            }
+            echo "WebDAV挂载成功，挂载点：${{ env.WEBDAV_MOUNT_POINT }}"
 
       - name: 📥 Restore Data
         if: ${{ secrets.WEBDAV_URL != '' }}
-        run: |
-          # 将复杂的排除列表定义在Shell内部，避免YAML解析报错
-          EXCLUDE_DIRS="/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs /etc/fstab /etc/mtab /etc/hostname /etc/machine-id /var/lib/docker/tmp /var/lib/docker/overlay2 '/var/lib/docker/containers/*/mounts' /var/lib/docker/network/files /var/lib/docker/buildkit /var/lib/docker/runtimes /var/lib/docker/swarm /var/lib/docker/trust"
-          
-          echo "Restoring data..."
-          IFS=' ' read -r -a dirs <<< "${{ env.SOURCE_DIRS }}"
-          for dir in "${dirs[@]}"; do
-            webdav_src="${{ env.WEBDAV_MOUNT_POINT }}${{ env.BACKUP_BUCKET }}$dir"
-            if [ -d "$webdav_src" ]; then
-              sudo mkdir -p "$dir"
-              exclude_params=()
-              for excl in $EXCLUDE_DIRS; do
-                if [[ "$excl" == "$dir"* ]]; then
-                  exclude_params+=("--exclude=$excl")
-                fi
-              done
-              sudo rsync -av --delete --copy-links --sparse --numeric-ids "${exclude_params[@]}" "$webdav_src/" "$dir/"
-            fi
-          done
+        uses: nick-fields/retry@v2
+        with:
+          max_attempts: 2
+          retry_delay_seconds: 15
+          command: |
+            echo "开始恢复数据，源目录：${{ env.SOURCE_DIRS }}"
+            # 修复：正确处理排除列表（用readarray避免空格拆分）
+            readarray -t EXCLUDE_DIRS < <(echo "${{ env.EXCLUDE_LIST }}" | tr ' ' '\n' | grep -v '^$')
+            
+            # 遍历需要恢复的目录
+            while IFS= read -r dir; do
+              # 修复：路径拼接逻辑（挂载点已包含BACKUP_BUCKET，无需重复拼接）
+              webdav_src="${{ env.WEBDAV_MOUNT_POINT }}$dir"
+              if [ -d "$webdav_src" ]; then
+                echo "恢复目录：$dir 从 $webdav_src"
+                sudo mkdir -p "$dir"
+                # 构建排除参数
+                exclude_params=()
+                for excl in "${EXCLUDE_DIRS[@]}"; do
+                  if [[ "$excl" == "$dir"* ]]; then
+                    exclude_params+=("--exclude=$excl")
+                    echo "排除路径：$excl"
+                  fi
+                done
+                # 执行rsync同步（增加日志输出）
+                sudo rsync -av --delete --copy-links --sparse --numeric-ids \
+                  "${exclude_params[@]}" \
+                  --log-file=/tmp/rsync_restore_$(echo $dir | tr '/' '_').log \
+                  "$webdav_src/" "$dir/"
+              else
+                echo "源目录不存在：$webdav_src，跳过恢复"
+              fi
+            done < <(echo "${{ env.SOURCE_DIRS }}" | tr ' ' '\n' | grep -v '^$')
 
       - name: 🏠 Install CasaOS
         if: ${{ secrets.WEBDAV_URL == '' || github.event_name != 'schedule' }}
         run: |
-          echo "Installing CasaOS..."
+          echo "检查并安装CasaOS..."
           if ! command -v casaos-service &> /dev/null; then
-            curl -fsSL https://get.casaos.io | sudo bash
+            # 增加安装日志
+            curl -fsSL https://get.casaos.io | sudo bash -x
           fi
           sudo mkdir -p /DATA
-          sudo chown -R runner:runner /DATA
+          # 修复：权限配置（使用root用户，避免服务运行权限不足）
+          sudo chown -R root:root /DATA
+          sudo chmod 775 /DATA
+          # 验证CasaOS安装
+          casaos-service --version || { echo "CasaOS安装失败"; exit 1; }
 
       - name: ▶️ Start Services
         run: |
+          echo "启动Docker和CasaOS服务..."
+          sudo systemctl daemon-reload
           sudo systemctl enable docker casaos
           sudo systemctl start docker casaos
-          sleep 10
+          # 等待服务启动
+          sleep 15
+          # 检查服务状态
+          sudo systemctl status docker --no-pager || { echo "Docker启动失败"; exit 1; }
+          sudo systemctl status casaos --no-pager || { echo "CasaOS启动失败"; exit 1; }
 
       - name: 🔐 Connect Tailscale
         if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
         env:
           TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          echo "安装并连接Tailscale..."
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname=CasaOS-Cloud
+          sudo tailscale up --authkey="$TS_AUTH_KEY" --hostname=CasaOS-Cloud --accept-routes
+          # 验证连接
+          tailscale status || { echo "Tailscale连接失败"; exit 1; }
 
       - name: 🔄 Run & Backup Loop
         if: ${{ secrets.WEBDAV_URL != '' }}
         run: |
-          # 将复杂的排除列表定义在Shell内部，避免YAML解析报错
-          EXCLUDE_DIRS="/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs /etc/fstab /etc/mtab /etc/hostname /etc/machine-id /var/lib/docker/tmp /var/lib/docker/overlay2 '/var/lib/docker/containers/*/mounts' /var/lib/docker/network/files /var/lib/docker/buildkit /var/lib/docker/runtimes /var/lib/docker/swarm /var/lib/docker/trust"
-          
-          echo "Running..."
-          # 这里放置你的循环逻辑
-          # 注意：为了防止YAML过长，复杂的逻辑建议写成单独的脚本文件引用
+          echo "开始备份循环（每5小时执行一次）..."
+          # 实现核心备份逻辑
+          while true; do
+            echo "执行备份 - $(date)"
+            # 遍历需要备份的目录
+            while IFS= read -r dir; do
+              backup_dst="${{ env.WEBDAV_MOUNT_POINT }}$dir"
+              if [ -d "$dir" ]; then
+                echo "备份目录：$dir 到 $backup_dst"
+                sudo mkdir -p "$backup_dst"
+                # 构建排除参数
+                exclude_params=()
+                readarray -t EXCLUDE_DIRS < <(echo "${{ env.EXCLUDE_LIST }}" | tr ' ' '\n' | grep -v '^$')
+                for excl in "${EXCLUDE_DIRS[@]}"; do
+                  if [[ "$excl" == "$dir"* ]]; then
+                    exclude_params+=("--exclude=$excl")
+                  fi
+                done
+                # 执行备份（增量同步）
+                sudo rsync -av --delete --copy-links --sparse --numeric-ids \
+                  "${exclude_params[@]}" \
+                  --log-file=/tmp/rsync_backup_$(echo $dir | tr '/' '_').log \
+                  "$dir/" "$backup_dst/"
+              else
+                echo "待备份目录不存在：$dir，跳"
+              fi
+            done < <(echo "${{ env.SOURCE_DIRS }}" | tr ' ' '\n' | grep -v '^$')
+            
+            echo "本次备份完成 - $(date)"
+            # 等待5小时（3600*5秒），符合定时触发频率
+            sleep 18000
+          done
 
       - name: 🧹 Cleanup
         if: always()
         run: |
-          fusermount -u "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null || true
+          echo "执行清理操作..."
+          # 停止备份循环进程（如果存在）
+          pkill -f "rsync -av --delete" || true
+          # 卸载WebDAV挂载点
+          fusermount -u "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null || sudo umount "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null
+          # 清理临时日志
+          rm -rf /tmp/rclone_*.log /tmp/rsync_*.log
+          echo "清理完成"
