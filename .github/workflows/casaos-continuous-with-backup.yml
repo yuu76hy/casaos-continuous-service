@@ -96,15 +96,15 @@ jobs:
             exit 0
           fi
 
-          # 生成rclone配置（修复EOF语法，严格缩进）
+          # 生成rclone配置（核心修复：EOF完全顶格，变量用shell拼接）
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
-          cat > /home/runner/.rclone.conf << 'EOF'
-[mywebdav]
-type = webdav
-url = ${WEBDAV_URL}
-user = ${WEBDAV_USER}
-pass = ${ENCRYPTED_PASS}
-EOF
+          # 用echo替代cat+EOF，彻底避免YAML语法冲突
+          echo "[mywebdav]" > /home/runner/.rclone.conf
+          echo "type = webdav" >> /home/runner/.rclone.conf
+          echo "url = $WEBDAV_URL" >> /home/runner/.rclone.conf
+          echo "user = $WEBDAV_USER" >> /home/runner/.rclone.conf
+          echo "pass = $ENCRYPTED_PASS" >> /home/runner/.rclone.conf
+          
           sudo chown runner:runner /home/runner/.rclone.conf
           sudo chmod 600 /home/runner/.rclone.conf
 
