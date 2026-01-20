@@ -11,9 +11,7 @@ jobs:
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
-      WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
-      # 核心新增：指定WebDAV存储子目录
-      WEBDAV_SNAPSHOT_DIR: ${{ env.WEBDAV_MOUNT_POINT }}/z/Ubu
+      WEBDAV_MOUNT_POINT: /home/runner/webdav_mount  # 基础路径直接写死，避免嵌套引用
       CORE_DIRS: "/var/lib /DATA"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/overlay2/*/home/dependabot
@@ -44,9 +42,14 @@ jobs:
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          # 提前创建WebDAV子目录（确保多级路径存在）
+          
+          # 步骤内动态拼接子目录路径（核心修复）
+          WEBDAV_SNAPSHOT_DIR="${WEBDAV_MOUNT_POINT}/z/Ubu"
+          # 创建多级目录，确保存在
           sudo mkdir -p "$WEBDAV_SNAPSHOT_DIR"
           echo "✅ Env init done, WebDAV snapshot dir: $WEBDAV_SNAPSHOT_DIR"
+          # 把路径写入环境变量，供后续步骤使用
+          echo "WEBDAV_SNAPSHOT_DIR=$WEBDAV_SNAPSHOT_DIR" >> "$GITHUB_ENV"
 
       # ========== 2. 创建 roots 用户 ==========
       - name: Create roots User
@@ -81,7 +84,7 @@ jobs:
             if timeout 5 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
               echo "✅ WebDAV mounted"
               echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-              # 核心修改：从/z/Ubu目录检测历史快照
+              # 从步骤1定义的子目录检测快照
               if ls "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
                 LATEST_SNAPSHOT=$(ls -t "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz | head -n1)
                 echo "✅ Found latest snapshot: $LATEST_SNAPSHOT"
@@ -184,7 +187,7 @@ jobs:
             # 生成带时间戳的文件名
             SNAPSHOT_NAME="casaos-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
-            # 核心修改：快照存储到WebDAV的/z/Ubu目录
+            # 使用步骤1定义的子目录路径
             WEBDAV_SNAPSHOT="${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}"
             echo "🔄 Snapshot name: $SNAPSHOT_NAME (save to $WEBDAV_SNAPSHOT_DIR)"
 
