@@ -40,17 +40,13 @@ jobs:
         mkdir -p ${{ env.WEBDAV_MOUNT_POINT }}
 
     - name: 🌐 2. 配置并挂载 WebDAV
+      # ✅ 关键：仅当 WEBDAV_URL 存在时才执行此步骤
+      if: ${{ secrets.WEBDAV_URL != '' }}
       env:
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
         WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
         WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       run: |
-        if [ -z "$WEBDAV_URL" ]; then
-          echo "⚠️ 未配置 WEBDAV_URL"
-          echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-          exit 0
-        fi
-
         mkdir -p ～/.config/rclone
         cat > ～/.config/rclone/rclone.conf << EOF
 [${{ env.WEBDAV_REMOTE_NAME }}]
@@ -72,15 +68,24 @@ EOF
         sleep 5
         if mountpoint -q ${{ env.WEBDAV_MOUNT_POINT }}; then
           echo "✅ WebDAV 挂载成功"
-          echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
+          # 设置一个文件标记，供后续步骤检查
+          touch /tmp/webdav_mounted
         else
           echo "❌ WebDAV 挂载失败"
-          echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+          exit 1
         fi
 
     - name: 📥 3. 恢复数据（从 /z/Ubu）
-      if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
+      # ✅【关键修复】第 56 行：改为检查挂载是否成功的标记文件
+      if: ${{ secrets.WEBDAV_URL != '' }}
       run: |
+        # 等待挂载稳定
+        sleep 10
+        if [ ! -f /tmp/webdav_mounted ]; then
+          echo "⚠️ WebDAV 未挂载，跳过恢复"
+          exit 0
+        fi
+
         echo "📂 正在从网盘恢复数据..."
         IFS=' ' read -r -a dirs <<< "$SOURCE_DIRS"
         for dir in "${dirs[@]}"; do
@@ -102,8 +107,8 @@ EOF
         done
 
     - name: 🏠 4. 安装 CasaOS
-      # ✅【关键修复】第 66 行：使用合法的 GitHub Actions 表达式
-      if: ${{ !(env.WEBDAV_AVAILABLE == 'true' && github.event_name == 'schedule') }}
+      # ✅ 逻辑更新：如果没有配置 WebDAV，或者不是定时任务，就安装
+      if: ${{ secrets.WEBDAV_URL == '' || github.event_name != 'schedule' }}
       run: |
         echo "🚀 安装 CasaOS..."
         if ! command -v casaos-service &> /dev/null; then
@@ -130,6 +135,8 @@ EOF
         echo "🛡️ Tailscale IPv6: $(tailscale ip -6)"
 
     - name: 🔄 7. 持续运行与自动备份
+      # ✅ 备份步骤也仅在配置了 WebDAV 时才执行
+      if: ${{ secrets.WEBDAV_URL != '' }}
       run: |
         echo "⏳ 实例已启动，正在运行..."
         START_TIME=$(date +%s)
