@@ -222,9 +222,10 @@ jobs:
             return 0
           }
 
-          # 保活循环
+          # 保活循环（核心语法修复：date +%s 用 $() 包裹）
           while true; do
-            run_mins=$(( (date +%s - start_time) / 60 ))
+            # ========== 关键修复：算术运算中正确执行 date 命令 ==========
+            run_mins=$(( ($(date +%s) - start_time) / 60 ))
             echo "📊 Running for $run_mins minutes"
 
             if [ $run_mins -ge 10 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
