@@ -9,7 +9,7 @@ on:
 env:
   SOURCE_DIRS: "/var/lib/casaos /var/lib/docker /DATA"
   BACKUP_BUCKET: "/z/Ubu"
-  WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
+  WEBDAV_MOUNT_POINT: "/home/runner/webdav_mount"
   WEBDAV_REMOTE_NAME: "mywebdav"
   EXCLUDE_DIRS: "/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs /etc/fstab /etc/mtab /etc/hostname /etc/machine-id /var/lib/docker/tmp /var/lib/docker/overlay2 /var/lib/docker/containers/*/mounts /var/lib/docker/network/files /var/lib/docker/buildkit /var/lib/docker/runtimes /var/lib/docker/swarm /var/lib/docker/trust"
 
@@ -24,7 +24,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y rclone rsync curl wget fuse
         echo 'user_allow_other' | sudo tee -a /etc/fuse.conf > /dev/null
-        mkdir -p ${{ env.WEBDAV_MOUNT_POINT }}
+        mkdir -p "${{ env.WEBDAV_MOUNT_POINT }}"
 
     - name: 🌐 2. 配置并挂载 WebDAV
       if: ${{ secrets.WEBDAV_URL != '' }}
@@ -44,7 +44,8 @@ pass = $WEBDAV_PASSWORD
 EOF
 
         echo "🚀 正在挂载 WebDAV..."
-        rclone mount ${{ env.WEBDAV_REMOTE_NAME }}:${{ env.WEBDAV_MOUNT_POINT }} \
+        rclone mount "${{ env.WEBDAV_REMOTE_NAME }}:${{ env.BACKUP_BUCKET }}" \
+          "${{ env.WEBDAV_MOUNT_POINT }}" \
           --allow-other \
           --vfs-cache-mode writes \
           --daemon \
@@ -53,7 +54,7 @@ EOF
           --poll-interval 5m
 
         sleep 8
-        if mountpoint -q ${{ env.WEBDAV_MOUNT_POINT }}; then
+        if mountpoint -q "${{ env.WEBDAV_MOUNT_POINT }}"; then
           echo "✅ WebDAV 挂载成功"
           touch /tmp/webdav_ready
         else
@@ -201,5 +202,5 @@ EOF
       if: always()
       run: |
         echo "🧹 清理 WebDAV 挂载..."
-        fusermount -u ${{ env.WEBDAV_MOUNT_POINT }} 2>/dev/null || true
+        fusermount -u "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null || true
         rm -f /tmp/webdav_ready
