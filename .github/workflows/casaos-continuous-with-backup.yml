@@ -11,20 +11,7 @@ env:
   BACKUP_BUCKET: "/z/Ubu"
   WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
   WEBDAV_REMOTE_NAME: "mywebdav"
-
-  EXCLUDE_DIRS: >-
-    /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
-    /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
-    /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs
-    /etc/fstab /etc/mtab /etc/hostname /etc/machine-id
-    /var/lib/docker/tmp
-    /var/lib/docker/overlay2
-    /var/lib/docker/containers/*/mounts
-    /var/lib/docker/network/files
-    /var/lib/docker/buildkit
-    /var/lib/docker/runtimes
-    /var/lib/docker/swarm
-    /var/lib/docker/trust
+  EXCLUDE_DIRS: "/bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media /usr/share/doc /usr/share/man /usr/share/locale /etc/ssl/certs /etc/fstab /etc/mtab /etc/hostname /etc/machine-id /var/lib/docker/tmp /var/lib/docker/overlay2 /var/lib/docker/containers/*/mounts /var/lib/docker/network/files /var/lib/docker/buildkit /var/lib/docker/runtimes /var/lib/docker/swarm /var/lib/docker/trust"
 
 jobs:
   setup:
@@ -40,7 +27,6 @@ jobs:
         mkdir -p ${{ env.WEBDAV_MOUNT_POINT }}
 
     - name: 🌐 2. 配置并挂载 WebDAV
-      # ✅【终极修复】第 53 行：使用最标准、最安全的写法
       if: ${{ secrets.WEBDAV_URL != '' }}
       env:
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
@@ -104,7 +90,6 @@ EOF
         done
 
     - name: 🏠 4. 安装 CasaOS
-      # 如果没有配置 WebDAV（全新安装），或者不是定时任务（手动触发），则安装
       if: ${{ secrets.WEBDAV_URL == '' || github.event_name != 'schedule' }}
       run: |
         echo "🚀 正在安装 CasaOS..."
