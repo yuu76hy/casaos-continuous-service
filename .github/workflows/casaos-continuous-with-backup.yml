@@ -43,9 +43,9 @@ jobs:
           # 安装rclone
           curl https://rclone.org/install.sh | sudo bash
           
-          # ========== 核心修复1：配置FUSE权限 + 挂载点权限 ==========
+          # 配置FUSE权限 + 挂载点权限
           echo "user_allow_other" | sudo tee -a /etc/fuse.conf
-          sudo chmod 644 /etc/fuse.conf  # 确保fuse配置可读取
+          sudo chmod 644 /etc/fuse.conf
           
           # 修复sudoers配置
           sudo sed -i 's/^Defaults    requiretty/#Defaults    requiretty/' /etc/sudoers
@@ -55,13 +55,12 @@ jobs:
           # 创建数据目录
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
-          # ========== 关键：修复挂载点权限 ==========
-          # 1. 创建挂载点并设置runner用户为所有者
+          # 修复挂载点权限
           mkdir -p "$WEBDAV_MOUNT_POINT"
           sudo chown -R runner:runner "$WEBDAV_MOUNT_POINT"
-          sudo chmod -R 775 "$WEBDAV_MOUNT_POINT"  # 确保可读写执行
+          sudo chmod -R 775 "$WEBDAV_MOUNT_POINT"
           
-          # 2. 创建快照子目录（英文）并设置权限
+          # 创建快照子目录并设置权限
           WEBDAV_SNAPSHOT_DIR="${WEBDAV_MOUNT_POINT}/${WEBDAV_SNAPSHOT_EN_DIR}"
           mkdir -p "$WEBDAV_SNAPSHOT_DIR"
           sudo chown -R runner:runner "$WEBDAV_SNAPSHOT_DIR"
@@ -75,11 +74,13 @@ jobs:
           set -e
           if ! id "roots" &>/dev/null; then
             sudo useradd -m -s /bin/bash roots
-            [ -n "$ROOTS_PASSWORD" ] && echo "roots:$ROOTS_PASSWORD" | sudo chpasswd || {
+            if [ -n "$ROOTS_PASSWORD" ]; then
+              echo "roots:$ROOTS_PASSWORD" | sudo chpasswd
+            else
               RANDOM_PASS=$(openssl rand -base64 12)
               echo "roots:$RANDOM_PASS" | sudo chpasswd
               echo "✅ roots password: $RANDOM_PASS"
-            }
+            fi
             sudo usermod -aG sudo roots
           fi
 
@@ -95,24 +96,22 @@ jobs:
             exit 0
           fi
 
-          # ========== 核心修复2：简化rclone配置（避免兼容问题） ==========
-          # 生成rclone配置（不指定vendor，通用适配所有WebDAV）
+          # 生成rclone配置（修复EOF语法，严格缩进）
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
-          cat > /home/runner/.rclone.conf << EOF
+          cat > /home/runner/.rclone.conf << 'EOF'
 [mywebdav]
 type = webdav
-url = $WEBDAV_URL
-user = $WEBDAV_USER
-pass = $ENCRYPTED_PASS
+url = ${WEBDAV_URL}
+user = ${WEBDAV_USER}
+pass = ${ENCRYPTED_PASS}
 EOF
           sudo chown runner:runner /home/runner/.rclone.conf
-          sudo chmod 600 /home/runner/.rclone.conf  # 安全权限
+          sudo chmod 600 /home/runner/.rclone.conf
 
-          # ========== 核心修复3：挂载命令添加UID/GID，强制runner权限 ==========
           # 先卸载可能残留的挂载
           fusermount3 -u "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
           
-          # 挂载WebDAV（指定runner用户ID，解决写入权限）
+          # 挂载WebDAV（指定runner用户ID）
           nohup sudo -u runner rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
             --config /home/runner/.rclone.conf \
             --uid $(id -u runner) \
@@ -127,15 +126,13 @@ EOF
             --log-level INFO \
             --log-file /tmp/rclone_mount.log >/dev/null 2>&1 &
           
-          # 检查挂载状态（重试5次，每次等待5秒）
+          # 检查挂载状态
           for i in $(seq 1 5); do
-            # 验证挂载点可读写
             if touch "$WEBDAV_MOUNT_POINT/.test-mount" 2>/dev/null; then
               rm -f "$WEBDAV_MOUNT_POINT/.test-mount"
               echo "✅ WebDAV mounted successfully (permission: runner)"
               echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
               
-              # 检测历史快照
               if ls "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
                 LATEST_SNAPSHOT=$(ls -t "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz | head -n1)
                 echo "✅ Found latest snapshot: $LATEST_SNAPSHOT"
@@ -152,7 +149,6 @@ EOF
           # 挂载失败，输出详细日志
           echo "❌ WebDAV mount failed after 5 attempts"
           cat /tmp/rclone_mount.log || echo "⚠️ No mount log file"
-          # 检查挂载点权限详情
           ls -ld "$WEBDAV_MOUNT_POINT"
           id runner
           echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -217,14 +213,25 @@ EOF
 
           # 续跑函数
           trigger_renew() {
-            [ -z "$USER_PAT" ] || [ -z "$REPO" ] && return 1
-            curl -fsS -X POST -H "Authorization: token $USER_PAT" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$REPO/dispatches" -d '{"event_type":"renew_casaos_snapshot"}'
-            [ $? -eq 0 ] && echo "✅ Renew triggered" && RENEW_TRIGGERED=true
+            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
+              return 1
+            fi
+            curl -fsS -X POST \
+              -H "Authorization: token $USER_PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/dispatches" \
+              -d '{"event_type":"renew_casaos_snapshot"}'
+            if [ $? -eq 0 ]; then
+              echo "✅ Renew triggered"
+              RENEW_TRIGGERED=true
+            fi
           }
 
           # 快照创建+同步函数
           create_snapshot() {
-            [ "${WEBDAV_AVAILABLE}" != "true" ] && return 1
+            if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
+              return 1
+            fi
             
             # 生成快照文件名
             SNAPSHOT_NAME="casaos-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
@@ -239,7 +246,12 @@ EOF
             sync && sleep 5
 
             # 打包快照
-            sudo tar -czf "${TMP_SNAPSHOT}" --absolute-names --ignore-failed-read --warning=no-all $EXCLUDE_RULES $CORE_DIRS
+            sudo tar -czf "${TMP_SNAPSHOT}" \
+              --absolute-names \
+              --ignore-failed-read \
+              --warning=no-all \
+              $EXCLUDE_RULES \
+              $CORE_DIRS
             if [ ! -f "${TMP_SNAPSHOT}" ]; then
               echo "❌ Snapshot file not found: $TMP_SNAPSHOT"
               sudo systemctl unmask docker.socket
@@ -248,7 +260,6 @@ EOF
             fi
             echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
 
-            # ========== 核心修复4：同步前验证挂载点权限 ==========
             # 验证快照目录可写
             if ! touch "$WEBDAV_SNAPSHOT_DIR/.test-write" 2>/dev/null; then
               echo "❌ WebDAV dir read-only: $WEBDAV_SNAPSHOT_DIR"
@@ -259,14 +270,14 @@ EOF
             fi
             rm -f "$WEBDAV_SNAPSHOT_DIR/.test-write"
 
-            # 复制快照到挂载目录（用runner权限）
+            # 复制快照到挂载目录
             sudo -u runner cp "${TMP_SNAPSHOT}" "${WEBDAV_SNAPSHOT}"
             if [ $? -eq 0 ]; then
               echo "✅ Copied to mount dir with runner permission"
               
-              # ========== 核心修复5：不用sync，直接用copy（更稳定） ==========
-              # 直接复制到WebDAV服务端（避免mount同步延迟）
-              sudo -u runner rclone copy "${WEBDAV_SNAPSHOT}" "mywebdav:/${WEBDAV_SNAPSHOT_EN_DIR}/" \
+              # 直接复制到WebDAV服务端
+              sudo -u runner rclone copy "${WEBDAV_SNAPSHOT}" \
+                "mywebdav:/${WEBDAV_SNAPSHOT_EN_DIR}/" \
                 --config /home/runner/.rclone.conf \
                 --transfers 4 \
                 --log-level INFO \
@@ -278,7 +289,9 @@ EOF
                 echo "snapshot_name=${SNAPSHOT_NAME}" | sudo -u runner tee "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
                 echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo -u runner tee -a "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
                 # 同步元信息
-                sudo -u runner rclone copy "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" "mywebdav:/${WEBDAV_SNAPSHOT_EN_DIR}/" --config /home/runner/.rclone.conf
+                sudo -u runner rclone copy "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" \
+                  "mywebdav:/${WEBDAV_SNAPSHOT_EN_DIR}/" \
+                  --config /home/runner/.rclone.conf
               else
                 echo "❌ Rclone copy failed, log:"
                 cat /tmp/rclone_copy.log || echo "⚠️ No copy log"
@@ -296,7 +309,6 @@ EOF
             # 恢复服务+清理旧快照
             sudo systemctl unmask docker.socket
             sudo systemctl start docker.service docker.socket casaos.service
-            # 清理7天前旧快照（runner权限）
             sudo -u runner find "$WEBDAV_SNAPSHOT_DIR" -name "casaos-server-snapshot-*.tar.gz" -mtime +7 -delete && echo "✅ Old snapshots cleaned" || echo "⚠️ No old snapshots"
             return 0
           }
@@ -309,7 +321,10 @@ EOF
               echo "⏰ Time to create snapshot"
               create_snapshot && trigger_renew
             fi
-            [ $run_mins -ge $MAX_RUN_MINUTES ] && echo "⏹️ Timeout" && exit 0
+            if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
+              echo "⏹️ Timeout"
+              exit 0
+            fi
             sleep 60
           done
 
