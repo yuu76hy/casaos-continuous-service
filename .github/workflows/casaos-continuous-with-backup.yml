@@ -12,6 +12,8 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
+      # 核心新增：指定WebDAV存储子目录
+      WEBDAV_SNAPSHOT_DIR: ${{ env.WEBDAV_MOUNT_POINT }}/z/Ubu
       CORE_DIRS: "/var/lib /DATA"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/overlay2/*/home/dependabot
@@ -31,7 +33,7 @@ jobs:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
 
     steps:
-      # ========== 1. 环境初始化 ==========
+      # ========== 1. 环境初始化 + 创建WebDAV子目录 ==========
       - name: Env Init & Create Dirs
         run: |
           set -e
@@ -42,7 +44,9 @@ jobs:
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          echo "✅ Env init done"
+          # 提前创建WebDAV子目录（确保多级路径存在）
+          sudo mkdir -p "$WEBDAV_SNAPSHOT_DIR"
+          echo "✅ Env init done, WebDAV snapshot dir: $WEBDAV_SNAPSHOT_DIR"
 
       # ========== 2. 创建 roots 用户 ==========
       - name: Create roots User
@@ -58,7 +62,7 @@ jobs:
             sudo usermod -aG sudo roots
           fi
 
-      # ========== 3. 挂载 WebDAV ==========
+      # ========== 3. 挂载 WebDAV + 检测子目录快照 ==========
       - name: Mount WebDAV
         run: |
           set -e
@@ -77,10 +81,13 @@ jobs:
             if timeout 5 ls "$WEBDAV_MOUNT_POINT" >/dev/null 2>&1; then
               echo "✅ WebDAV mounted"
               echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-              if ls "$WEBDAV_MOUNT_POINT"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
-                LATEST_SNAPSHOT=$(ls -t "$WEBDAV_MOUNT_POINT"/casaos-server-snapshot-*.tar.gz | head -n1)
-                echo "✅ Found snapshot: $LATEST_SNAPSHOT"
+              # 核心修改：从/z/Ubu目录检测历史快照
+              if ls "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
+                LATEST_SNAPSHOT=$(ls -t "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz | head -n1)
+                echo "✅ Found latest snapshot: $LATEST_SNAPSHOT"
                 echo "LATEST_SNAPSHOT=$LATEST_SNAPSHOT" >> "$GITHUB_ENV"
+              else
+                echo "⚠️ No historical snapshot in $WEBDAV_SNAPSHOT_DIR"
               fi
               exit 0
             fi
@@ -89,7 +96,7 @@ jobs:
           echo "❌ WebDAV mount failed"
           echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
 
-      # ========== 4. 恢复快照 + 删除已用文件 ==========
+      # ========== 4. 从子目录恢复快照 + 删除已用文件 ==========
       - name: Restore Snapshot & Cleanup
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
@@ -97,7 +104,7 @@ jobs:
           echo "===== Restore from: $LATEST_SNAPSHOT ====="
           # 彻底停掉Docker/CasaOS
           sudo systemctl stop docker.service docker.socket casaos.service
-          sudo systemctl mask docker.socket  # 禁止socket自动启动
+          sudo systemctl mask docker.socket
           sudo pkill -9 docker || true
           sync && sleep 3
 
@@ -107,8 +114,9 @@ jobs:
           if [ $? -eq 0 ]; then
             echo "✅ Restore success"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            sudo rm -f "$LATEST_SNAPSHOT" "$WEBDAV_MOUNT_POINT/snapshot_meta.txt"
-            sudo systemctl unmask docker.socket  # 恢复socket
+            # 删除子目录下的已用快照和元信息
+            sudo rm -f "$LATEST_SNAPSHOT" "$WEBDAV_SNAPSHOT_DIR/snapshot_meta.txt"
+            sudo systemctl unmask docker.socket
           else
             echo "❌ Restore failed"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
@@ -154,7 +162,7 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}"
           echo "✅ Tailscale IP: $(sudo tailscale ip -4)"
 
-      # ========== 8. 核心修复：创建快照 + 上传 ==========
+      # ========== 8. 核心修复：快照保存到/z/Ubu目录 ==========
       - name: Create Snapshot & Upload & Renew
         shell: bash
         run: |
@@ -169,23 +177,24 @@ jobs:
             [ $? -eq 0 ] && echo "✅ Renew triggered" && RENEW_TRIGGERED=true
           }
 
-          # 快照创建函数（核心修复）
+          # 快照创建函数
           create_snapshot() {
             [ "${WEBDAV_AVAILABLE}" != "true" ] && return 1
 
-            # ========== 修复1：强制解析date，生成正确文件名 ==========
+            # 生成带时间戳的文件名
             SNAPSHOT_NAME="casaos-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
-            WEBDAV_SNAPSHOT="${WEBDAV_MOUNT_POINT}/${SNAPSHOT_NAME}"
-            echo "🔄 Snapshot name: $SNAPSHOT_NAME"
+            # 核心修改：快照存储到WebDAV的/z/Ubu目录
+            WEBDAV_SNAPSHOT="${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}"
+            echo "🔄 Snapshot name: $SNAPSHOT_NAME (save to $WEBDAV_SNAPSHOT_DIR)"
 
-            # ========== 修复2：彻底停止Docker，禁止自动启动 ==========
+            # 彻底停止Docker
             sudo systemctl stop docker.service docker.socket casaos.service
             sudo systemctl mask docker.socket
             sudo pkill -9 docker || true
-            sync && sleep 5  # 等待文件系统稳定
+            sync && sleep 5
 
-            # ========== 修复3：tar参数终极优化，屏蔽所有警告和错误 ==========
+            # 打包快照
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
@@ -197,20 +206,20 @@ jobs:
             [ ! -f "${TMP_SNAPSHOT}" ] && echo "❌ Snapshot file not found" && return 1
             echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
 
-            # ========== 修复4：检查WebDAV可写性 ==========
-            if ! sudo touch "${WEBDAV_MOUNT_POINT}/.test-write" 2>/dev/null; then
-              echo "❌ WebDAV read-only"
+            # 检查WebDAV子目录可写性
+            if ! sudo touch "${WEBDAV_SNAPSHOT_DIR}/.test-write" 2>/dev/null; then
+              echo "❌ WebDAV dir $WEBDAV_SNAPSHOT_DIR is read-only"
               return 1
             fi
-            sudo rm -f "${WEBDAV_MOUNT_POINT}/.test-write"
+            sudo rm -f "${WEBDAV_SNAPSHOT_DIR}/.test-write"
 
-            # 上传快照
+            # 上传快照到子目录
             sudo cp "${TMP_SNAPSHOT}" "${WEBDAV_SNAPSHOT}"
             if [ $? -eq 0 ]; then
-              echo "✅ Snapshot uploaded to WebDAV"
-              # 写入元信息
-              echo "snapshot_name=${SNAPSHOT_NAME}" | sudo tee "${WEBDAV_MOUNT_POINT}/snapshot_meta.txt" >/dev/null
-              echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee -a "${WEBDAV_MOUNT_POINT}/snapshot_meta.txt" >/dev/null
+              echo "✅ Snapshot uploaded to $WEBDAV_SNAPSHOT"
+              # 元信息文件也存到子目录
+              echo "snapshot_name=${SNAPSHOT_NAME}" | sudo tee "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
+              echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee -a "${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" >/dev/null
             else
               echo "❌ Upload failed"
               return 1
@@ -222,9 +231,8 @@ jobs:
             return 0
           }
 
-          # 保活循环（核心语法修复：date +%s 用 $() 包裹）
+          # 保活循环（修复算术运算语法）
           while true; do
-            # ========== 关键修复：算术运算中正确执行 date 命令 ==========
             run_mins=$(( ($(date +%s) - start_time) / 60 ))
             echo "📊 Running for $run_mins minutes"
 
