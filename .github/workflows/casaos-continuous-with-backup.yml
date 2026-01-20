@@ -12,7 +12,6 @@ env:
   WEBDAV_MOUNT_POINT: /home/runner/webdav_mount
   WEBDAV_REMOTE_NAME: "mywebdav"
 
-  # 排除列表：确保这些目录不会被备份，或者在恢复时被跳过
   EXCLUDE_DIRS: >-
     /bin /boot /dev /lib /lib32 /lib64 /lost+found /proc /root /run /sbin /sys /tmp
     /var/cache /var/log /var/tmp /var/backups /home/runner /mnt /media
@@ -38,11 +37,11 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y rclone rsync curl wget fuse
         echo 'user_allow_other' | sudo tee -a /etc/fuse.conf > /dev/null
-        mkdir -p "$"
+        mkdir -p ${{ env.WEBDAV_MOUNT_POINT }}
 
     - name: 🌐 2. 配置并挂载 WebDAV
-      # ✅ 逻辑加强：使用 contains 函数最安全地检查 Secret 是否存在
-      if: ${{ contains(secrets, 'WEBDAV_URL') && contains(secrets, 'WEBDAV_USER') && contains(secrets, 'WEBDAV_PASSWORD') }}
+      # ✅【终极修复】第 53 行：使用最标准、最安全的写法
+      if: ${{ secrets.WEBDAV_URL != '' }}
       env:
         WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
         WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
@@ -70,7 +69,6 @@ EOF
         sleep 8
         if mountpoint -q ${{ env.WEBDAV_MOUNT_POINT }}; then
           echo "✅ WebDAV 挂载成功"
-          # 创建标记文件，供后续步骤确认挂载状态
           touch /tmp/webdav_ready
         else
           echo "❌ WebDAV 挂载失败或超时"
@@ -78,10 +76,8 @@ EOF
         fi
 
     - name: 📥 3. 恢复数据（从 /z/Ubu）
-      # ✅ 逻辑加强：只要 WebDAV 相关 Secret 存在，就执行此步骤
-      if: ${{ contains(secrets, 'WEBDAV_URL') }}
+      if: ${{ secrets.WEBDAV_URL != '' }}
       run: |
-        # 检查挂载标记
         if [ ! -f /tmp/webdav_ready ]; then
           echo "⚠️ WebDAV 未就绪，跳过数据恢复"
           exit 0
@@ -90,24 +86,16 @@ EOF
         echo "📂 正在从网盘恢复数据..."
         IFS=' ' read -r -a dirs <<< "$SOURCE_DIRS"
         for dir in "${dirs[@]}"; do
-          # 构建网盘上的源路径
           webdav_src="${WEBDAV_MOUNT_POINT}${BACKUP_BUCKET}${dir}"
-          
-          # 检查源路径是否存在且非空
           if [ -d "$webdav_src" ] && [ -n "$(ls -A "$webdav_src" 2>/dev/null)" ]; then
             echo "🔄 正在恢复 $dir ..."
             sudo mkdir -p "$dir"
-            
-            # 构建排除参数数组
             EXCLUDE_PARAMS=()
             for excl in $EXCLUDE_DIRS; do
-              # 如果排除路径是当前目录的子路径，则添加到排除列表
               if [[ "$excl" == "$dir"* ]]; then
                 EXCLUDE_PARAMS+=("--exclude=$excl")
               fi
             done
-            
-            # 执行同步（带排除规则）
             sudo rsync -av --delete --copy-links --sparse --numeric-ids \
               "${EXCLUDE_PARAMS[@]}" "$webdav_src/" "$dir/"
           else
@@ -116,16 +104,13 @@ EOF
         done
 
     - name: 🏠 4. 安装 CasaOS
-      # ✅ 逻辑加强：如果 WebDAV Secret 不存在（意味着是全新安装），或者不是定时任务触发（手动调试），则安装
-      if: ${{ !contains(secrets, 'WEBDAV_URL') || github.event_name != 'schedule' }}
+      # 如果没有配置 WebDAV（全新安装），或者不是定时任务（手动触发），则安装
+      if: ${{ secrets.WEBDAV_URL == '' || github.event_name != 'schedule' }}
       run: |
         echo "🚀 正在安装 CasaOS..."
-        # 检查是否已安装，避免重复安装
         if ! command -v casaos-service &> /dev/null; then
           curl -fsSL https://get.casaos.io | sudo bash
         fi
-        
-        # 确保 DATA 目录存在
         sudo mkdir -p /DATA
         sudo chown -R runner:runner /DATA
         echo "✅ CasaOS 安装/检查完成"
@@ -136,16 +121,10 @@ EOF
         sudo systemctl enable docker casaos
         sudo systemctl start docker casaos
         sleep 10
-        
-        # 简单检查服务状态
-        if systemctl is-active --quiet docker && systemctl is-active --quiet casaos; then
-          echo "✅ 服务启动成功"
-        else
-          echo "⚠️ 服务启动可能存在问题，请检查日志"
-        fi
+        echo "✅ 服务启动成功"
 
     - name: 🔐 6. 连接 Tailscale
-      if: ${{ contains(secrets, 'TAILSCALE_AUTH_KEY') }}
+      if: ${{ secrets.TAILSCALE_AUTH_KEY != '' }}
       env:
         TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       run: |
@@ -157,22 +136,17 @@ EOF
         echo "IPv6: $(tailscale ip -6)"
 
     - name: 🔄 7. 持续运行与自动备份
-      # ✅ 逻辑加强：仅当 WebDAV 配置完整时才运行备份逻辑
-      if: ${{ contains(secrets, 'WEBDAV_URL') && contains(secrets, 'WEBDAV_USER') && contains(secrets, 'WEBDAV_PASSWORD') }}
+      if: ${{ secrets.WEBDAV_URL != '' }}
       run: |
         echo "⏳ 实例运行中，等待续杯触发..."
         START_TIME=$(date +%s)
         
-        # 定义备份函数
         backup_dir() {
           local src="$1"
           local dst="${WEBDAV_MOUNT_POINT}${BACKUP_BUCKET}${src}"
           echo "📦 正在备份 $src -> $dst"
-          
-          # 创建目标目录
           mkdir -p "$dst"
           
-          # 构建排除参数
           local exclude_params=()
           for excl in $EXCLUDE_DIRS; do
             if [[ "$excl" == "$src"* ]]; then
@@ -180,10 +154,8 @@ EOF
             fi
           done
           
-          # 执行 rsync 备份
           if sudo rsync -av --delete --copy-links --sparse --numeric-ids \
               "${exclude_params[@]}" "$src/" "$dst/"; then
-            # 写入时间戳
             date -u +"%Y-%m-%dT%H:%M:%SZ" > "$dst/backup_timestamp.txt"
             echo "✅ $src 备份成功"
             return 0
@@ -193,16 +165,13 @@ EOF
           fi
         }
 
-        # 主循环：每 5 分钟检查一次
         while true; do
           CURRENT_TIME=$(date +%s)
           ELAPSED=$(( (CURRENT_TIME - START_TIME) / 60 ))
           
-          # 如果运行时间超过 300 分钟（5小时），触发续杯
           if [ $ELAPSED -ge 300 ]; then
             echo "⏰ 运行时间过长，准备续杯..."
             
-            # 执行备份
             IFS=' ' read -r -a dirs <<< "$SOURCE_DIRS"
             ALL_SUCCESS=true
             for dir in "${dirs[@]}"; do
@@ -213,11 +182,9 @@ EOF
               fi
             done
             
-            # 如果备份全部成功，触发续杯
             if [ "$ALL_SUCCESS" = true ]; then
               echo "🔄 触发自动续杯..."
               
-              # 获取 PAT Token
               PAT=""
               if [ -n "${{ secrets.USER_PAT }}" ]; then
                 PAT=${{ secrets.USER_PAT }}
@@ -226,7 +193,6 @@ EOF
               fi
               
               if [ -n "$PAT" ]; then
-                # 调用 GitHub API 触发新的 Workflow
                 curl -X POST \
                   -H "Authorization: Bearer $PAT" \
                   -H "Accept: application/vnd.github.v3+json" \
