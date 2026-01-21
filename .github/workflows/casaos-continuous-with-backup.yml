@@ -25,10 +25,9 @@ jobs:
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ github.repository }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      TRIGGER_BACKUP_AFTER_MINS: 10  # 配置10分钟后执行备份
+      TRIGGER_BACKUP_AFTER_MINS: 10  # 10分钟后执行备份+续跑
 
     steps:
       - name: Env Init & Install Dependencies
@@ -195,39 +194,6 @@ jobs:
             fi
           fi
 
-      - name: Deploy Tailscale
-        run: |
-          set -e
-          export LC_ALL=en_US.UTF-8
-          export LANG=en_US.UTF-8
-          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Missing Tailscale auth key, skip deployment"
-            exit 0
-          fi
-          sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          sudo chmod 0644 /usr/share/keyrings/tailscale-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo chmod 0644 /etc/apt/sources.list.d/tailscale.list
-          sudo apt update -y && sudo apt install -y tailscale
-          TAILSCALE_PATH=$(which tailscale)
-          if [ -z "$TAILSCALE_PATH" ]; then
-            echo "❌ Tailscale installation failed, no executable found"
-            exit 0
-          fi
-          echo "✅ Tailscale installed at: $TAILSCALE_PATH"
-          if ! sudo "$TAILSCALE_PATH" up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}"; then
-            echo "❌ Tailscale login failed"
-            sudo "$TAILSCALE_PATH" status
-            exit 0
-          fi
-          echo "✅ Tailscale IP address: $(sudo "$TAILSCALE_PATH" ip -4)"
-          if [ "${SNAPSHOT_RESTORED}" = "true" ]; then
-            echo "🔄 Restarting services after Tailscale deployment (snapshot mode)"
-            sudo systemctl restart docker.service casaos.service
-            echo "✅ Services restarted successfully"
-          fi
-
       - name: Create Snapshot and Upload to WebDAV & Renew Workflow
         shell: bash
         run: |
@@ -323,7 +289,7 @@ jobs:
 
           while true; do
             current_time=$(date +%s)
-            elapsed_mins=$(( (current_time - start_time) / 60 ))
+            elapsed_mins=$(( (current_time - start_time)/60 ))
             remaining_mins=$(( MAX_RUN_MINUTES - elapsed_mins ))
 
             echo "📊 Elapsed: $elapsed_mins mins | Remaining: $remaining_mins mins"
