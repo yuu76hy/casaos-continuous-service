@@ -85,15 +85,14 @@ jobs:
           echo "✅ WebDAV connected successfully (no mount mode)"
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
 
-          # 提前创建远程目录
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           echo "✅ Created remote directory: mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}"
 
-          # ========== 修复：路径拼接逻辑，避免重复文件名 ==========
-          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}')
+          # ========== 彻底修复路径重复问题 ==========
+          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
-            # 直接取最新文件名，不重复拼接
-            LATEST_SNAPSHOT_FILENAME=$(echo "$REMOTE_SNAPSHOTS" | sort -r | head -n1)
+            LATEST_SNAPSHOT_FILENAME=$(echo "$REMOTE_SNAPSHOTS" | head -n1)
+            # 强制拼接正确路径：目录+文件名，无重复
             LATEST_SNAPSHOT="${WEBDAV_SNAPSHOT_EN_DIR}/${LATEST_SNAPSHOT_FILENAME}"
             echo "✅ Found latest remote snapshot: ${LATEST_SNAPSHOT}"
             echo "LATEST_SNAPSHOT=${LATEST_SNAPSHOT}" >> "$GITHUB_ENV"
@@ -109,14 +108,11 @@ jobs:
           export LANG=zh_CN.UTF-8
           echo "===== 直接从远程恢复：$LATEST_SNAPSHOT ====="
           
-          # ========== 修复：容错停止服务，不存在则跳过 ==========
-          # 停止docker相关服务（必存在）
           sudo systemctl stop docker.service docker.socket || echo "⚠️ docker服务未运行/不存在，跳过停止"
           sudo systemctl mask docker.socket
-          sudo pkill -9 docker || true  # 修复：中文“真”改为true
-          sync && sleep 3  # 修复：中文“同步与睡眠3”改为英文
+          sudo pkill -9 docker || true
+          sync && sleep 3
           
-          # 停止casaos服务（容错，不存在则不报错）
           if systemctl is-active --quiet casaos.service; then
             sudo systemctl stop casaos.service
             echo "✅ 已停止casaos.service"
@@ -124,7 +120,6 @@ jobs:
             echo "⚠️ casaos.service未加载/不存在，跳过停止"
           fi
 
-          # 校验快照是否可读
           if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
             echo "❌ 远程快照无效或无法读取"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
@@ -132,11 +127,10 @@ jobs:
             exit 1
           fi
 
-          # 执行恢复
           rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --warning=no-all $EXCLUDE_RULES
           if [ $? -eq 0 ]; then
             echo "✅ 恢复WebDAV的成功"
-            echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"  # 修复：引号闭合
+            echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
             rclone delete mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf
             rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt --config /home/runner/.rclone.conf
             sudo systemctl unmask docker.socket
@@ -160,13 +154,11 @@ jobs:
         run: |
           set -e
           sudo systemctl unmask docker.socket || true
-          # 启动docker服务
           for i in $(seq 1 3); do
             sudo systemctl enable --now docker.service docker.socket
             sleep 10
             if sudo systemctl is-active --quiet docker && sudo systemctl is-active --quiet docker.socket; then
               echo "✅ Docker服务启动成功"
-              # 尝试启动casaos（不存在则跳过）
               if systemctl list-unit-files | grep -q casaos.service; then
                 sudo systemctl enable --now casaos.service
                 sleep 5
@@ -184,23 +176,39 @@ jobs:
       - name: Deploy Tailscale
         run: |
           set -e
+          export LC_ALL=zh_CN.UTF-8
+          export LANG=en_US.UTF-8  # 切换英文避免源列表乱码
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ Tailscale key missing, skip"
             exit 0
           fi
-          for i in $(seq 1 2); do
-            if curl -fsSL https://tailscale.com/install.sh | sudo bash; then
-              break
-            fi
-            echo "⚠️ Tailscale install attempt $i failed, retrying..."
-            sleep 5
-          done
-          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}" || {
-            echo "❌ Tailscale login failed"
-            sudo tailscale status
+
+          # ========== 核心修复：Tailscale 正确安装步骤 ==========
+          # 1. 安装依赖
+          sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates
+          # 2. 下载GPG密钥（修正后缀为.gpg）
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          sudo chmod 0644 /usr/share/keyrings/tailscale-archive-keyring.gpg
+          # 3. 添加正确源列表（无乱码）
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          sudo chmod 0644 /etc/apt/sources.list.d/tailscale.list
+          # 4. 更新并安装
+          sudo apt update -y && sudo apt install -y tailscale -y
+          # 5. 查找tailscale绝对路径（解决sudo找不到命令问题）
+          TAILSCALE_PATH=$(which tailscale)
+          if [ -z "$TAILSCALE_PATH" ]; then
+            echo "❌ Tailscale 安装失败，未找到可执行文件"
             exit 0
-          }
-          echo "✅ Tailscale IP: $(sudo tailscale ip -4)"
+          fi
+          echo "✅ Tailscale 安装路径：$TAILSCALE_PATH"
+
+          # 6. 用绝对路径执行登录（避免sudo PATH问题）
+          if ! sudo "$TAILSCALE_PATH" up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}"; then
+            echo "❌ Tailscale login failed"
+            sudo "$TAILSCALE_PATH" status
+            exit 0
+          fi
+          echo "✅ Tailscale IP: $(sudo "$TAILSCALE_PATH" ip -4)"
 
       - name: Create Snapshot & Direct Upload to WebDAV
         shell: bash
@@ -237,7 +245,6 @@ jobs:
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
             echo "🔄 Creating snapshot: $SNAPSHOT_NAME (direct upload to WebDAV: ${REMOTE_PATH})"
 
-            # 容错停止服务
             sudo systemctl stop docker.service docker.socket || true
             if systemctl is-active --quiet casaos.service; then
               sudo systemctl stop casaos.service
@@ -246,14 +253,12 @@ jobs:
             sudo pkill -9 docker || true
             sync && sleep 5
 
-            # 打包前检查目录是否存在，避免tar警告
             for dir in $CORE_DIRS; do
               if [ ! -d "$dir" ]; then
                 echo "⚠️ Directory $dir does not exist, skip backup for it"
               fi
             done
 
-            # 打包快照
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
@@ -263,7 +268,6 @@ jobs:
             sudo chown runner:runner "${TMP_SNAPSHOT}"
             sudo chmod 644 "${TMP_SNAPSHOT}"
 
-            # 校验快照有效性
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
               echo "❌ Snapshot is empty or invalid (size < 1KB)"
               sudo systemctl unmask docker.socket
@@ -275,7 +279,6 @@ jobs:
             fi
             echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
 
-            # 上传快照
             if ! sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" \
               --config /home/runner/.rclone.conf \
               --transfers 4 \
@@ -294,16 +297,13 @@ jobs:
             fi
 
             echo "✅ Snapshot uploaded to WebDAV: ${REMOTE_PATH}"
-            # 上传元信息
             META_FILE="/tmp/snapshot_meta.txt"
             echo "snapshot_name=${SNAPSHOT_NAME}" > "${META_FILE}"
             echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"
             sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
 
-            # 清理临时文件
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
             
-            # 清理旧快照
             echo "🔍 Dry run: cleaning snapshots older than 1 day..."
             sudo -u runner rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} \
               --config /home/runner/.rclone.conf \
@@ -317,7 +317,6 @@ jobs:
               --include "casaos-server-snapshot-*.tar.gz"
             echo "✅ Remote snapshots older than 1 day cleaned up in ${WEBDAV_SNAPSHOT_EN_DIR}"
 
-            # 恢复服务
             sudo systemctl unmask docker.socket
             sudo systemctl start docker.service docker.socket || true
             if systemctl list-unit-files | grep -q casaos.service; then
@@ -326,7 +325,6 @@ jobs:
             return 0
           }
 
-          # 主循环（2分钟触发备份）
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             echo "📊 Running for $run_mins minutes"
