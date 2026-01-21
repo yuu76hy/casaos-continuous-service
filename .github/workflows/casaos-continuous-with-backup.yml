@@ -6,7 +6,8 @@ on:
     types: [renew_casaos_snapshot]
 
 jobs:
-  快照-备份-恢复:
+  # ========== 核心修复：将中文job ID改为合规的英文ID ==========
+  casaos_snapshot_backup_restore:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -87,11 +88,11 @@ jobs:
           echo "✅ WebDAV connected successfully (no mount mode)"
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
 
-          # 自动创建远程目录（核心修复：解决目录不存在问题）
+          # 自动创建远程目录
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           echo "✅ Created remote directory: mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}"
 
-          # 读取自定义目录下的快照（优化路径处理）
+          # 读取自定义目录下的快照
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}')
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             LATEST_SNAPSHOT_FILENAME=$(echo "$REMOTE_SNAPSHOTS" | sort -r | head -n1)
@@ -237,7 +238,7 @@ jobs:
             sudo chown runner:runner "${TMP_SNAPSHOT}"
             sudo chmod 644 "${TMP_SNAPSHOT}"
 
-            # 校验快照有效性（核心修复：检查文件大小和完整性）
+            # 校验快照有效性
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
               echo "❌ Snapshot is empty or invalid (size < 1KB)"
               sudo systemctl unmask docker.socket
@@ -272,7 +273,7 @@ jobs:
             # 清理本地临时文件
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
             
-            # 清理自定义目录下1天前的快照（增加--dry-run调试，避免误删）
+            # 清理自定义目录下1天前的快照
             echo "🔍 Dry run: cleaning snapshots older than 1 day..."
             sudo -u runner rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} \
               --config /home/runner/.rclone.conf \
@@ -319,6 +320,6 @@ jobs:
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
           sudo systemctl unmask docker.socket || true
-          # 清理所有临时文件（包括root拥有的）
+          # 清理所有临时文件
           sudo rm -rf /tmp/casaos-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
           echo "✅ Cleanup completed"
