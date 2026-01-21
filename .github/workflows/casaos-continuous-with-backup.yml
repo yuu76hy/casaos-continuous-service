@@ -36,7 +36,7 @@ jobs:
         --exclude=/var/lib/docker/overlay2/tmp
         --exclude=/var/lib/docker/*-tmp
       BACKUP_MARKER: latest_backup.txt
-      LOG_FILE: casaos_service_${{ github.run_id }}_$(date +%Y%m%d_%H%M%S).log
+      LOG_FILE: casaos_service_${{ github.run_id }}_$(date +'%Y%m%d_%H%M%S')
 
     steps:
       - name: "Step 0: Pre-Check - Shell Env & Log Dir Init"
@@ -46,7 +46,7 @@ jobs:
           set -euo pipefail
           mkdir -p $LOG_DIR $RCLONE_CACHE_DIR
           chmod 755 $LOG_DIR $RCLONE_CACHE_DIR
-          exec > >(tee -a $LOG_DIR/$LOG_FILE) 2>&1
+          exec > >(tee -a $LOG_DIR/$LOG_FILE.log) 2>&1
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Pre-Check Completed ===="
           echo "===================================== WORKFLOW BASIC INFO ====================================="
           echo "🔧 Workflow Run ID: ${{ github.run_id }}"
@@ -80,49 +80,49 @@ jobs:
         run: |
           set -euo pipefail
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 2 Start: WebDAV Configuration ===="
-          # Read Secrets（用单引号包裹，避免$解析）
-          WEBDAV_URL='${{ secrets.WEBDAV_URL }}'
-          WEBDAV_USER='${{ secrets.WEBDAV_USERNAME }}'
-          WEBDAV_PASS='${{ secrets.WEBDAV_PASSWORD }}'  # 单引号包裹加密密码，防止$被解析
+          # 读取 Secret：直接匹配你现有的三个变量，无需加密
+          WEBDAV_URL=${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER=${{ secrets.WEBDAV_USER }}  # 改为 WEBDAV_USER，匹配你的 Secret 名称
+          WEBDAV_PASS=${{ secrets.WEBDAV_PASSWORD }}
           
-          # Debug: Desensitized check
-          echo "🔍 Secrets Check - WEBDAV_URL: $WEBDAV_URL"
+          # 脱敏校验
+          echo "🔍 Secrets Check - WEBDAV_URL: [${WEBDAV_URL:0:2}]***"
           echo "🔍 Secrets Check - WEBDAV_USER: [${WEBDAV_USER:0:2}]***"
-          echo "🔍 Secrets Check - WEBDAV_PASS: [${WEBDAV_PASS:0:5}]***"
+          echo "🔍 Secrets Check - WEBDAV_PASS: [${WEBDAV_PASS:0:2}]***"
           
-          # Non-empty validation
+          # 非空校验
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASS" ]; then
             echo "ERROR: WebDAV Secrets Not Configured! Exit."
             exit 1
           fi
 
-          # 修复URL格式：替换中文符号、补全末尾/
+          # 修复 URL 中文符号，补全末尾 /
           WEBDAV_URL=$(echo "$WEBDAV_URL" | sed -e 's/：/:/g' -e 's/ //g')
           if [[ "$WEBDAV_URL" != */ ]]; then
-            WEBDAV_URL="$WEBDAV_URL/"
+            WEBDAV_URL="${WEBDAV_URL}/"
           fi
           echo "🔧 Fixed WebDAV URL: $WEBDAV_URL"
 
-          # Configure Rclone（关键：pass字段用单引号包裹，避免$被Shell解析）
+          # Rclone 明文配置（核心：无加密，纯数字密码直接用）
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf << EOF
           [webdav_remote]
           type = webdav
           url = $WEBDAV_URL
-          vendor = other
+          vendor = generic  # 纯数字密码用 generic 兼容性更好
           user = $WEBDAV_USER
-          pass = '$WEBDAV_PASS'  # 单引号包裹加密密码，核心修复！
+          pass = $WEBDAV_PASS  # 直接填明文数字密码
           timeout = 30s
           retries = 3
           EOF
           chmod 600 ~/.config/rclone/rclone.conf
           echo "🔗 Rclone Configured (URL: ${WEBDAV_URL%%/*}, User: $WEBDAV_USER)"
 
-          # 挂载前清理旧挂载
+          # 清理旧挂载
           sudo fusermount -u $LOCAL_MOUNT_POINT 2>/dev/null || true
           rm -rf $LOCAL_MOUNT_POINT/* 2>/dev/null || true
 
-          # Mount WebDAV (3 retries)
+          # WebDAV 挂载（3次重试）
           MOUNT_RETRY=0
           while [ $MOUNT_RETRY -lt 3 ]; do
             rclone mount webdav_remote:$WEBDAV_REMOTE_DIR $LOCAL_MOUNT_POINT \
@@ -132,8 +132,7 @@ jobs:
               --vfs-cache-mode writes \
               --cache-dir $RCLONE_CACHE_DIR \
               --timeout 1h \
-              --retries 2 \
-              --log-level INFO
+              --retries 2
             sleep 8
             if mount | grep -q $LOCAL_MOUNT_POINT; then
               echo "✅ WebDAV Mount Success: WebDAV($WEBDAV_REMOTE_DIR) → Local($LOCAL_MOUNT_POINT)"
@@ -147,9 +146,7 @@ jobs:
 
           if [ $MOUNT_RETRY -eq 3 ]; then
             echo "ERROR: WebDAV Mount Failed After 3 Retries! Exit."
-            echo "🔍 Debug Info - Rclone Config:"
             cat ~/.config/rclone/rclone.conf
-            echo "🔍 Debug Info - Rclone Test:"
             rclone ls webdav_remote:$WEBDAV_REMOTE_DIR --log-level DEBUG
             exit 1
           fi
@@ -266,7 +263,7 @@ jobs:
           echo "✅ CasaOS Panel: http://$TAILSCALE_IP:$CASAOS_PORT"
           echo "✅ Data Source: $(if [ $HAS_BACKUP = 'true' ]; then echo "Restored From Backup"; else echo "Fresh Install"; fi)"
           echo "✅ Backup Scope: CasaOS Core + Docker Core + /DATA | Exclude: Logs/Temp/Junk"
-          echo "✅ Log File: $LOG_DIR/$LOG_FILE | WebDAV Log Dir: $LOCAL_MOUNT_POINT/logs"
+          echo "✅ Log File: $LOG_DIR/$LOG_FILE.log | WebDAV Log Dir: $LOCAL_MOUNT_POINT/logs"
           echo "=============================================================================================="
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 6 Completed ===="
 
@@ -292,8 +289,8 @@ jobs:
             sudo docker system prune -af --volumes 2>/dev/null || true
             sudo docker rmi $(sudo docker images -f "dangling=true" -q) 2>/dev/null || true
             sudo rm -rf /tmp/* /var/tmp/* /home/runner/.cache/* 2>/dev/null || true
-            OLD_LOGS=$(find $LOG_DIR -name "*.log" ! -name "$LOG_FILE" | wc -l)
-            find $LOG_DIR -name "*.log" ! -name "$LOG_FILE" -delete 2>/dev/null || true
+            OLD_LOGS=$(find $LOG_DIR -name "*.log" ! -name "$LOG_FILE.log" | wc -l)
+            find $LOG_DIR -name "*.log" ! -name "$LOG_FILE.log" -delete 2>/dev/null || true
             WEBDAV_OLD_LOGS=$(find $LOCAL_MOUNT_POINT/logs -name "*.log" -type f -mtime +7 | wc -l)
             find $LOCAL_MOUNT_POINT/logs -name "*.log" -type f -mtime +7 -delete 2>/dev/null || true
             AFTER=$(df -h / | awk 'NR==2{print $4}')
@@ -311,7 +308,7 @@ jobs:
               echo "⚠️ Free Space <5G - Run Emergency Cleanup First"
               auto_clean
             fi
-            TS=$(date +%Y%m%d_%H%M%S)
+            TS=$(date +'%Y%m%d_%H%M%S')
             BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
             BK_PATH="$LOCAL_MOUNT_POINT/$BK_NAME"
             DOCKER_CONTAINERS=$(sudo docker ps -q | wc -l)
@@ -335,7 +332,7 @@ jobs:
               echo "✅ Backup Valid - Name: $BK_NAME | Size: $BK_SIZE"
               echo "✅ Stored in WebDAV: $WEBDAV_REMOTE_DIR/$BK_NAME"
               echo "$BK_NAME" > "$LOCAL_MOUNT_POINT/$BACKUP_MARKER"
-              cp $LOG_DIR/$LOG_FILE "$LOCAL_MOUNT_POINT/logs/"
+              cp $LOG_DIR/$LOG_FILE.log "$LOCAL_MOUNT_POINT/logs/"
               echo "✅ Backup Marker Updated: $LOCAL_MOUNT_POINT/$BACKUP_MARKER"
               BACKUP_FILES=$(ls -t $LOCAL_MOUNT_POINT/casaos_*.tar.gz 2>/dev/null | grep -v "tmp")
               BACKUP_COUNT=$(echo "$BACKUP_FILES" | wc -l)
@@ -461,7 +458,7 @@ jobs:
           sudo tailscale down 2>/dev/null || true
           echo "✅ Services Stopped"
           echo "📤 Sync Final Log to WebDAV"
-          cp $LOG_DIR/$LOG_FILE "$LOCAL_MOUNT_POINT/logs/final_$LOG_FILE" 2>/dev/null || echo "⚠️ Log Sync Failed"
+          cp $LOG_DIR/$LOG_FILE.log "$LOCAL_MOUNT_POINT/logs/final_$LOG_FILE.log" 2>/dev/null || echo "⚠️ Log Sync Failed"
           if mount | grep -q $LOCAL_MOUNT_POINT; then
             echo "🔓 Unmount WebDAV: $LOCAL_MOUNT_POINT"
             sudo fusermount -u $LOCAL_MOUNT_POINT 2>/dev/null || sudo umount -l $LOCAL_MOUNT_POINT 2>/dev/null || true
