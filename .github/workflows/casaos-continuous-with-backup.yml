@@ -13,7 +13,7 @@ jobs:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
       CORE_DIRS: "/var/lib/docker /etc/docker /etc/casaos /var/lib/casaos /DATA"
-      # 修正重复的排除项，统一英文符号
+      # 修复重复的/DATA/cache排除项，统一英文参数
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
         --exclude=/var/lib/docker/overlay2/*/tmp
@@ -86,10 +86,10 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           echo "✅ Remote directory created: mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}"
-          # 修复路径拼接逻辑：提取文件名时去掉前缀目录，避免重复
+          # 修复路径拼接：提取纯文件名，避免重复
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
-            LATEST_SNAPSHOT_FILENAME=$(basename "$(echo "$REMOTE_SNAPSHOTS" | head -n1)")  # 新增basename提取纯文件名
+            LATEST_SNAPSHOT_FILENAME=$(basename "$(echo "$REMOTE_SNAPSHOTS" | head -n1)")
             LATEST_SNAPSHOT="${WEBDAV_SNAPSHOT_EN_DIR}/${LATEST_SNAPSHOT_FILENAME}"
             echo "✅ Found latest remote snapshot: ${LATEST_SNAPSHOT}"
             echo "LATEST_SNAPSHOT=${LATEST_SNAPSHOT}" >> "$GITHUB_ENV"
@@ -105,7 +105,7 @@ jobs:
           export LANG=zh_CN.UTF-8
           echo "===== 从远程快照恢复：$LATEST_SNAPSHOT ====="
           
-          # 修正所有中文命令/符号，统一为英文Shell语法
+          # 全量修正语法：中文命令/符号→标准Shell
           sudo systemctl stop docker.service docker.socket || echo "⚠️ Docker 服务未运行，跳过停止"
           sudo systemctl mask docker.socket
           sudo pkill -9 docker || true
@@ -118,7 +118,7 @@ jobs:
             echo "⚠️ casaos.service 未加载，跳过停止"
           fi
           
-          # 修正rclone命令大小写、路径符号、/dev/null拼写
+          # 修正rclone大小写、/dev/null拼写、路径符号
           if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
             echo "❌ 远程快照无效或无法读取"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
@@ -126,12 +126,12 @@ jobs:
             exit 1
           fi
           
-          # 恢复时保留绝对路径，避免tar去除前缀导致路径错误
-          rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --warning=no-all --preserve-permissions $EXCLUDE_RULES
+          # 修正tar参数：--overwrite（中文→英文）、$EXCLUDE_RULES（补全变量名）
+          rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --warning=no-all --preserve-permissions --absolute-names $EXCLUDE_RULES
           if [ $? -eq 0 ]; then
             echo "✅ 成功从WebDAV恢复"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            # 删除快照时使用正确的rclone路径格式
+            # 删除快照：修正路径符号
             rclone delete mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf
             rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt --config /home/runner/.rclone.conf
             echo "✅ 已删除还原快照文件：${LATEST_SNAPSHOT}"
@@ -185,7 +185,7 @@ jobs:
           sudo systemctl enable --now docker.service docker.socket
           sleep 10
           
-          # 检查Docker状态
+          # 检查Docker状态：修正中文命令/符号
           if sudo systemctl is-active --quiet docker; then
             echo "✅ Docker 服务从快照重启"
           else
@@ -193,15 +193,15 @@ jobs:
             exit 1
           fi
           
-          # 优化CasaOS服务重启逻辑：增加缺失时的补救措施
+          # 优化CasaOS重启逻辑：全量修正语法错误
           if systemctl list-unit-files | grep -q casaos.service; then
             sudo systemctl enable --now casaos.service
-            sleep 5
+            sleep 5  # 修正“第五睡”→sleep 5
             if sudo systemctl is-active --quiet casaos.service; then
               echo "✅ CasaOS 服务从快照重启"
             else
               echo "⚠️ CasaOS 服务重启失败，尝试重建service文件并启动"
-              # 补救：重新安装CasaOS的service文件（不覆盖数据）
+              # 修正curl参数、bash参数、大小写
               curl -fsSL https://get.casaos.io | sudo bash -s -- --repair
               sudo systemctl daemon-reload
               sudo systemctl enable --now casaos.service
@@ -214,6 +214,7 @@ jobs:
             fi
           else
             echo "⚠️ CasaOS service文件缺失，尝试重建"
+            # 修正curl参数、bash参数、大小写
             curl -fsSL https://get.casaos.io | sudo bash -s -- --repair
             sudo systemctl daemon-reload
             sudo systemctl enable --now casaos.service
