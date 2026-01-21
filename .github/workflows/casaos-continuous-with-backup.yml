@@ -1,4 +1,4 @@
-name: Full-Featured CasaOS-Tailscale-Backup (Auto-Renew + Precision Backup)
+name: CasaOS-Tailscale-Backup-Auto-Renew
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -17,7 +17,7 @@ jobs:
       HEALTH_CHECK_TIMEOUT: 300
       BACKUP_DIR: /home/runner/backup
       LOG_DIR: /home/runner/logs
-      LOCAL_MOUNT_POINT: /mnt/webdav_casaos
+      WEBDAV_MOUNT_POINT: /mnt/webdav_casaos
       WEBDAV_REMOTE_DIR: /z/Ubu
       RCLONE_CACHE_DIR: /tmp/rclone_cache
       NEW_RUN_ID_FILE: /home/runner/new_run_id.txt
@@ -39,191 +39,165 @@ jobs:
       LOG_FILE: casaos_service_${{ github.run_id }}_$(date +'%Y%m%d_%H%M%S')
 
     steps:
-      - name: "Step 0: Pre-Check - Shell Env & Log Dir Init"
+      - name: "Step 0: Pre-Check & Env Init"
         id: pre_check
         continue-on-error: false
         run: |
           set -euo pipefail
-          mkdir -p $LOG_DIR $RCLONE_CACHE_DIR
-          chmod 755 $LOG_DIR $RCLONE_CACHE_DIR
+          mkdir -p $LOG_DIR $RCLONE_CACHE_DIR $WEBDAV_MOUNT_POINT
+          chmod 755 $LOG_DIR $RCLONE_CACHE_DIR $WEBDAV_MOUNT_POINT
           exec > >(tee -a $LOG_DIR/$LOG_FILE.log) 2>&1
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Pre-Check Completed ===="
-          echo "===================================== WORKFLOW BASIC INFO ====================================="
           echo "🔧 Workflow Run ID: ${{ github.run_id }}"
-          echo "🔧 WebDAV Remote Target: $WEBDAV_REMOTE_DIR"
-          echo "🔧 Local Mount Point: $LOCAL_MOUNT_POINT"
-          echo "🔧 Backup Retention: Keep Latest $KEEP_BACKUP_COUNT Backups"
+          echo "🔧 WebDAV Remote Dir: $WEBDAV_REMOTE_DIR"
           echo "🔧 Max Runtime: $MAX_RUN_MINUTES Minutes | Renew Trigger: 30 Mins Remaining"
-          echo "=============================================================================================="
 
-      - name: "Step 1: System Env Initialization"
+      - name: "Step 1: System Dependencies Install"
         id: sys_init
         continue-on-error: false
         run: |
           set -euo pipefail
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 1 Start: System Initialization ===="
-          echo "📊 Initial System Free Space: $(df -h / | awk 'NR==2{print $4}')"
           sudo apt update -y && sudo apt upgrade -y -qq
           REQUIRED_PACKAGES="tar gzip rsync rclone fuse3 netcat-openbsd psmisc curl git wget jq bc"
           sudo apt install -y $REQUIRED_PACKAGES
           echo "runner:$RUNNER_PASSWORD" | sudo chpasswd
-          sudo mkdir -p $BACKUP_DIR $LOCAL_MOUNT_POINT /DATA
-          sudo chown -R runner:runner $BACKUP_DIR $LOCAL_MOUNT_POINT /DATA
-          sudo chmod -R 755 $BACKUP_DIR $LOCAL_MOUNT_POINT /DATA
+          sudo mkdir -p $BACKUP_DIR /DATA
+          sudo chown -R runner:runner $BACKUP_DIR /DATA $WEBDAV_MOUNT_POINT
           echo "✅ Dependencies Installed: $REQUIRED_PACKAGES"
-          echo "✅ Core Directories Created: $BACKUP_DIR | $LOCAL_MOUNT_POINT | /DATA"
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 1 Completed ===="
 
-      - name: "Step 2: WebDAV Mount (Remote Dir: /z/Ubu) With Retry"
+      - name: "Step 2: WebDAV Mount (Plaintext Secrets Direct Reference)"
         id: webdav_setup
         continue-on-error: false
         run: |
-          set -euo pipefail
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 2 Start: WebDAV Configuration ===="
-          # 读取 Secret：直接匹配你现有的三个变量，无需加密
-          WEBDAV_URL=${{ secrets.WEBDAV_URL }}
-          WEBDAV_USER=${{ secrets.WEBDAV_USER }}  # 改为 WEBDAV_USER，匹配你的 Secret 名称
-          WEBDAV_PASS=${{ secrets.WEBDAV_PASSWORD }}
+          set -e
+          # 直接引用仓库Secrets，无加密/无校验
+          WEBDAV_URL="${{ secrets.WEBDAV_URL }}"
+          WEBDAV_USER="${{ secrets.WEBDAV_USER }}"
+          WEBDAV_PASSWORD="${{ secrets.WEBDAV_PASSWORD }}"
           
-          # 脱敏校验
-          echo "🔍 Secrets Check - WEBDAV_URL: [${WEBDAV_URL:0:2}]***"
-          echo "🔍 Secrets Check - WEBDAV_USER: [${WEBDAV_USER:0:2}]***"
-          echo "🔍 Secrets Check - WEBDAV_PASS: [${WEBDAV_PASS:0:2}]***"
+          # 仅保留非空校验（空值无法挂载，必须保留）
+          if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
+            echo "❌ WebDAV Secrets Empty"
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
           
-          # 非空校验
-          if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASS" ]; then
-            echo "ERROR: WebDAV Secrets Not Configured! Exit."
-            exit 1
-          fi
-
-          # 修复 URL 中文符号，补全末尾 /
-          WEBDAV_URL=$(echo "$WEBDAV_URL" | sed -e 's/：/:/g' -e 's/ //g')
-          if [[ "$WEBDAV_URL" != */ ]]; then
-            WEBDAV_URL="${WEBDAV_URL}/"
-          fi
-          echo "🔧 Fixed WebDAV URL: $WEBDAV_URL"
-
-          # Rclone 明文配置（核心：无加密，纯数字密码直接用）
-          mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf << EOF
-          [webdav_remote]
-          type = webdav
-          url = $WEBDAV_URL
-          vendor = generic  # 纯数字密码用 generic 兼容性更好
-          user = $WEBDAV_USER
-          pass = $WEBDAV_PASS  # 直接填明文数字密码
-          timeout = 30s
-          retries = 3
-          EOF
-          chmod 600 ~/.config/rclone/rclone.conf
-          echo "🔗 Rclone Configured (URL: ${WEBDAV_URL%%/*}, User: $WEBDAV_USER)"
-
-          # 清理旧挂载
-          sudo fusermount -u $LOCAL_MOUNT_POINT 2>/dev/null || true
-          rm -rf $LOCAL_MOUNT_POINT/* 2>/dev/null || true
-
-          # WebDAV 挂载（3次重试）
-          MOUNT_RETRY=0
-          while [ $MOUNT_RETRY -lt 3 ]; do
-            rclone mount webdav_remote:$WEBDAV_REMOTE_DIR $LOCAL_MOUNT_POINT \
-              --daemon \
-              --allow-other \
-              --allow-non-empty \
-              --vfs-cache-mode writes \
-              --cache-dir $RCLONE_CACHE_DIR \
-              --timeout 1h \
-              --retries 2
-            sleep 8
-            if mount | grep -q $LOCAL_MOUNT_POINT; then
-              echo "✅ WebDAV Mount Success: WebDAV($WEBDAV_REMOTE_DIR) → Local($LOCAL_MOUNT_POINT)"
-              echo "📊 WebDAV Mount Point Free Space: $(df -h $LOCAL_MOUNT_POINT | awk 'NR==2{print $4}')"
-              break
+          # 直接写入明文配置
+          mkdir -p /home/runner/
+          echo "[mywebdav]" > /home/runner/.rclone.conf
+          echo "type = webdav" >> /home/runner/.rclone.conf
+          echo "url = $WEBDAV_URL" >> /home/runner/.rclone.conf
+          echo "user = $WEBDAV_USER" >> /home/runner/.rclone.conf
+          echo "pass = $WEBDAV_PASSWORD" >> /home/runner/.rclone.conf
+          
+          # 权限配置
+          sudo chown runner:runner /home/runner/.rclone.conf
+          sudo chmod 600 /home/runner/.rclone.conf
+          
+          # 卸载残留挂载 & 创建挂载点
+          fusermount3 -u "$WEBDAV_MOUNT_POINT" 2>/dev/null || fusermount -u "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
+          
+          # 后台挂载WebDAV
+          nohup sudo -u runner rclone mount mywebdav: "$WEBDAV_MOUNT_POINT" \
+            --config /home/runner/.rclone.conf \
+            --uid $(id -u runner) \
+            --gid $(id -g runner) \
+            --vfs-cache-mode writes \
+            --allow-other \
+            --allow-non-empty \
+            --log-file /tmp/rclone_mount.log >/dev/null 2>&1 &
+          
+          # 5次挂载检查
+          for i in $(seq 1 5); do
+            if touch "$WEBDAV_MOUNT_POINT/.test-mount" 2>/dev/null; then
+              rm -f "$WEBDAV_MOUNT_POINT/.test-mount"
+              echo "✅ WebDAV Mount Success (Plaintext Mode)"
+              echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
+              
+              # 检测最新快照
+              WEBDAV_SNAPSHOT_DIR="${WEBDAV_MOUNT_POINT}${WEBDAV_REMOTE_DIR}"
+              if ls "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz 1>/dev/null 2>&1; then
+                LATEST_SNAPSHOT=$(ls -t "$WEBDAV_SNAPSHOT_DIR"/casaos-server-snapshot-*.tar.gz | head -n1)
+                echo "✅ Found Latest Snapshot: $LATEST_SNAPSHOT"
+                echo "LATEST_SNAPSHOT=$LATEST_SNAPSHOT" >> "$GITHUB_ENV"
+              fi
+              exit 0
             fi
-            MOUNT_RETRY=$((MOUNT_RETRY + 1))
-            echo "⚠️ WebDAV Mount Retry $MOUNT_RETRY Failed"
-            sudo fusermount -u $LOCAL_MOUNT_POINT 2>/dev/null || true
+            echo "⚠️ Mount Retry $i/5"
+            sleep 5
           done
+          
+          # 挂载失败处理
+          echo "❌ WebDAV Mount Failed After 5 Retries"
+          cat /tmp/rclone_mount.log || echo "⚠️ No Mount Log"
+          echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+          exit 1
 
-          if [ $MOUNT_RETRY -eq 3 ]; then
-            echo "ERROR: WebDAV Mount Failed After 3 Retries! Exit."
-            cat ~/.config/rclone/rclone.conf
-            rclone ls webdav_remote:$WEBDAV_REMOTE_DIR --log-level DEBUG
-            exit 1
-          fi
-
-          mkdir -p $LOCAL_MOUNT_POINT/logs
-          echo "WEBDAV_STATUS=success" >> $GITHUB_ENV
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 2 Completed ===="
-
-      - name: "Step 3: Backup Restore & Validation (CasaOS+Docker+/DATA)"
+      - name: "Step 3: Backup Restore (If Available)"
         id: backup_restore
         continue-on-error: false
         run: |
           set -euo pipefail
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 3 Start: Backup Restore ===="
-          BACKUP_MARKER_FILE="$LOCAL_MOUNT_POINT/$BACKUP_MARKER"
           HAS_BACKUP="false"
-          if [ -f "$BACKUP_MARKER_FILE" ]; then
-            LATEST_BACKUP=$(cat "$BACKUP_MARKER_FILE")
-            echo "🔍 Found Backup Marker: $BACKUP_MARKER_FILE"
-            echo "🔍 Latest Backup File: $LATEST_BACKUP | Size: $(du -h $LOCAL_MOUNT_POINT/$LATEST_BACKUP 2>/dev/null | awk '{print $1}')"
-            echo "$BACKUP_EXCLUDE" | tr ' ' '\n' > $BACKUP_DIR/exclude-list.txt
-            sudo systemctl stop docker containerd 2>/dev/null || true
-            sleep 3
-            echo "📌 Start Restore From WebDAV: $LOCAL_MOUNT_POINT/$LATEST_BACKUP"
-            if sudo tar -zxf "$LOCAL_MOUNT_POINT/$LATEST_BACKUP" -C / --exclude-from=$BACKUP_DIR/exclude-list.txt; then
-              if [ -d "/etc/casaos" ] && [ -d "/var/lib/docker/containers" ] && [ -d "/DATA" ]; then
-                echo "✅ Restore Success - Critical Directories Exist: /etc/casaos | /var/lib/docker/containers | /DATA"
+          if [ "${{ env.WEBDAV_AVAILABLE }}" = "true" ]; then
+            BACKUP_MARKER_FILE="$WEBDAV_MOUNT_POINT/$BACKUP_MARKER"
+            if [ -f "$BACKUP_MARKER_FILE" ]; then
+              LATEST_BACKUP=$(cat "$BACKUP_MARKER_FILE")
+              echo "🔍 Start Restore From: $LATEST_BACKUP"
+              echo "$BACKUP_EXCLUDE" | tr ' ' '\n' > $BACKUP_DIR/exclude-list.txt
+              sudo systemctl stop docker containerd 2>/dev/null || true
+              sleep 3
+              sudo tar -zxf "$LATEST_BACKUP" -C / --exclude-from=$BACKUP_DIR/exclude-list.txt
+              if [ -d "/etc/casaos" ] && [ -d "/var/lib/docker/containers" ]; then
+                echo "✅ Restore Success"
                 HAS_BACKUP="true"
-              else
-                echo "WARNING: Restore Validation Failed - Critical Directories Missing"
               fi
-            else
-              echo "WARNING: Restore Command Failed - Use Fresh Env"
+              sudo systemctl start docker containerd 2>/dev/null || true
             fi
-            sudo systemctl start docker containerd 2>/dev/null || true
-            echo "✅ Docker Service Restarted After Restore"
-          else
-            echo "ℹ️ No Backup Marker Found - Use Fresh Environment"
           fi
           echo "HAS_BACKUP=$HAS_BACKUP" >> $GITHUB_ENV
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 3 Completed ===="
 
-      - name: "Step 4: CasaOS Installation & Startup"
+      - name: "Step 4: CasaOS Installation"
         id: casaos_install
         continue-on-error: false
         run: |
           set -euo pipefail
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 4 Start: CasaOS Install ===="
-          curl -fsSL https://get.casaos.io | sudo bash -s -- --debug 2>&1 | grep -v "restart" || { echo "WARNING: CasaOS Install Has Warnings"; }
+          if [ "${{ env.HAS_BACKUP }}" = "false" ]; then
+            curl -fsSL https://get.casaos.io | sudo bash -s -- --debug 2>&1 | grep -v "restart" || true
+          fi
           sudo systemctl daemon-reload
           sudo systemctl enable --now casaos
           sleep 10
           if sudo systemctl is-active --quiet casaos; then
-            echo "✅ CasaOS Service Status: Running"
-            echo "🔗 CasaOS Core Paths: /etc/casaos (Config) | /var/lib/casaos (Data)"
+            echo "✅ CasaOS Service Running"
           else
-            echo "WARNING: CasaOS Service Status: Not Running - Check Logs Later"
+            echo "⚠️ CasaOS Service Not Running"
           fi
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 4 Completed ===="
 
-      - name: "Step 5: Tailscale Deployment (5 Retries)"
+      - name: "Step 5: Tailscale Deployment"
         id: tailscale_deploy
         continue-on-error: false
         run: |
           set -euo pipefail
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 5 Start: Tailscale Deploy ===="
+          # 安装Tailscale
           if ! curl -fsSL https://tailscale.com/install.sh | sudo sh -s -- -q; then
-            echo "⚠️ Script Install Failed - Fallback to APT"
             curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
             curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
             sudo apt update && sudo apt install -y tailscale
           fi
           sudo systemctl enable --now tailscaled
           sleep 5
+          # 配置Tailscale
           TS_AUTH_KEY=${{ secrets.TAILSCALE_AUTH_KEY }}
           if [ -z "$TS_AUTH_KEY" ]; then
-            echo "ERROR: Tailscale Auth Key Not Configured! Exit."
+            echo "ERROR: Tailscale Auth Key Not Configured"
             exit 1
           fi
           TS_RETRY=0
@@ -232,47 +206,26 @@ jobs:
             if sudo tailscale up --authkey=$TS_AUTH_KEY --hostname=casaos-${{ github.run_id }} --accept-routes=false --accept-dns=false; then
               TAILSCALE_IP=$(sudo tailscale ip -4)
               if [ -n "$TAILSCALE_IP" ]; then
-                echo "✅ Tailscale Joined - Internal IP: $TAILSCALE_IP"
-                echo "✅ Tailscale Hostname: casaos-${{ github.run_id }}"
+                echo "✅ Tailscale Joined - IP: $TAILSCALE_IP"
                 break
               fi
             fi
             TS_RETRY=$((TS_RETRY + 1))
-            echo "⚠️ Tailscale Retry $TS_RETRY Failed"
             sleep 5
           done
           if [ -z "$TAILSCALE_IP" ]; then
-            echo "ERROR: Tailscale Join Failed After 5 Retries! Exit."
+            echo "ERROR: Tailscale Join Failed"
             exit 1
           fi
           echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 5 Completed ===="
 
-      - name: "Step 6: Output Service Access Info"
-        id: output_info
-        continue-on-error: false
-        run: |
-          set -euo pipefail
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 6 Start: Access Info Output ===="
-          echo "===================================== SERVICE ACCESS INFO ====================================="
-          echo "✅ Total Runtime: 360 Minutes (6 Hours)"
-          echo "✅ Renew Trigger: When Remaining Time = 30 Minutes"
-          echo "✅ System Free Space: $(df -h / | awk 'NR==2{print $4}')"
-          echo "✅ Runner Password: $RUNNER_PASSWORD"
-          echo "✅ WebDAV Status: $WEBDAV_STATUS | Remote Dir: $WEBDAV_REMOTE_DIR"
-          echo "✅ CasaOS Panel: http://$TAILSCALE_IP:$CASAOS_PORT"
-          echo "✅ Data Source: $(if [ $HAS_BACKUP = 'true' ]; then echo "Restored From Backup"; else echo "Fresh Install"; fi)"
-          echo "✅ Backup Scope: CasaOS Core + Docker Core + /DATA | Exclude: Logs/Temp/Junk"
-          echo "✅ Log File: $LOG_DIR/$LOG_FILE.log | WebDAV Log Dir: $LOCAL_MOUNT_POINT/logs"
-          echo "=============================================================================================="
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 6 Completed ===="
-
-      - name: "Step 7: Core Keepalive + Hourly Clean + Full Stop Backup + Auto Renew"
+      - name: "Step 6: Core Keepalive & Auto Renew & Backup"
         id: core_keepalive
         continue-on-error: true
         run: |
           set -euo pipefail
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 7 Start: Core Keepalive Logic ===="
+          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 6 Start: Keepalive Logic ===="
           start_time=$(date +%s)
           last_clean=$start_time
           backup_done=false
@@ -280,192 +233,123 @@ jobs:
           REPO=${{ github.repository }}
           CURRENT_RUN_ID=${{ github.run_id }}
 
+          # 定时清理函数
           auto_clean() {
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [HOURLY CLEAN] Start Deep Cleanup"
-            BEFORE=$(df -h / | awk 'NR==2{print $4}')
-            BEFORE_SIZE=$(df -B1 / | awk 'NR==2{print $4}')
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [CLEAN] Start Hourly Cleanup"
             sudo apt clean -y && sudo apt autoremove -y --purge -qq
-            DOCKER_DANGLING=$(sudo docker images -f "dangling=true" -q | wc -l)
             sudo docker system prune -af --volumes 2>/dev/null || true
-            sudo docker rmi $(sudo docker images -f "dangling=true" -q) 2>/dev/null || true
-            sudo rm -rf /tmp/* /var/tmp/* /home/runner/.cache/* 2>/dev/null || true
-            OLD_LOGS=$(find $LOG_DIR -name "*.log" ! -name "$LOG_FILE.log" | wc -l)
-            find $LOG_DIR -name "*.log" ! -name "$LOG_FILE.log" -delete 2>/dev/null || true
-            WEBDAV_OLD_LOGS=$(find $LOCAL_MOUNT_POINT/logs -name "*.log" -type f -mtime +7 | wc -l)
-            find $LOCAL_MOUNT_POINT/logs -name "*.log" -type f -mtime +7 -delete 2>/dev/null || true
-            AFTER=$(df -h / | awk 'NR==2{print $4}')
-            AFTER_SIZE=$(df -B1 / | awk 'NR==2{print $4}')
-            FREED_SIZE=$(( (BEFORE_SIZE - AFTER_SIZE) / 1024 / 1024 ))
-            echo "📊 Cleanup Result: $BEFORE → $AFTER (Freed ~${FREED_SIZE}MB)"
-            echo "🗑️ Cleaned: $DOCKER_DANGLING Dangling Images | $OLD_LOGS Local Logs | $WEBDAV_OLD_LOGS WebDAV Logs"
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [HOURLY CLEAN] Completed"
+            sudo rm -rf /tmp/* /home/runner/.cache/* 2>/dev/null || true
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [CLEAN] Completed"
           }
 
+          # 备份函数
           do_backup() {
-            FREE_SPACE=$(df -h / | awk 'NR==2{print $4}')
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [BACKUP] Triggered - Free Space: $FREE_SPACE"
-            if (( $(echo "$FREE_SPACE < 5" | bc -l) )); then
-              echo "⚠️ Free Space <5G - Run Emergency Cleanup First"
-              auto_clean
-            fi
-            TS=$(date +'%Y%m%d_%H%M%S')
-            BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
-            BK_PATH="$LOCAL_MOUNT_POINT/$BK_NAME"
-            DOCKER_CONTAINERS=$(sudo docker ps -q | wc -l)
-            sudo docker stop $(sudo docker ps -q) 2>/dev/null || true
-            sudo systemctl stop docker containerd casaos tailscaled 2>/dev/null || true
-            sleep 5
-            echo "🛑 Stopped $DOCKER_CONTAINERS Containers + All Services"
-            echo "📥 Start Backup - Target: $BK_PATH"
-            echo "📥 Backup Includes: /etc/casaos | /var/lib/casaos | /var/lib/docker/{image,containers,volumes,networks} | /DATA"
-            sudo tar -z -cf $BK_PATH $BACKUP_EXCLUDE \
-              /etc/casaos \
-              /var/lib/casaos \
-              /var/lib/docker/image \
-              /var/lib/docker/containers \
-              /var/lib/docker/volumes \
-              /var/lib/docker/networks \
-              /DATA \
-              --warning=no-file-changed
-            if [ -f "$BK_PATH" ] && [ $(stat -c%s "$BK_PATH") -gt 1024 ]; then
-              BK_SIZE=$(du -h $BK_PATH | awk '{print $1}')
-              echo "✅ Backup Valid - Name: $BK_NAME | Size: $BK_SIZE"
-              echo "✅ Stored in WebDAV: $WEBDAV_REMOTE_DIR/$BK_NAME"
-              echo "$BK_NAME" > "$LOCAL_MOUNT_POINT/$BACKUP_MARKER"
-              cp $LOG_DIR/$LOG_FILE.log "$LOCAL_MOUNT_POINT/logs/"
-              echo "✅ Backup Marker Updated: $LOCAL_MOUNT_POINT/$BACKUP_MARKER"
-              BACKUP_FILES=$(ls -t $LOCAL_MOUNT_POINT/casaos_*.tar.gz 2>/dev/null | grep -v "tmp")
-              BACKUP_COUNT=$(echo "$BACKUP_FILES" | wc -l)
-              if [ $BACKUP_COUNT -gt $KEEP_BACKUP_COUNT ]; then
-                FILES_TO_DELETE=$(echo "$BACKUP_FILES" | tail -n +$((KEEP_BACKUP_COUNT + 1)))
-                DELETE_COUNT=$(echo "$FILES_TO_DELETE" | wc -l)
-                for FILE in $FILES_TO_DELETE; do
-                  sudo rm -f "$FILE" || true
-                done
-                echo "🗑️ Cleaned $DELETE_COUNT Old Backups | Retained $KEEP_BACKUP_COUNT Latest"
-              else
-                echo "ℹ️ Backup Count ($BACKUP_COUNT) ≤ Retention - No Cleanup"
+            if [ "${{ env.WEBDAV_AVAILABLE }}" = "true" ]; then
+              echo "[$(date +'%Y-%m-%d %H:%M:%S')] [BACKUP] Start Full Backup"
+              TS=$(date +'%Y%m%d_%H%M%S')
+              BK_NAME="casaos_${CURRENT_RUN_ID}_$TS.tar.gz"
+              BK_PATH="$WEBDAV_MOUNT_POINT/$BK_NAME"
+              sudo docker stop $(sudo docker ps -q) 2>/dev/null || true
+              sudo systemctl stop docker containerd casaos tailscaled 2>/dev/null || true
+              sleep 5
+              sudo tar -zcf $BK_PATH $BACKUP_EXCLUDE /etc/casaos /var/lib/casaos /var/lib/docker /DATA --warning=no-file-changed
+              if [ -f "$BK_PATH" ] && [ $(stat -c%s "$BK_PATH") -gt 1024 ]; then
+                echo "$BK_NAME" > "$WEBDAV_MOUNT_POINT/$BACKUP_MARKER"
+                cp $LOG_DIR/$LOG_FILE.log "$WEBDAV_MOUNT_POINT/logs/"
+                # 清理旧备份
+                BACKUP_FILES=$(ls -t $WEBDAV_MOUNT_POINT/casaos_*.tar.gz 2>/dev/null)
+                BACKUP_COUNT=$(echo "$BACKUP_FILES" | wc -l)
+                if [ $BACKUP_COUNT -gt $KEEP_BACKUP_COUNT ]; then
+                  FILES_TO_DELETE=$(echo "$BACKUP_FILES" | tail -n +$((KEEP_BACKUP_COUNT + 1)))
+                  for FILE in $FILES_TO_DELETE; do sudo rm -f "$FILE"; done
+                fi
+                echo "✅ Backup Success: $BK_NAME"
               fi
-            else
-              echo "❌ Backup Invalid - Delete Corrupted File"
-              sudo rm -f "$BK_PATH" 2>/dev/null || true
+              # 重启服务
+              sudo systemctl start docker containerd casaos tailscaled 2>/dev/null || true
+              sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=casaos-${{ github.run_id }} 2>/dev/null || true
+              backup_done=true
             fi
-            echo "🔄 Restart Services (Dependency Order)"
-            sudo systemctl start docker containerd 2>/dev/null || true
-            sleep 3
-            sudo systemctl start casaos tailscaled 2>/dev/null || true
-            sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=casaos-${{ github.run_id }} 2>/dev/null || true
-            echo "✅ All Services Restarted"
-            backup_done=true
           }
 
+          # 触发续跑函数
           trigger_renew() {
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [RENEW] Trigger New Workflow"
             if [ -z "$GITHUB_PAT" ] || [ -z "$REPO" ]; then
-              echo "❌ Failed - PAT/Repo Not Configured"
               return 1
             fi
             RESPONSE=$(curl -s -X POST https://api.github.com/repos/$REPO/dispatches \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GITHUB_PAT" \
               -d '{"event_type":"renew_vnc"}' \
-              -w "%{http_code}" -o /dev/null --connect-timeout 30s)
-            if [ "$RESPONSE" -eq 204 ]; then
-              echo "✅ Trigger Success - HTTP Code: $RESPONSE"
-              return 0
-            else
-              echo "❌ Trigger Failed - HTTP Code: $RESPONSE"
-              return 1
-            fi
+              -w "%{http_code}" -o /dev/null)
+            [ "$RESPONSE" -eq 204 ] && return 0 || return 1
           }
 
+          # 检查新容器健康
           check_new_container() {
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [HEALTH CHECK] Check New Container - Timeout: $HEALTH_CHECK_TIMEOUTs"
             start_check=$(date +%s)
             while [ $(( $(date +%s) - start_check )) -lt $HEALTH_CHECK_TIMEOUT ]; do
               RUNS=$(curl -s -H "Authorization: Bearer $GITHUB_PAT" \
                 "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&event=repository_dispatch" \
                 | jq -r '.workflow_runs[] | select(.id != '$CURRENT_RUN_ID') | .id')
               if [ -n "$RUNS" ]; then
-                NEW_RUN_ID=$(echo "$RUNS" | head -n 1)
-                echo "✅ New Container Found - Run ID: $NEW_RUN_ID"
+                NEW_RUN_ID=$(echo "$RUNS" | head -n1)
+                echo "✅ New Container Ready: $NEW_RUN_ID"
                 echo $NEW_RUN_ID > $NEW_RUN_ID_FILE
-                sleep 120
-                echo "✅ New Container Healthy"
                 return 0
               fi
-              echo "⏳ New Container Not Ready - Wait 10s"
               sleep 10
             done
-            echo "❌ Timeout - No Valid New Container"
             return 1
           }
 
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] [KEEPALIVE] Monitoring Loop Started - Interval: 60s"
+          # 核心保活循环
+          echo "[$(date +'%Y-%m-%d %H:%M:%S')] [KEEPALIVE] Monitoring Started"
           while true; do
             now=$(date +%s)
             run_mins=$(( (now - start_time) / 60 ))
             remaining_mins=$((MAX_RUN_MINUTES - run_mins))
-            free_space=$(df -h / | awk 'NR==2{print $4}')
-            echo "[$(date +'%Y-%m-%d %H:%M:%S')] [KEEPALIVE] Status - Running: $run_mins Mins | Remaining: $remaining_mins Mins | Free Space: $free_space"
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] Running: $run_mins Mins | Remaining: $remaining_mins Mins"
+            
+            # 定时清理
             if [ $((now - last_clean)) -ge $CLEAN_INTERVAL ]; then
               auto_clean
               last_clean=$now
             fi
-            if (( $(echo "$free_space < 1" | bc -l) )); then
-              echo "⚠️ Emergency Cleanup Triggered - Free Space <1G"
-              auto_clean
-              last_clean=$now
-            fi
+
+            # 剩余30分钟触发备份+续跑
             if [ $remaining_mins -eq 30 ] && [ "$backup_done" = false ]; then
               do_backup
-              if trigger_renew; then
-                if check_new_container; then
-                  echo "✅ New Container Ready - Old Container Exit Safely"
-                  sudo systemctl stop casaos tailscaled docker containerd
-                  sudo tailscale down
-                  exit 0
-                else
-                  echo "⚠️ New Container Unhealthy - Old Container Continue"
-                fi
-              else
-                echo "⚠️ Renew Trigger Failed - Old Container Continue"
+              if trigger_renew && check_new_container; then
+                echo "✅ New Container Healthy, Old Container Exit"
+                sudo systemctl stop casaos tailscaled docker containerd
+                sudo tailscale down
+                exit 0
               fi
             fi
-            if ! sudo systemctl is-active --quiet casaos; then
-              echo "⚠️ CasaOS Down - Restarting"
-              sudo systemctl restart casaos
-            fi
-            if ! sudo systemctl is-active --quiet tailscaled; then
-              echo "⚠️ Tailscale Down - Restarting"
-              sudo systemctl restart tailscaled
-            fi
-            if ! sudo systemctl is-active --quiet docker; then
-              echo "⚠️ Docker Down - Restarting"
-              sudo systemctl restart docker containerd
-            fi
+
+            # 服务保活
+            ! sudo systemctl is-active --quiet casaos && sudo systemctl restart casaos
+            ! sudo systemctl is-active --quiet tailscaled && sudo systemctl restart tailscaled
+            ! sudo systemctl is-active --quiet docker && sudo systemctl restart docker containerd
+            
             sleep 60
           done
 
-      - name: "Step 8: Post-Service Cleanup & WebDAV Unmount"
+      - name: "Step 7: Post-Cleanup & Unmount"
         id: post_cleanup
         if: always()
         run: |
           set -euo pipefail
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 8 Start: Post Cleanup ===="
-          echo "🛑 Stop All Services"
+          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 7 Start: Post Cleanup ===="
+          # 停止所有服务
           sudo systemctl stop casaos tailscaled docker containerd 2>/dev/null || true
           sudo tailscale down 2>/dev/null || true
-          echo "✅ Services Stopped"
-          echo "📤 Sync Final Log to WebDAV"
-          cp $LOG_DIR/$LOG_FILE.log "$LOCAL_MOUNT_POINT/logs/final_$LOG_FILE.log" 2>/dev/null || echo "⚠️ Log Sync Failed"
-          if mount | grep -q $LOCAL_MOUNT_POINT; then
-            echo "🔓 Unmount WebDAV: $LOCAL_MOUNT_POINT"
-            sudo fusermount -u $LOCAL_MOUNT_POINT 2>/dev/null || sudo umount -l $LOCAL_MOUNT_POINT 2>/dev/null || true
-            echo "✅ WebDAV Unmounted"
+          # 卸载WebDAV
+          if [ "${{ env.WEBDAV_AVAILABLE }}" = "true" ]; then
+            cp $LOG_DIR/$LOG_FILE.log "$WEBDAV_MOUNT_POINT/logs/final_$LOG_FILE.log" 2>/dev/null || true
+            fusermount3 -u "$WEBDAV_MOUNT_POINT" 2>/dev/null || fusermount -u "$WEBDAV_MOUNT_POINT" 2>/dev/null || true
           fi
-          echo "🗑️ Clean Local Temp Directories"
+          # 清理本地目录
           sudo rm -rf $BACKUP_DIR $RCLONE_CACHE_DIR /tmp/* 2>/dev/null || true
-          echo "✅ Cleaned: $BACKUP_DIR | $RCLONE_CACHE_DIR | /tmp"
-          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 8 Completed ===="
-          echo "===================================== WORKFLOW EXECUTION COMPLETED ==================================="
+          echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Workflow Completed ===="
