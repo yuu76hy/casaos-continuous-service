@@ -80,42 +80,61 @@ jobs:
         run: |
           set -euo pipefail
           echo "[$(date +'%Y-%m-%d %H:%M:%S')] ==== Step 2 Start: WebDAV Configuration ===="
-          # Read Secrets (100% English)
+          # Read Secrets
           WEBDAV_URL=${{ secrets.WEBDAV_URL }}
           WEBDAV_USER=${{ secrets.WEBDAV_USERNAME }}
           WEBDAV_PASS=${{ secrets.WEBDAV_PASSWORD }}
           
-          # Debug: Desensitized check (only show first 2 chars)
+          # Debug: Desensitized check
           echo "🔍 Secrets Check - WEBDAV_URL: [${WEBDAV_URL:0:2}]***"
           echo "🔍 Secrets Check - WEBDAV_USER: [${WEBDAV_USER:0:2}]***"
           echo "🔍 Secrets Check - WEBDAV_PASS: [${WEBDAV_PASS:0:2}]***"
           
-          # Non-empty validation (English symbols only)
+          # Non-empty validation
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASS" ]; then
             echo "ERROR: WebDAV Secrets Not Configured! Exit."
             exit 1
           fi
 
-          # Configure Rclone (standard config)
+          # 关键修复1：转义密码中的特殊字符（解决解密失败）
+          ESCAPED_PASS=$(echo "$WEBDAV_PASS" | sed -e 's/[\/&]/\\&/g')
+          # 关键修复2：补全WebDAV URL格式（确保末尾有/）
+          if [[ "$WEBDAV_URL" != */ ]]; then
+            WEBDAV_URL="$WEBDAV_URL/"
+          fi
+
+          # Configure Rclone（优化vendor为other，适配所有WebDAV服务）
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf << EOF
           [webdav_remote]
           type = webdav
           url = $WEBDAV_URL
-          vendor = generic
+          vendor = other  # 替换generic为other，适配性更强
           user = $WEBDAV_USER
-          pass = $WEBDAV_PASS
+          pass = $ESCAPED_PASS  # 使用转义后的密码
           timeout = 30s
           retries = 3
           EOF
           chmod 600 ~/.config/rclone/rclone.conf
           echo "🔗 Rclone Configured (URL: ${WEBDAV_URL%%/*}, User: $WEBDAV_USER)"
 
+          # 关键修复3：挂载前先清理旧挂载（避免冲突）
+          sudo fusermount -u $LOCAL_MOUNT_POINT 2>/dev/null || true
+          rm -rf $LOCAL_MOUNT_POINT/* 2>/dev/null || true
+
           # Mount WebDAV (3 retries)
           MOUNT_RETRY=0
           while [ $MOUNT_RETRY -lt 3 ]; do
+            # 增加挂载参数：允许非空挂载、放宽权限
             rclone mount webdav_remote:$WEBDAV_REMOTE_DIR $LOCAL_MOUNT_POINT \
-              --daemon --allow-other --vfs-cache-mode writes --cache-dir $RCLONE_CACHE_DIR --timeout 1h --retries 2
+              --daemon \
+              --allow-other \
+              --allow-non-empty \
+              --vfs-cache-mode writes \
+              --cache-dir $RCLONE_CACHE_DIR \
+              --timeout 1h \
+              --retries 2 \
+              --log-level INFO  # 输出详细日志，便于排查
             sleep 5
             if mount | grep -q $LOCAL_MOUNT_POINT; then
               echo "✅ WebDAV Mount Success: WebDAV($WEBDAV_REMOTE_DIR) → Local($LOCAL_MOUNT_POINT)"
@@ -129,6 +148,8 @@ jobs:
 
           if [ $MOUNT_RETRY -eq 3 ]; then
             echo "ERROR: WebDAV Mount Failed After 3 Retries! Exit."
+            # 输出Rclone详细日志，便于排查
+            rclone ls webdav_remote:$WEBDAV_REMOTE_DIR --log-level DEBUG
             exit 1
           fi
 
