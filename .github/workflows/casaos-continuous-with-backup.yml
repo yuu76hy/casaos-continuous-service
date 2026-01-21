@@ -12,7 +12,8 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      CORE_DIRS: "/var/lib /DATA /etc/casaos"
+      # 核心修改：添加 /usr/bin/tailscale 到备份目录列表
+      CORE_DIRS: "/var/lib /DATA /etc/casaos /usr/bin/tailscale"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/overlay2/*/home/dependabot
         --exclude=/var/lib/docker/overlay2/*/vendor/ruby
@@ -122,9 +123,10 @@ jobs:
             sudo systemctl unmask docker.socket
             exit 1
           fi
+          # 恢复时会自动包含 /usr/bin/tailscale（因CORE_DIRS已包含）
           rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --warning=no-all $EXCLUDE_RULES
           if [ $? -eq 0 ]; then
-            echo "✅ Restored from WebDAV successfully"
+            echo "✅ Restored from WebDAV successfully (including /usr/bin/tailscale)"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
             # 仅删除本次恢复的快照文件和对应的元数据
             rclone delete mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf
@@ -195,6 +197,13 @@ jobs:
               echo "⚠️ CasaOS service restart failed, try manual start"
             fi
           fi
+          # 验证 tailscale 文件是否恢复成功
+          if [ -f "/usr/bin/tailscale" ]; then
+            echo "✅ /usr/bin/tailscale restored successfully"
+            sudo chmod +x /usr/bin/tailscale # 确保可执行权限
+          else
+            echo "⚠️ /usr/bin/tailscale not found after restore"
+          fi
 
       - name: Deploy Tailscale
         run: |
@@ -205,13 +214,18 @@ jobs:
             echo "⚠️ Missing Tailscale auth key, skip deployment"
             exit 0
           fi
-          # Install Tailscale dependencies and repo
-          sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          sudo chmod 0644 /usr/share/keyrings/tailscale-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo chmod 0644 /etc/apt/sources.list.d/tailscale.list
-          sudo apt update -y && sudo apt install -y tailscale
+          # 若恢复后已存在 tailscale，跳过重复安装
+          if [ -f "/usr/bin/tailscale" ]; then
+            echo "✅ /usr/bin/tailscale already exists, skip reinstall"
+          else
+            # Install Tailscale dependencies and repo
+            sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates
+            curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+            sudo chmod 0644 /usr/share/keyrings/tailscale-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+            sudo chmod 0644 /etc/apt/sources.list.d/tailscale.list
+            sudo apt update -y && sudo apt install -y tailscale
+          fi
           # Get Tailscale path to avoid sudo PATH issues
           TAILSCALE_PATH=$(which tailscale)
           if [ -z "$TAILSCALE_PATH" ]; then
@@ -278,12 +292,14 @@ jobs:
             sudo pkill -9 docker || true
             sync && sleep 5
             
+            # 检查 /usr/bin/tailscale 是否存在，不存在则跳过备份该文件
             for dir in $CORE_DIRS; do
-              if [ ! -d "$dir" ]; then
-                echo "⚠️ Directory $dir does not exist, skip backup"
+              if [ ! -d "$dir" ] && [ ! -f "$dir" ]; then
+                echo "⚠️ Path $dir does not exist, skip backup"
               fi
             done
             
+            # 备份时自动包含 /usr/bin/tailscale（因CORE_DIRS已包含）
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
@@ -304,7 +320,7 @@ jobs:
               return 1
             fi
             
-            echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
+            echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}') (includes /usr/bin/tailscale)"
             
             if ! sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" \
               --config /home/runner/.rclone.conf \
@@ -327,6 +343,7 @@ jobs:
             META_FILE="/tmp/snapshot_meta.txt"
             echo "snapshot_name=${SNAPSHOT_NAME}" > "${META_FILE}"
             echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"
+            echo "included_files=/usr/bin/tailscale" >> "${META_FILE}" # 标记包含tailscale
             sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
             
