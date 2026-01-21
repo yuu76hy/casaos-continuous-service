@@ -6,14 +6,13 @@ on:
     types: [renew_casaos_snapshot]
 
 jobs:
-  # ========== 核心修复：将中文job ID改为合规的英文ID ==========
   casaos_snapshot_backup_restore:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      CORE_DIRS: "/var/lib /DATA"
+      CORE_DIRS: "/var/lib /DATA /etc/casaos"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/overlay2/*/home/dependabot
         --exclude=/var/lib/docker/overlay2/*/vendor/ruby
@@ -68,7 +67,6 @@ jobs:
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
-          # 配置rclone
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav \
             url="$WEBDAV_URL" \
@@ -79,7 +77,6 @@ jobs:
           sudo chown runner:runner /home/runner/.rclone.conf
           sudo chmod 600 /home/runner/.rclone.conf
 
-          # 检查WebDAV连通性
           if ! rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
             echo "❌ WebDAV connection failed"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -88,11 +85,9 @@ jobs:
           echo "✅ WebDAV connected successfully (no mount mode)"
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
 
-          # 自动创建远程目录
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           echo "✅ Created remote directory: mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}"
 
-          # 读取自定义目录下的快照
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}')
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             LATEST_SNAPSHOT_FILENAME=$(echo "$REMOTE_SNAPSHOTS" | sort -r | head -n1)
@@ -115,7 +110,6 @@ jobs:
           sudo pkill -9 docker || true
           sync && sleep 3
 
-          # 恢复前校验快照是否可读取
           if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
             echo "❌ Remote snapshot is invalid or unreadable"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
@@ -123,7 +117,6 @@ jobs:
             exit 1
           fi
 
-          # 执行恢复
           rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --warning=no-all $EXCLUDE_RULES
           if [ $? -eq 0 ]; then
             echo "✅ Restore success from WebDAV"
@@ -170,7 +163,6 @@ jobs:
             echo "⚠️ Tailscale key missing, skip"
             exit 0
           fi
-          # 增加错误重试和日志
           for i in $(seq 1 2); do
             if curl -fsSL https://tailscale.com/install.sh | sudo bash; then
               break
@@ -194,7 +186,6 @@ jobs:
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
 
-          # 修复：curl添加--fail处理错误，优化续跑逻辑
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "❌ USER_PAT or REPO is empty"
@@ -221,24 +212,20 @@ jobs:
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
             echo "🔄 Creating snapshot: $SNAPSHOT_NAME (direct upload to WebDAV: ${REMOTE_PATH})"
 
-            # 停止服务打包
             sudo systemctl stop docker.service docker.socket casaos.service
             sudo systemctl mask docker.socket
             sudo pkill -9 docker || true
             sync && sleep 5
 
-            # 打包快照（修复：生成后修改权限为runner可读取）
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
               --warning=no-all \
               $EXCLUDE_RULES \
               $CORE_DIRS
-            # 核心修复：修改文件权限，让runner可读
             sudo chown runner:runner "${TMP_SNAPSHOT}"
             sudo chmod 644 "${TMP_SNAPSHOT}"
 
-            # 校验快照有效性
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
               echo "❌ Snapshot is empty or invalid (size < 1KB)"
               sudo systemctl unmask docker.socket
@@ -247,11 +234,9 @@ jobs:
             fi
             echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
 
-            # 上传快照（增加--mkdir确保目录存在）
             if ! sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" \
               --config /home/runner/.rclone.conf \
               --transfers 4 \
-              --mkdir \
               --header "Content-Type: application/xml; charset=utf-8" \
               --log-level INFO \
               --log-file /tmp/rclone_upload.log; then
@@ -264,16 +249,13 @@ jobs:
             fi
 
             echo "✅ Snapshot uploaded to WebDAV: ${REMOTE_PATH}"
-            # 生成并上传元信息
             META_FILE="/tmp/snapshot_meta.txt"
             echo "snapshot_name=${SNAPSHOT_NAME}" > "${META_FILE}"
             echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"
-            sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf --mkdir
+            sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
 
-            # 清理本地临时文件
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
             
-            # 清理自定义目录下1天前的快照
             echo "🔍 Dry run: cleaning snapshots older than 1 day..."
             sudo -u runner rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} \
               --config /home/runner/.rclone.conf \
@@ -287,19 +269,17 @@ jobs:
               --include "casaos-server-snapshot-*.tar.gz"
             echo "✅ Remote snapshots older than 1 day cleaned up in ${WEBDAV_SNAPSHOT_EN_DIR}"
 
-            # 恢复服务
             sudo systemctl unmask docker.socket
             sudo systemctl start docker.service docker.socket casaos.service
             return 0
           }
 
-          # 保活循环
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             echo "📊 Running for $run_mins minutes"
-            if [ $run_mins -ge 10 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
+            # ========== 核心修改：阈值改为 2 分钟 ==========
+            if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
               echo "⏰ Time to create and upload snapshot"
-              # 先执行备份，成功后再触发续跑
               if create_and_upload_snapshot; then
                 trigger_renew
               else
@@ -320,6 +300,5 @@ jobs:
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
           sudo systemctl unmask docker.socket || true
-          # 清理所有临时文件
           sudo rm -rf /tmp/casaos-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
           echo "✅ Cleanup completed"
