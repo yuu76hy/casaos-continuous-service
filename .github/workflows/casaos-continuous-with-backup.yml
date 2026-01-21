@@ -28,10 +28,8 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ github.repository }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      # 新增：Tailscale源配置（适配Ubuntu 24.04 noble）
       TAILSCALE_GPG_URL: "https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg"
       TAILSCALE_LIST_URL: "https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list"
-      # 新增：日志文件路径
       FIX_LOG_FILE: "/tmp/tailscale_fix_after_backup.log"
 
     steps:
@@ -47,7 +45,6 @@ jobs:
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          # 初始化修复日志
           sudo touch $FIX_LOG_FILE && sudo chmod 666 $FIX_LOG_FILE
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== 环境初始化完成 =====" | tee -a $FIX_LOG_FILE
           echo "✅ Env init completed"
@@ -98,11 +95,9 @@ jobs:
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           echo "✅ Created remote directory: mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}" | tee -a $FIX_LOG_FILE
 
-          # ========== 彻底修复路径重复问题 ==========
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             LATEST_SNAPSHOT_FILENAME=$(echo "$REMOTE_SNAPSHOTS" | head -n1)
-            # 强制拼接正确路径：目录+文件名，无重复
             LATEST_SNAPSHOT="${WEBDAV_SNAPSHOT_EN_DIR}/${LATEST_SNAPSHOT_FILENAME}"
             echo "✅ Found latest remote snapshot: ${LATEST_SNAPSHOT}" | tee -a $FIX_LOG_FILE
             echo "LATEST_SNAPSHOT=${LATEST_SNAPSHOT}" >> "$GITHUB_ENV"
@@ -184,74 +179,76 @@ jobs:
           echo "❌ Docker服务启动失败" | tee -a $FIX_LOG_FILE
           exit 1
 
-      - name: Fix APT/Dpkg Environment After Backup (关键修复步骤)
+      - name: Fix APT/Dpkg Environment After Backup
         run: |
           set -e
           export LC_ALL=zh_CN.UTF-8
           export LANG=en_US.UTF-8
           echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== 开始修复APT/Dpkg环境 =====" | tee -a $FIX_LOG_FILE
           
-          # 1. 修复dpkg数据库
           sudo dpkg --configure -a 2>&1 | tee -a $FIX_LOG_FILE
-          # 2. 修复依赖关系
           sudo apt --fix-broken install -y 2>&1 | tee -a $FIX_LOG_FILE
-          # 3. 强制更新软件包列表
           sudo apt update --fix-missing -y 2>&1 | tee -a $FIX_LOG_FILE
-          # 4. 清理缓存
           sudo apt clean && sudo apt autoclean 2>&1 | tee -a $FIX_LOG_FILE
           
-          # 5. 重置APT/Dpkg目录权限（备份恢复最易出问题的点）
-          echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== 重置目录权限 =====" | tee -a $FIX_LOG_FILE
           sudo chown -R root:root /var/lib/apt /var/lib/dpkg
           sudo chmod -R 755 /var/lib/apt/lists/
           sudo chmod 644 /etc/apt/sources.list.d/* || true
           
           echo "✅ APT/Dpkg环境修复完成" | tee -a $FIX_LOG_FILE
 
-      - name: Deploy Tailscale (整合修复逻辑)
+      - name: Deploy Tailscale (Auto Detect & Restart CasaOS+Tailscale)
         run: |
           set -e
           export LC_ALL=zh_CN.UTF-8
-          export LANG=en_US.UTF-8  # 切换英文避免源列表乱码
+          export LANG=en_US.UTF-8
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ Tailscale key missing, skip" | tee -a $FIX_LOG_FILE
             exit 0
           fi
 
-          echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== 开始安装Tailscale =====" | tee -a $FIX_LOG_FILE
-          # 1. 安装基础依赖
-          sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates 2>&1 | tee -a $FIX_LOG_FILE
-          
-          # 2. 重新添加Tailscale GPG密钥（避免备份覆盖）
-          sudo rm -f /usr/share/keyrings/tailscale-archive-keyring.gpg
-          curl -fsSL $TAILSCALE_GPG_URL | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          sudo chmod 0644 /usr/share/keyrings/tailscale-archive-keyring.gpg
-          
-          # 3. 重新添加Tailscale源列表（适配Ubuntu 24.04 noble）
-          sudo rm -f /etc/apt/sources.list.d/tailscale.list
-          curl -fsSL $TAILSCALE_LIST_URL | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo chmod 0644 /etc/apt/sources.list.d/tailscale.list
-          
-          # 4. 更新并安装Tailscale
-          sudo apt update -y 2>&1 | tee -a $FIX_LOG_FILE
-          sudo apt install -y tailscale 2>&1 | tee -a $FIX_LOG_FILE
-          
-          # 5. 查找tailscale绝对路径（解决sudo找不到命令问题）
+          # 1. 检测 Tailscale 是否已安装
           TAILSCALE_PATH=$(which tailscale)
           if [ -z "$TAILSCALE_PATH" ]; then
-            echo "❌ Tailscale 安装失败，未找到可执行文件" | tee -a $FIX_LOG_FILE
-            exit 0
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== Tailscale 未安装，开始自动安装 ======" | tee -a $FIX_LOG_FILE
+            # 安装依赖 + 添加源
+            sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates 2>&1 | tee -a $FIX_LOG_FILE
+            sudo rm -f /usr/share/keyrings/tailscale-archive-keyring.gpg /etc/apt/sources.list.d/tailscale.list
+            curl -fsSL $TAILSCALE_GPG_URL | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+            curl -fsSL $TAILSCALE_LIST_URL | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+            # 安装 Tailscale
+            sudo apt update -y && sudo apt install -y tailscale 2>&1 | tee -a $FIX_LOG_FILE
+            TAILSCALE_PATH=$(which tailscale)
+            if [ -z "$TAILSCALE_PATH" ]; then
+              echo "❌ Tailscale 安装失败" | tee -a $FIX_LOG_FILE
+              exit 0
+            fi
+            echo "✅ Tailscale 安装成功，路径: $TAILSCALE_PATH" | tee -a $FIX_LOG_FILE
+          else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===== 检测到 Tailscale 已安装，跳过安装直接重启 ======" | tee -a $FIX_LOG_FILE
           fi
-          echo "✅ Tailscale 安装路径：$TAILSCALE_PATH" | tee -a $FIX_LOG_FILE
 
-          # 6. 用绝对路径执行登录（避免sudo PATH问题）
+          # 2. 重启 CasaOS 服务
+          if systemctl list-unit-files | grep -q casaos.service; then
+            sudo systemctl stop casaos.service || echo "⚠️ CasaOS 服务未运行，跳过停止" | tee -a $FIX_LOG_FILE
+            sleep 3
+            sudo systemctl start casaos.service
+            echo "✅ CasaOS 服务重启成功" | tee -a $FIX_LOG_FILE
+          else
+            echo "⚠️ CasaOS 服务未安装，跳过重启" | tee -a $FIX_LOG_FILE
+          fi
+
+          # 3. 重启 Tailscale 服务 + 重新组网
+          sudo systemctl restart tailscaled || sudo "$TAILSCALE_PATH" daemon restart
+          sleep 5
           if ! sudo "$TAILSCALE_PATH" up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}"; then
-            echo "❌ Tailscale login failed" | tee -a $FIX_LOG_FILE
+            echo "❌ Tailscale 登录失败" | tee -a $FIX_LOG_FILE
             sudo "$TAILSCALE_PATH" status 2>&1 | tee -a $FIX_LOG_FILE
             exit 0
           fi
+
           TAILSCALE_IP=$(sudo "$TAILSCALE_PATH" ip -4)
-          echo "✅ Tailscale IP: $TAILSCALE_IP" | tee -a $FIX_LOG_FILE
+          echo "✅ Tailscale 重启组网成功，IP: $TAILSCALE_IP" | tee -a $FIX_LOG_FILE
 
       - name: Create Snapshot & Direct Upload to WebDAV
         shell: bash
@@ -394,7 +391,6 @@ jobs:
           export LANG=zh_CN.UTF-8
           sudo systemctl unmask docker.socket || true
           sudo rm -rf /tmp/casaos-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
-          # 上传修复日志供排查
           cp $FIX_LOG_FILE /tmp/tailscale_fix_log_${{ github.run_id }}.log
           echo "✅ Cleanup completed"
           
