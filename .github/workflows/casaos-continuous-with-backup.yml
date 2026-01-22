@@ -40,13 +40,13 @@ jobs:
       - name: 环境初始化与依赖安装
         run: |
           set -e
-          # 配置可靠DNS，解决解析问题
+          # 配置可靠DNS
           sudo rm -f /etc/resolv.conf
           echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
           echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
           sudo chmod 644 /etc/resolv.conf
           
-          # 更新并安装依赖
+          # 更新并安装基础依赖
           sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils
           sudo locale-gen zh_CN.UTF-8
           export LC_ALL=zh_CN.UTF-8
@@ -125,10 +125,13 @@ jobs:
             sudo systemctl stop 1panel.service || echo "⚠️1Panel服务未运行"
           fi
           if systemctl list-unit-files | grep -q docker.service; then
-            sudo systemctl stop docker.service docker.socket || echo "⚠️Docker服务未运行"
+            sudo systemctl stop docker.service || echo "⚠️Docker服务未运行"
           fi
           
-          sudo systemctl mask docker.socket
+          # 避免操作不存在的docker.socket
+          if systemctl list-unit-files | grep -q docker.socket; then
+            sudo systemctl mask docker.socket || true
+          fi
           sudo pkill -9 docker 1panel || true
           sync && sleep 3
           
@@ -136,7 +139,8 @@ jobs:
           if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
             echo "❌快照无效或无法读取"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
-            sudo systemctl unmask docker.socket
+            # 仅当socket存在时unmask
+            systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
             exit 1
           fi
           
@@ -151,7 +155,8 @@ jobs:
             echo "❌1Panel快照恢复失败"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
           fi
-          sudo systemctl unmask docker.socket
+          # 仅当socket存在时unmask
+          systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
 
       - name: 清理1Panel残留（恢复失败时执行）
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
@@ -165,11 +170,14 @@ jobs:
             sudo systemctl disable 1panel.service || true
           fi
           if systemctl list-unit-files | grep -q docker.service; then
-            sudo systemctl stop docker.service docker.socket || true
-            sudo systemctl disable docker.service docker.socket || true
+            sudo systemctl stop docker.service || true
+            sudo systemctl disable docker.service || true
           fi
           
-          sudo systemctl mask docker.socket
+          # 仅当socket存在时mask
+          if systemctl list-unit-files | grep -q docker.socket; then
+            sudo systemctl mask docker.socket || true
+          fi
           sudo pkill -9 docker 1panel || true
           sync && sleep 3
           
@@ -182,33 +190,58 @@ jobs:
             echo "⚠️Docker未运行，跳过容器/镜像清理"
           fi
           
-          # 清理1Panel和Docker文件（1Panel非apt安装，无需apt purge）
+          # 清理1Panel和Docker文件
           sudo rm -rf /opt/1panel /etc/1panel /var/log/1panel /usr/bin/1panel /usr/lib/systemd/system/1panel*
           sudo rm -rf /var/lib/docker /etc/docker /DATA/1panel* /tmp/1panel*
           
-          # 仅清理已安装的Docker包（避免无意义报错）
+          # 仅清理已安装的Docker包
           dpkg -l | grep -q docker && sudo apt purge -y docker* containerd* runc* || true
           sudo apt autoremove -y && sudo apt clean
           
-          sudo systemctl unmask docker.socket
+          # 仅当socket存在时unmask
+          systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
           echo "✅1Panel残留已清除"
 
-      - name: 全新安装1Panel（恢复失败时执行）
+      - name: 安装Docker环境（仅恢复失败时执行）
+        if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
+        run: |
+          set -e
+          echo "===== 安装Docker环境 ====="
+          # 安装Docker依赖
+          sudo apt update -y
+          sudo apt install -y ca-certificates curl gnupg lsb-release
+          # 添加Docker官方GPG密钥
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+          # 添加Docker源
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          # 安装Docker引擎
+          sudo apt update -y
+          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          # 启动Docker服务
+          if systemctl list-unit-files | grep -q docker.socket; then
+            sudo systemctl unmask docker.socket || true
+          fi
+          sudo systemctl enable --now docker.service
+          sleep 10
+          # 验证Docker启动
+          if ! sudo systemctl is-active --quiet docker; then
+            echo "❌Docker启动失败，打印状态："
+            sudo systemctl status docker --no-pager
+            exit 1
+          fi
+          echo "✅ Docker安装并启动成功"
+
+      - name: 全新安装1Panel（仅恢复失败时执行）
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
         run: |
           set -e
           echo "===== 安装1Panel ====="
-          
-          # 先启动Docker（1Panel依赖Docker）
-          sudo systemctl unmask docker.socket
-          sudo systemctl enable --now docker.service docker.socket
-          sleep 10
+          # 直接使用已安装的Docker环境
           if ! sudo systemctl is-active --quiet docker; then
-            echo "❌Docker启动失败，无法安装1Panel"
+            echo "❌Docker未运行，无法安装1Panel"
             exit 1
           fi
-          
-          # 1Panel官方安装地址（修复核心DNS解析问题）
+          # 安装1Panel（官方地址）
           curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash - || {
             echo "❌1Panel安装失败，打印安装日志："
             cat /tmp/1panel-install.log 2>/dev/null || true
@@ -231,15 +264,17 @@ jobs:
             exit 1
           fi
 
-      - name: 重启1Panel服务（恢复成功时执行）
+      - name: 重启1Panel服务（仅恢复成功时执行）
         if: ${{ env.SNAPSHOT_RESTORED == 'true' }}
         run: |
           set -e
-          sudo systemctl unmask docker.socket
+          echo "===== 重启1Panel服务（复用快照环境） ====="
+          # 仅当socket存在时unmask
+          systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
           sudo systemctl daemon-reload
           
-          # 启动Docker
-          sudo systemctl enable --now docker.service docker.socket
+          # 启动Docker（复用快照中的Docker）
+          sudo systemctl enable --now docker.service
           sleep 10
           if ! sudo systemctl is-active --quiet docker; then
             echo "❌Docker服务启动失败"
@@ -338,9 +373,10 @@ jobs:
             
             # 仅当服务存在时停止
             systemctl list-unit-files | grep -q 1panel.service && sudo systemctl stop 1panel.service || true
-            systemctl list-unit-files | grep -q docker.service && sudo systemctl stop docker.service docker.socket || true
+            systemctl list-unit-files | grep -q docker.service && sudo systemctl stop docker.service || true
             
-            sudo systemctl mask docker.socket
+            # 仅当socket存在时mask
+            systemctl list-unit-files | grep -q docker.socket && sudo systemctl mask docker.socket || true
             sudo pkill -9 docker 1panel || true
             sync && sleep 5
             
@@ -356,8 +392,9 @@ jobs:
             
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
               echo "❌快照无效（大小<1KB）"
-              sudo systemctl unmask docker.socket
-              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service docker.socket || true
+              # 仅当socket存在时unmask
+              systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
+              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
               systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
               return 1
             fi
@@ -367,8 +404,9 @@ jobs:
               echo "❌快照上传失败，查看日志：/tmp/rclone_upload.log"
               cat /tmp/rclone_upload.log || true
               rm -f "${TMP_SNAPSHOT}"
-              sudo systemctl unmask docker.socket
-              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service docker.socket || true
+              # 仅当socket存在时unmask
+              systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
+              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
               systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
               return 1
             fi
@@ -379,8 +417,9 @@ jobs:
             sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
             
-            sudo systemctl unmask docker.socket
-            systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service docker.socket || true
+            # 仅当socket存在时unmask
+            systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
+            systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
             systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
             return 0
           }
@@ -410,6 +449,7 @@ jobs:
         if: ${{ always() }}
         run: |
           set -e
-          sudo systemctl unmask docker.socket || true
+          # 仅当socket存在时unmask
+          systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
           sudo rm -rf /tmp/1panel-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
           echo "✅临时文件清理完成"
