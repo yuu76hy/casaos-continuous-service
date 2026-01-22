@@ -12,8 +12,13 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      # 🔴 新增关键目录：确保Docker/1Panel运行依赖全备份
-      CORE_DIRS: "/var/lib/docker /etc/docker /opt/1panel /usr/bin/1panel /etc/systemd/system /DATA /var/run/docker.sock /usr/lib/systemd/system/docker* /usr/lib/systemd/system/1panel* /etc/default/docker /var/log/docker /var/log/1panel"
+      # 🔴 跨设备直接启动核心：新增Docker/1Panel所有依赖目录，包含用户、权限、服务自启配置
+      CORE_DIRS: |
+        /var/lib/docker /etc/docker /opt/1panel /usr/bin/1panel /etc/systemd/system 
+        /DATA /var/run/docker.sock /usr/lib/systemd/system/docker* /usr/lib/systemd/system/1panel*
+        /etc/default/docker /var/log/docker /var/log/1panel /var/lib/docker/networks /var/lib/docker/plugins
+        /opt/1panel/db /opt/1panel/cert /opt/1panel/conf /etc/passwd /etc/group /etc/sudoers.d
+        /usr/lib/systemd/system/containerd.service /etc/containerd
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
         --exclude=/var/lib/docker/overlay2/*/tmp
@@ -37,6 +42,10 @@ jobs:
       REPO: ${{ github.repository }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       WEBDAV_AVAILABLE: "true"
+      RETRY_COUNT: 3
+      TRANSFERS: 8
+      # 🔴 仅保留最近2个备份
+      KEEP_LATEST_SNAPSHOTS: 2
 
     steps:
       - name: 环境初始化与依赖安装
@@ -96,12 +105,22 @@ jobs:
           rclone config create mywebdav webdav URL="$WEBDAV_URL" vendor="webdav" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf
           sudo chown runner:runner /home/runner/.rclone.conf
           sudo chmod 600 /home/runner/.rclone.conf
-          if ! rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-            echo "❌WebDAV连接失败"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          echo "✅WebDAV已连接"
+          
+          for i in $(seq 1 $RETRY_COUNT); do
+            if rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+              echo "✅WebDAV已连接"
+              break
+            else
+              echo "⚠️WebDAV连接失败，第 $i 次重试..."
+              sleep 5
+              if [ $i -eq $RETRY_COUNT ]; then
+                echo "❌WebDAV连接失败（已重试$RETRY_COUNT次）"
+                echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+                exit 0
+              fi
+            fi
+          done
+          
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "1panel-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
@@ -121,38 +140,48 @@ jobs:
           export LANG=zh_CN.UTF-8
           echo "===== 恢复完整快照：$LATEST_SNAPSHOT ====="
           
-          # 🔴 停止所有相关服务，避免文件占用
           sudo systemctl stop 1panel docker containerd docker.socket 2>/dev/null || true
           sudo systemctl unmask docker.socket 2>/dev/null || true
           sudo pkill -9 docker 1panel containerd 2>/dev/null || true
           sync && sleep 5
           
-          # 🔴 验证快照完整性（检查核心文件签名）
-          if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | tar -tzf - | grep -q "/var/lib/docker/image"; then
-            echo "❌快照不完整：缺失Docker镜像数据"
-            echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
-            exit 1
-          fi
-          if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | tar -tzf - | grep -q "/opt/1panel/server"; then
-            echo "❌快照不完整：缺失1Panel核心程序"
-            echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
-            exit 1
-          fi
+          # 🔴 跨设备校验：确保包含用户、配置、证书等核心数据
+          CHECK_ITEMS=(
+            "/opt/1panel/db" "/opt/1panel/cert" "/var/lib/docker/volumes"
+            "/etc/passwd" "/usr/lib/systemd/system/docker.service"
+          )
+          for item in "${CHECK_ITEMS[@]}"; do
+            if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | tar -tzf - | grep -q "$item"; then
+              echo "❌快照不完整：缺失 $item"
+              echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
+              exit 1
+            fi
+          done
           
-          # 🔴 恢复快照：保留所有权限、SELinux上下文、硬链接
-          rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / \
-            --overwrite --ignore-failed-read --warning=no-all \
-            --preserve-permissions --preserve-owner --preserve-links --absolute-names \
-            $EXCLUDE_RULES
+          RESTORE_SUCCESS="false"
+          for i in $(seq 1 $RETRY_COUNT); do
+            echo "开始第 $i 次恢复尝试..."
+            if rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / \
+              --overwrite --ignore-failed-read --warning=no-all \
+              --preserve-permissions --preserve-owner --preserve-links --absolute-names \
+              --preserve-context --same-owner $EXCLUDE_RULES; then
+              RESTORE_SUCCESS="true"
+              break
+            else
+              echo "⚠️第 $i 次恢复失败，5秒后重试..."
+              sleep 5
+            fi
+          done
           
-          if [ $? -eq 0 ]; then
+          if [ "$RESTORE_SUCCESS" == "true" ]; then
             echo "✅1Panel&Docker快照恢复成功"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            # 🔴 修复systemd服务配置权限
-            sudo chown root:root /usr/lib/systemd/system/docker* /usr/lib/systemd/system/1panel*
-            sudo chmod 644 /usr/lib/systemd/system/docker* /usr/lib/systemd/system/1panel*
+            # 🔴 跨设备自启核心：修复服务权限+设置开机自启
+            sudo chown root:root /usr/lib/systemd/system/docker* /usr/lib/systemd/system/1panel* /usr/lib/systemd/system/containerd*
+            sudo chmod 644 /usr/lib/systemd/system/docker* /usr/lib/systemd/system/1panel* /usr/lib/systemd/system/containerd*
+            sudo systemctl enable docker.service containerd.service 1panel.service --now
           else
-            echo "❌快照恢复失败"
+            echo "❌快照恢复失败（已重试$RETRY_COUNT次）"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
           fi
 
@@ -169,10 +198,11 @@ jobs:
             sudo docker rm -f $(sudo docker ps -aq) 2>/dev/null || true
             sudo docker rmi -f $(sudo docker images -aq) 2>/dev/null || true
             sudo docker volume rm -f $(sudo docker volume ls -q) 2>/dev/null || true
+            sudo docker network rm $(sudo docker network ls -q) 2>/dev/null || true
           fi
           
           sudo rm -rf /opt/1panel /etc/1panel /var/log/1panel /usr/bin/1panel /usr/lib/systemd/system/1panel*
-          sudo rm -rf /var/lib/docker /etc/docker /usr/lib/systemd/system/docker* /etc/default/docker
+          sudo rm -rf /var/lib/docker /etc/docker /usr/lib/systemd/system/docker* /etc/default/docker /etc/containerd
           sudo rm -rf /DATA/1panel* /tmp/1panel*
           
           dpkg -l | grep -q docker && sudo apt purge -y docker* containerd* runc* || true
@@ -183,7 +213,6 @@ jobs:
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
         run: |
           set -e
-          # 安装Docker
           sudo apt update -y
           sudo apt install -y ca-certificates curl gnupg lsb-release
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
@@ -197,7 +226,6 @@ jobs:
           sudo systemctl enable --now docker.socket docker.service
           sleep 10
           
-          # 安装1Panel
           if sudo systemctl is-active --quiet docker; then
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash - || {
               cat /tmp/1panel-install.log 2>/dev/null || true
@@ -216,23 +244,22 @@ jobs:
         run: |
           set -e
           echo "===== 一键重启Docker&1Panel服务 ====="
-          # 🔴 重置systemd状态+重载配置
           sudo systemctl daemon-reload
-          sudo systemctl reset-failed docker.service 1panel.service
+          sudo systemctl reset-failed docker.service containerd.service 1panel.service
           
-          # 🔴 按依赖顺序启动：先启动docker.socket → docker → 1panel
-          sudo systemctl enable --now docker.socket
+          # 🔴 跨设备启动顺序：containerd → docker → 1panel
+          sudo systemctl enable --now containerd.service
           sleep 3
-          sudo systemctl enable --now docker.service
+          sudo systemctl enable --now docker.socket docker.service
           sleep 5
           sudo systemctl enable --now 1panel.service
           sleep 5
           
-          # 🔴 验证启动状态
           if sudo systemctl is-active --quiet docker.service && sudo systemctl is-active --quiet 1panel.service; then
-            echo "✅✅Docker&1Panel已正常启动！"
+            echo "✅✅Docker&1Panel已正常启动！跨设备无需额外配置"
             echo "Docker状态: $(sudo systemctl status docker.service --no-pager | grep Active)"
             echo "1Panel状态: $(sudo systemctl status 1panel.service --no-pager | grep Active)"
+            echo "1Panel访问地址可执行: sudo 1panel status 查看"
           else
             echo "❌启动异常，尝试修复..."
             sudo 1panel repair
@@ -265,7 +292,7 @@ jobs:
           fi
           echo "✅Tailscale IP: $(sudo "$TAILSCALE_PATH" ip -4)"
 
-      - name: 创建Docker&1Panel完整备份（含所有数据）
+      - name: 创建Docker&1Panel完整备份（跨设备直接启动版）
         shell: bash
         run: |
           set -e
@@ -273,12 +300,11 @@ jobs:
           export LANG=zh_CN.UTF-8
           if [ "${WEBDAV_AVAILABLE}" != "true" ]; then exit 0; fi
           
-          # 🔴 停止服务确保数据一致性
           sudo systemctl stop 1panel docker containerd docker.socket 2>/dev/null || true
           sudo pkill -9 docker 1panel containerd 2>/dev/null || true
           sync && sleep 5
           
-          # 🔴 过滤有效目录，确保备份完整
+          # 过滤有效目录，确保跨设备备份完整性
           VALID_CORE_DIRS=""
           for dir in $CORE_DIRS; do
             if [ -d "$dir" ] || [ -f "$dir" ]; then
@@ -292,50 +318,80 @@ jobs:
             exit 1
           fi
           
-          # 🔴 创建完整快照（含权限、硬链接、SELinux）
           SNAPSHOT_NAME="1panel-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
+          # 🔴 跨设备备份核心：添加--same-owner --preserve-context 保留所有权限和SELinux上下文
           sudo tar -czf "${TMP_SNAPSHOT}" \
             --absolute-names --ignore-failed-read --warning=no-all \
             --preserve-permissions --preserve-owner --preserve-links \
-            $EXCLUDE_RULES $VALID_CORE_DIRS
+            --same-owner --preserve-context $EXCLUDE_RULES $VALID_CORE_DIRS
           sudo chown runner:runner "${TMP_SNAPSHOT}"
           sudo chmod 644 "${TMP_SNAPSHOT}"
           
-          # 🔴 双重校验快照完整性
+          # 跨设备校验：确保备份大小和核心数据存在
           if [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 10240 ]; then
             echo "❌快照过小，备份失败"
             sudo systemctl start docker 1panel 2>/dev/null || true
             exit 1
           fi
-          if ! tar -tzf "${TMP_SNAPSHOT}" | grep -q "/var/lib/docker/volumes"; then
-            echo "❌快照缺失Docker卷数据"
+          if ! tar -tzf "${TMP_SNAPSHOT}" | grep -q "/opt/1panel/db" || ! tar -tzf "${TMP_SNAPSHOT}" | grep -q "/var/lib/docker/volumes"; then
+            echo "❌快照缺失核心数据，备份失败"
             sudo systemctl start docker 1panel 2>/dev/null || true
             exit 1
           fi
           
-          # 🔴 上传到WebDAV
+          # 断点续传上传
+          UPLOAD_SUCCESS="false"
           REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
-          if ! sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" --config /home/runner/.rclone.conf --transfers 4 --progress; then
-            echo "❌上传失败"
+          for i in $(seq 1 $RETRY_COUNT); do
+            echo "开始第 $i 次上传尝试..."
+            if sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" \
+              --config /home/runner/.rclone.conf \
+              --transfers ${TRANSFERS} \
+              --progress \
+              --checksum \
+              --retries 3; then
+              UPLOAD_SUCCESS="true"
+              break
+            else
+              echo "⚠️第 $i 次上传失败，5秒后重试..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "❌备份上传失败（已重试$RETRY_COUNT次）"
             rm -f "${TMP_SNAPSHOT}"
             sudo systemctl start docker 1panel 2>/dev/null || true
             exit 1
           fi
           
-          # 🔴 生成备份元数据
+          # 生成跨设备备份元数据
           META_FILE="/tmp/snapshot_meta.txt"
           echo "snapshot_name=${SNAPSHOT_NAME}" > "${META_FILE}"
           echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"
           echo "snapshot_size=$(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')" >> "${META_FILE}"
           echo "docker_version=$(docker -v | awk '{print $3}' | sed 's/,//g')" >> "${META_FILE}"
           echo "1panel_version=$(1panel -v | awk '{print $3}')" >> "${META_FILE}"
+          echo "cross_device_support=true" >> "${META_FILE}"
           sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
           
-          # 🔴 启动服务+清理临时文件
-          sudo systemctl start docker 1panel 2>/dev/null || true
+          # 🔴 仅保留最近2个备份，自动删除更早的
+          echo "开始清理旧备份，保留最近${KEEP_LATEST_SNAPSHOTS}个..."
+          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "1panel-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
+          SNAPSHOTS_TO_DELETE=$(echo "$REMOTE_SNAPSHOTS" | tail -n +$((KEEP_LATEST_SNAPSHOTS + 1)))
+          if [ -n "$SNAPSHOTS_TO_DELETE" ]; then
+            while IFS= read -r snap; do
+              echo "删除旧备份: $snap"
+              rclone delete "mywebdav:$snap" --config /home/runner/.rclone.conf
+            done <<< "$SNAPSHOTS_TO_DELETE"
+          else
+            echo "无旧备份需要清理"
+          fi
+          
+          sudo systemctl start docker 1panel containerd 2>/dev/null || true
           rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
-          echo "✅✅完整备份已创建并上传：${SNAPSHOT_NAME}（大小：$(du -sh /tmp/${SNAPSHOT_NAME} 2>/dev/null | awk '{print $1}')）"
+          echo "✅✅跨设备完整备份已创建并上传：${SNAPSHOT_NAME}"
 
       - name: 清理临时文件
         if: ${{ always() }}
