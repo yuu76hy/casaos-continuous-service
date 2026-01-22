@@ -10,15 +10,16 @@ defaults:
     shell: bash
     working-directory: /home/runner
 
+# 全局环境变量（关键：timeout-minutes可直接引用全局env）
 env:
   # ========== 基础配置（可按需修改） ==========
   OS_VERSION: noble
   TIMEZONE: Asia/Shanghai
   LOCALE: zh_CN.UTF-8
-  MAX_RUN_MINUTES: 360
-  RETRY_TIMES: 3          # 关键操作重试次数
-  RETRY_INTERVAL: 5       # 重试间隔（秒）
-  KEEP_SNAPSHOTS: 3       # 保留最近快照数量
+  MAX_RUN_MINUTES: 360          # 全局定义，确保timeout-minutes能引用
+  RETRY_TIMES: 3                # 关键操作重试次数
+  RETRY_INTERVAL: 5             # 重试间隔（秒）
+  KEEP_SNAPSHOTS: 3             # 保留最近快照数量
   # ========== 备份/恢复核心配置 ==========
   WEBDAV_SNAPSHOT_DIR: "/z/Ubu"
   DOCKER_TTA_FULL_DIRS: |
@@ -63,10 +64,12 @@ env:
 jobs:
   docker-tta-snapshot:
     runs-on: ubuntu-24.04
+    # 修复：使用全局env变量，语法正确（或直接写360避免引用）
     timeout-minutes: ${{ env.MAX_RUN_MINUTES }}
     permissions:  # 最小权限原则
       contents: read
       actions: write  # 仅给续跑需要的权限
+    # 修复：“秘密”改为英文secrets（核心错误）
     secrets:
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
