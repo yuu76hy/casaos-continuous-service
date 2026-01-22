@@ -55,6 +55,7 @@ jobs:
           echo "✅ Check Network Connectivity..."
           curl -fsSL https://github.com >/dev/null 2>&1 || { echo "❌ Can't Connect to GitHub"; exit 1; }
           echo "✅ Env Initialization Completed"
+
       - name: 2. Create roots Admin User
         run: |
           set -e
@@ -66,6 +67,7 @@ jobs:
           else
             echo "ℹ️ roots User Exists, Skip"
           fi
+
       - name: 3. Configure WebDAV (Rclone)
         id: webdav-config
         run: |
@@ -86,7 +88,7 @@ jobs:
             exit 0
           fi
           
-          # 彻底修复路径：清理目录末尾/ + 仅提取快照文件名（避免重复拼接）
+          # 清理目录末尾/ + 仅提取快照文件名（避免重复拼接）
           WEBDAV_SNAPSHOT_DIR_CLEAN=$(echo "$WEBDAV_SNAPSHOT_DIR" | sed 's/\/$//')
           LATEST_SNAPSHOT=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN} --config /home/runner/.rclone.conf | grep "1panel-snapshot-.*.tar.gz" | awk -F '/' '{print $NF}' | sort -r | head -n1)
           
@@ -98,6 +100,7 @@ jobs:
           fi
           echo "webdav_available=true" >> "$GITHUB_OUTPUT"
           echo "WEBDAV_SNAPSHOT_DIR_CLEAN=${WEBDAV_SNAPSHOT_DIR_CLEAN}" >> "$GITHUB_ENV"
+
       - name: 4. Restore Snapshot from WebDAV
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
         id: restore
@@ -119,7 +122,7 @@ jobs:
           
           TEMP_SNAPSHOT="/tmp/snapshot.tar.gz"
           rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf > "$TEMP_SNAPSHOT"
-          # GNU tar兼容参数：-p(保留权限) + --same-owner(保留所有者)，反斜杠后无空格
+          # 解压快照：保留权限/所有者，覆盖现有文件
           sudo tar -xzf "$TEMP_SNAPSHOT" -C / \
             --overwrite \
             --ignore-failed-read \
@@ -127,15 +130,25 @@ jobs:
             --same-owner
           rm -f "$TEMP_SNAPSHOT"
           
+          # 核心修复：统一1Panel路径 + 修正systemd服务文件（解决203/EXEC基础问题）
+          sudo rm -f /usr/bin/1panel
+          sudo ln -s /usr/local/bin/1panel /usr/bin/1panel 2>/dev/null || true
+          if [ -f "/etc/systemd/system/1panel.service" ]; then
+            sudo sed -i 's|ExecStart=/usr/bin/1panel|ExecStart=/usr/local/bin/1panel|g' /etc/systemd/system/1panel.service
+          fi
+          
+          # 重装Docker保证环境一致性
           sudo apt purge -y moby* containerd* runc* docker* -y || true
           sudo apt autoremove -y && sudo apt clean
           curl -fsSL https://get.docker.com | sudo bash
           
+          # 删除远端旧快照和元数据
           rclone delete mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf
           rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt --config /home/runner/.rclone.conf
           
           echo "✅ Snapshot Restored Successfully"
           echo "restore_success=true" >> "$GITHUB_OUTPUT"
+
       - name: 5. Clean Residues (Restore Failed)
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
@@ -153,8 +166,9 @@ jobs:
           
           sudo apt purge -y docker* moby* containerd* runc* 1panel* -y || true
           sudo apt autoremove -y && sudo apt clean
-          sudo rm -rf /opt/1panel /etc/1panel /usr/local/bin/1panel /var/lib/docker /etc/docker /var/lib/containerd /DATA/*
+          sudo rm -rf /opt/1panel /etc/1panel /usr/local/bin/1panel /usr/bin/1panel /var/lib/docker /etc/docker /var/lib/containerd /DATA/*
           echo "✅ Residues Cleaned Completed"
+
       - name: 6. Install Docker+1Panel (No Snapshot/Restore Failed)
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
@@ -177,18 +191,22 @@ jobs:
           
           echo "===== Install 1Panel ====="
           curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -
+          # 安装后直接统一路径，避免后续203错误
+          sudo rm -f /usr/bin/1panel
+          sudo ln -s /usr/local/bin/1panel /usr/bin/1panel 2>/dev/null || true
           sleep 5
           if ! sudo systemctl is-active --quiet 1panel; then
             sudo 1panel repair
           fi
           echo "✅ 1Panel Installed Completed"
+
       - name: 7. Restart Services (Restore Success)
         if: ${{ steps.restore.outputs.restore_success == 'true' }}
         run: |
           set -e
           echo "===== Restart 1Panel/Docker Services ====="
           
-          # 步骤1：修复并启动Docker/containerd依赖服务
+          # 修复Docker/containerd服务状态
           for service in docker.service containerd.service; do
             if sudo systemctl list-unit-files --type=service | grep -q "$service"; then
               sudo systemctl reset-failed "$service" 2>/dev/null || true
@@ -197,38 +215,48 @@ jobs:
           sudo systemctl daemon-reload && sleep 15
           sudo systemctl enable --now containerd.service 2>/dev/null || true && sleep 3
           sudo systemctl enable --now docker.service 2>/dev/null || true && sleep 10
-          # 步骤2：核心修复1Panel status=203/EXEC执行失败（保留数据，仅修复程序）
+          
+          # 彻底修复203/EXEC错误：路径+权限+架构+服务文件四重校验
           echo "===== Fix 1Panel EXEC 203 Error ====="
-          # 检查1Panel主程序是否存在
+          # 1. 强制统一可执行文件路径
+          sudo rm -f /usr/bin/1panel
+          sudo ln -s /usr/local/bin/1panel /usr/bin/1panel 2>/dev/null || true
+          # 2. 检查主程序是否存在，不存在则修复安装
           if [ ! -f "/usr/local/bin/1panel" ]; then
             echo "⚠️ /usr/local/bin/1panel not found, reinstall main program (keep data)"
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
           else
-            # 修复可执行权限
+            # 3. 修复可执行权限（双路径都赋权）
             echo "✅ Fix 1Panel execute permission"
-            sudo chmod +x /usr/local/bin/1panel
-            # 检查架构兼容性（GitHub Actions为x86_64，过滤ARM架构）
-            if file /usr/local/bin/1panel | grep -qi "arm\|aarch64"; then
-              echo "⚠️ 1Panel is ARM architecture, incompatible with x86_64 runner, reinstall"
-              sudo rm -f /usr/local/bin/1panel
+            sudo chmod +x /usr/local/bin/1panel /usr/bin/1panel
+            # 4. 强校验架构兼容性（x86_64 Runner不兼容ARM/AARCH64）
+            PANEL_ARCH=$(file /usr/local/bin/1panel | grep -oE 'x86-64|ARM|aarch64')
+            RUNNER_ARCH=$(uname -m)
+            if [ "$PANEL_ARCH" != "x86-64" ] && [ "$RUNNER_ARCH" = "x86_64" ]; then
+              echo "⚠️ 1Panel arch ($PANEL_ARCH) incompatible with runner ($RUNNER_ARCH), reinstall x86_64 version"
+              sudo rm -f /usr/local/bin/1panel /usr/bin/1panel
               curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
             fi
           fi
-          # 步骤3：重新注册并启动1panel.service
-          if ! sudo systemctl list-unit-files --type=service | grep -q "1panel.service"; then
+          
+          # 修正并重载systemd服务文件
+          if [ -f "/etc/systemd/system/1panel.service" ]; then
+            sudo sed -i 's|ExecStart=/usr/bin/1panel|ExecStart=/usr/local/bin/1panel|g' /etc/systemd/system/1panel.service
+          else
             echo "✅ Regenerate 1panel.service file"
             sudo 1panel repair 2>/dev/null || true
-            sudo systemctl daemon-reload
           fi
+          sudo systemctl daemon-reload  # 必须重载，否则服务配置修改不生效
           sudo systemctl enable --now 1panel.service 2>/dev/null || true && sleep 10
-          # 步骤4：状态校验（带重试机制，避免启动延迟）
+          
+          # 服务状态校验：带重试机制，提升容错性
           echo "===== Check Service Status ====="
-          # 强制校验Docker状态
+          # 校验Docker状态
           if ! sudo systemctl is-active --quiet docker; then
             echo "❌ Docker Start Failed：$(sudo journalctl -xeu docker.service --no-pager | head -20)"
             exit 1
           fi
-          # 1Panel多轮重试校验，提升容错性
+          # 1Panel多轮重试（解决启动延迟问题）
           panel_active=false
           for retry in {1..3}; do
             if sudo systemctl is-active --quiet 1panel; then
@@ -239,10 +267,14 @@ jobs:
             sudo systemctl restart 1panel
             sleep 5
           done
-          # 最终兜底：重试失败则重装1Panel（保留数据）
+          # 最终兜底：重试失败则再次修复安装（保留数据）
           if [ "$panel_active" = "false" ]; then
             echo "⚠️ 1Panel start failed, final repair (keep DATA/opt/1panel)"
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
+            # 修复后再次统一路径
+            sudo rm -f /usr/bin/1panel
+            sudo ln -s /usr/local/bin/1panel /usr/bin/1panel
+            sudo systemctl daemon-reload
             sleep 5
             if ! sudo systemctl is-active --quiet 1panel; then
               echo "❌ 1Panel Start Failed：$(sudo journalctl -xeu 1panel.service --no-pager | head -20)"
@@ -250,26 +282,29 @@ jobs:
             fi
           fi
           echo "✅ All Services Restarted Successfully"
+
       - name: 8. Deploy Tailscale (Optional)
         run: |
-          set -e
+          set -e 
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Missing Tailscale Auth Key, Skip"
-            exit 0
-          fi
+            echo "⚠️ 缺少Tailscale授权密钥，跳过"
+            exit 0 
+          fi 
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list
           sudo apt update -y && sudo apt install -y tailscale
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="1panel-snapshot-${{ github.run_id }}"
           echo "✅ Tailscale IP：$(sudo tailscale ip -4)"
+
       - name: 9. Create Snapshot + Upload WebDAV + Trigger Renew
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' }}
         run: |
-          set -e
-          start_time=$(date +%s)
-          RENEW_TRIGGERED=false
+          set -e 
+          start_time=$(date +%s) 
+          RENEW_TRIGGERED=false 
           
-          stop_old_containers() {
+          # 清理旧容器函数
+          stop_old_containers() { 
             if sudo docker info >/dev/null 2>&1; then
               OLD_CONTAINERS=$(sudo docker ps -aq)
               if [ -n "$OLD_CONTAINERS" ]; then
@@ -280,6 +315,7 @@ jobs:
             fi
           }
           
+          # 触发续跑函数
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "❌ Missing PAT/Repository Info"
@@ -299,7 +335,9 @@ jobs:
             fi
           }
           
+          # 创建快照并上传函数
           create_snapshot() {
+            # 过滤有效备份路径
             VALID_DIRS=""
             for dir in $CORE_BACKUP_DIRS; do
               if [ -d "$dir" ] || [ -f "$dir" ]; then
@@ -313,15 +351,17 @@ jobs:
               return 1
             fi
             
+            # 定义快照文件名和路径
             SNAPSHOT_NAME="1panel-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/$SNAPSHOT_NAME"
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/$SNAPSHOT_NAME"
             
+            # 停止服务后创建快照
             sudo systemctl stop 1panel docker containerd 2>/dev/null || true
             sudo pkill -9 docker containerd 1panel 2>/dev/null || true
             sync && sleep 5
             
-            # 统一tar兼容参数，反斜杠后无空格，缩进对齐
+            # 打包快照：保留权限/ACL/扩展属性，应用排除规则
             sudo tar -czpf "$TMP_SNAPSHOT" \
               --ignore-failed-read \
               -p \
@@ -336,6 +376,7 @@ jobs:
               --exclude='/var/log/1panel/*' --exclude='/etc/systemd/system/*.wants' \
               $VALID_DIRS || { echo "❌ Tar Package Failed"; return 1; }
             
+            # 校验快照有效性（避免空包）
             if [ $(stat -c%s "$TMP_SNAPSHOT") -lt 1024 ]; then
               echo "❌ Invalid Snapshot (File Too Small)"
               rm -f "$TMP_SNAPSHOT"
@@ -343,20 +384,20 @@ jobs:
             fi
             sudo chown runner:runner "$TMP_SNAPSHOT"
             
+            # 上传快照到WebDAV
             if ! sudo -u runner rclone copy "$TMP_SNAPSHOT" "$REMOTE_PATH" --config /home/runner/.rclone.conf --transfers 4; then
               echo "❌ Upload Failed"
               rm -f "$TMP_SNAPSHOT"
               return 1
             fi
             
-            # 生成快照元数据
+            # 生成并上传快照元数据
             printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n1panel_version=%s\n" \
               "$SNAPSHOT_NAME" \
               "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               "$(du -sh "$TMP_SNAPSHOT" | awk '{print $1}')" \
               "$(docker -v 2>/dev/null | awk '{print $3}' | sed 's/,//g')" \
               "$(1panel -v 2>/dev/null | awk '{print $3}' || echo 'unknown')" | sudo tee /tmp/snapshot_meta.txt
-            
             sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             
             # 清理临时文件并重启服务
@@ -377,14 +418,18 @@ jobs:
             
             if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
               echo "⏹️ Timeout, Exit"
-              exit 0
-            fi
-            sleep 60
+              exit 0 
+            fi 
+            sleep 60 
           done
+
       - name: 10. Clean Temp Files (Always Execute)
-        if: ${{ always() }}
+        if: ${{ always() }} 
         run: |
-          set -e
+          set -e 
+          # 清理所有临时文件和配置
           sudo rm -rf /tmp/1panel-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
           sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
-          echo "✅ Temp Files Cleaned Completed"
+          # 清理软链接（可选，避免残留）
+          sudo rm -f /usr/bin/1panel 2>/dev/null || true
+          echo "✅ 临时文件清理完成"
