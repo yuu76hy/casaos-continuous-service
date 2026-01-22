@@ -6,13 +6,12 @@ on:
     types: [renew_1panel_snapshot]
 
 jobs:
-  onepanel_snapshot_backup_restore:  # 核心修复：以字母开头，符合ID规则
+  onepanel_snapshot_backup_restore:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      # 仅保留1Panel核心目录
       CORE_DIRS: "/var/lib/docker /etc/docker /DATA /etc/systemd/system /opt/1panel /etc/1panel /var/log/1panel"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
@@ -41,16 +40,31 @@ jobs:
       - name: 环境初始化与依赖安装
         run: |
           set -e
-          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl
+          # 配置可靠DNS，解决解析问题
+          sudo rm -f /etc/resolv.conf
+          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
+          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
+          sudo chmod 644 /etc/resolv.conf
+          
+          # 更新并安装依赖
+          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils
           sudo locale-gen zh_CN.UTF-8
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
+          
+          # 安装rclone
           curl https://rclone.org/install.sh | sudo bash
+          
+          # 配置sudo权限
           sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          echo "✅环境已成功初始化"
+          
+          # 检查网络连通性
+          echo "✅ 检查DNS解析..."
+          nslookup resource.fit2cloud.com || { echo "❌ DNS解析失败"; exit 1; }
+          echo "✅ 环境已成功初始化"
 
       - name: 创建roots管理员用户
         run: |
@@ -106,8 +120,14 @@ jobs:
           export LANG=zh_CN.UTF-8
           echo "===== 恢复1Panel快照：$LATEST_SNAPSHOT ====="
           
-          # 停止相关服务
-          sudo systemctl stop docker.service docker.socket 1panel.service || echo "⚠️服务未运行"
+          # 仅当服务存在时停止
+          if systemctl list-unit-files | grep -q 1panel.service; then
+            sudo systemctl stop 1panel.service || echo "⚠️1Panel服务未运行"
+          fi
+          if systemctl list-unit-files | grep -q docker.service; then
+            sudo systemctl stop docker.service docker.socket || echo "⚠️Docker服务未运行"
+          fi
+          
           sudo systemctl mask docker.socket
           sudo pkill -9 docker 1panel || true
           sync && sleep 3
@@ -125,7 +145,6 @@ jobs:
           if [ $? -eq 0 ]; then
             echo "✅1Panel快照恢复成功"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            # 删除已恢复的快照
             rclone delete mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf
             rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt --config /home/runner/.rclone.conf
           else
@@ -139,19 +158,39 @@ jobs:
         run: |
           set -e
           echo "===== 彻底清除1Panel残留 ====="
-          # 停止服务
-          sudo systemctl stop 1panel.service docker.service docker.socket || true
-          sudo systemctl disable 1panel.service docker.service docker.socket || true
-          # 清理容器/镜像/卷
-          sudo docker rm -f $(sudo docker ps -aq) || true
-          sudo docker rmi -f $(sudo docker images -aq) || true
-          sudo docker volume rm -f $(sudo docker volume ls -q) || true
-          # 删除文件目录
+          
+          # 仅当服务存在时操作
+          if systemctl list-unit-files | grep -q 1panel.service; then
+            sudo systemctl stop 1panel.service || true
+            sudo systemctl disable 1panel.service || true
+          fi
+          if systemctl list-unit-files | grep -q docker.service; then
+            sudo systemctl stop docker.service docker.socket || true
+            sudo systemctl disable docker.service docker.socket || true
+          fi
+          
+          sudo systemctl mask docker.socket
+          sudo pkill -9 docker 1panel || true
+          sync && sleep 3
+          
+          # 仅当Docker可连接时清理容器/镜像/卷
+          if sudo docker info >/dev/null 2>&1; then
+            sudo docker rm -f $(sudo docker ps -aq) 2>/dev/null || true
+            sudo docker rmi -f $(sudo docker images -aq) 2>/dev/null || true
+            sudo docker volume rm -f $(sudo docker volume ls -q) 2>/dev/null || true
+          else
+            echo "⚠️Docker未运行，跳过容器/镜像清理"
+          fi
+          
+          # 清理1Panel和Docker文件（1Panel非apt安装，无需apt purge）
           sudo rm -rf /opt/1panel /etc/1panel /var/log/1panel /usr/bin/1panel /usr/lib/systemd/system/1panel*
           sudo rm -rf /var/lib/docker /etc/docker /DATA/1panel* /tmp/1panel*
-          # 卸载相关包
-          sudo apt purge -y 1panel* docker* containerd* runc* || true
+          
+          # 仅清理已安装的Docker包（避免无意义报错）
+          dpkg -l | grep -q docker && sudo apt purge -y docker* containerd* runc* || true
           sudo apt autoremove -y && sudo apt clean
+          
+          sudo systemctl unmask docker.socket
           echo "✅1Panel残留已清除"
 
       - name: 全新安装1Panel（恢复失败时执行）
@@ -159,14 +198,38 @@ jobs:
         run: |
           set -e
           echo "===== 安装1Panel ====="
-          curl -fsSL https://get.1panel.io | sudo bash - || { echo "❌1Panel安装失败"; exit 1; }
-          # 启动基础服务
+          
+          # 先启动Docker（1Panel依赖Docker）
           sudo systemctl unmask docker.socket
           sudo systemctl enable --now docker.service docker.socket
           sleep 10
-          sudo systemctl enable --now 1panel.service
+          if ! sudo systemctl is-active --quiet docker; then
+            echo "❌Docker启动失败，无法安装1Panel"
+            exit 1
+          fi
+          
+          # 1Panel官方安装地址（修复核心DNS解析问题）
+          curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash - || {
+            echo "❌1Panel安装失败，打印安装日志："
+            cat /tmp/1panel-install.log 2>/dev/null || true
+            exit 1
+          }
+          
+          # 验证1Panel安装并启动
           sleep 5
-          echo "✅1Panel安装完成"
+          if systemctl list-unit-files | grep -q 1panel.service; then
+            sudo systemctl enable --now 1panel.service
+            sleep 5
+            if sudo systemctl is-active --quiet 1panel.service; then
+              echo "✅1Panel安装并启动成功"
+            else
+              echo "⚠️1Panel安装完成但启动失败，尝试修复"
+              sudo 1panel repair || true
+            fi
+          else
+            echo "❌1Panel安装后未生成服务文件"
+            exit 1
+          fi
 
       - name: 重启1Panel服务（恢复成功时执行）
         if: ${{ env.SNAPSHOT_RESTORED == 'true' }}
@@ -174,6 +237,7 @@ jobs:
           set -e
           sudo systemctl unmask docker.socket
           sudo systemctl daemon-reload
+          
           # 启动Docker
           sudo systemctl enable --now docker.service docker.socket
           sleep 10
@@ -181,16 +245,20 @@ jobs:
             echo "❌Docker服务启动失败"
             exit 1
           fi
+          
           # 启动并修复1Panel
           if systemctl list-unit-files | grep -q 1panel.service; then
-            sudo chmod 755 /usr/bin/1panel
-            sudo chown root:root /etc/systemd/system/1panel.service
+            sudo chmod 755 /usr/bin/1panel || true
+            sudo chown root:root /etc/systemd/system/1panel.service || true
             sudo systemctl daemon-reload
             sudo systemctl enable --now 1panel.service
             sleep 5
             if ! sudo systemctl is-active --quiet 1panel.service; then
               echo "⚠️1Panel启动失败，执行修复"
-              curl -fsSL https://get.1panel.io | sudo bash -s -- --repair
+              sudo 1panel repair || {
+                echo "❌1Panel修复失败，重新安装"
+                curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -
+              }
               sudo systemctl enable --now 1panel.service
               sleep 5
             fi
@@ -235,7 +303,6 @@ jobs:
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
           
-          # 触发快照续订
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "❌USER_PAT或REPO为空"
@@ -255,10 +322,8 @@ jobs:
             return 0
           }
           
-          # 创建并上传快照
           create_and_upload_snapshot() {
             if [ "${WEBDAV_AVAILABLE}" != "true" ]; then return 1; fi
-            # 验证1Panel关键文件
             echo "🔍验证1Panel关键文件"
             for file in /etc/systemd/system/1panel.service /usr/bin/1panel /opt/1panel; do
               if [ ! -e "$file" ]; then
@@ -266,62 +331,64 @@ jobs:
                 exit 1
               fi
             done
-            # 定义快照信息
             SNAPSHOT_NAME="1panel-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
             echo "🔄创建1Panel快照：$SNAPSHOT_NAME"
-            # 停止服务
-            sudo systemctl stop 1panel.service docker.service docker.socket || true
+            
+            # 仅当服务存在时停止
+            systemctl list-unit-files | grep -q 1panel.service && sudo systemctl stop 1panel.service || true
+            systemctl list-unit-files | grep -q docker.service && sudo systemctl stop docker.service docker.socket || true
+            
             sudo systemctl mask docker.socket
             sudo pkill -9 docker 1panel || true
             sync && sleep 5
-            # 遍历核心目录
+            
             for dir in $CORE_DIRS; do
               if [ ! -d "$dir" ] && [ ! -f "$dir" ]; then
                 echo "⚠️目录不存在，跳过：$dir"
               fi
             done
-            # 生成快照
+            
             sudo tar -czf "${TMP_SNAPSHOT}" --absolute-names --ignore-failed-read --warning=no-all $EXCLUDE_RULES $CORE_DIRS
             sudo chown runner:runner "${TMP_SNAPSHOT}"
             sudo chmod 644 "${TMP_SNAPSHOT}"
-            # 验证快照
+            
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
               echo "❌快照无效（大小<1KB）"
               sudo systemctl unmask docker.socket
-              sudo systemctl start docker.service docker.socket 1panel.service || true
+              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service docker.socket || true
+              systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
               return 1
             fi
+            
             echo "✅快照创建成功，大小：$(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
-            # 上传快照
             if ! sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" --config /home/runner/.rclone.conf --transfers 4 --log-file /tmp/rclone_upload.log; then
               echo "❌快照上传失败，查看日志：/tmp/rclone_upload.log"
               cat /tmp/rclone_upload.log || true
               rm -f "${TMP_SNAPSHOT}"
               sudo systemctl unmask docker.socket
-              sudo systemctl start docker.service docker.socket 1panel.service || true
+              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service docker.socket || true
+              systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
               return 1
             fi
-            echo "✅快照上传成功：${REMOTE_PATH}"
-            # 上传元数据
+            
             META_FILE="/tmp/snapshot_meta.txt"
             echo "snapshot_name=${SNAPSHOT_NAME}" > "${META_FILE}"
             echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"
             sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
-            # 清理临时文件
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
-            # 重启服务
+            
             sudo systemctl unmask docker.socket
-            sudo systemctl start docker.service docker.socket 1panel.service || true
+            systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service docker.socket || true
+            systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
             return 0
           }
           
-          # 循环执行快照任务
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             echo "📊工作流运行时间：$run_mins分钟"
-            # 运行2分钟后创建快照
+            
             if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
               echo "⏰开始创建并上传1Panel快照"
               if create_and_upload_snapshot; then
@@ -330,11 +397,12 @@ jobs:
                 echo "❌快照创建失败，跳过续订"
               fi
             fi
-            # 达到最大运行时间退出
+            
             if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
               echo "⏹️达到最大运行时间，退出工作流"
               exit 0
             fi
+            
             sleep 60
           done
 
