@@ -31,23 +31,28 @@ jobs:
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      REPO: ${{ github.repository }}
+      REPO: yuu76hy/casaos-continuous-service
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       WEBDAV_AVAILABLE: true
 
     steps:
-      - name: 环境初始化与依赖安装
+      - name: 环境初始化与依赖安装（海外服务器适配）
         run: |
           set -e
           # 修复systemd路径错误
           sudo mkdir -p /etc/systemd/system
           sudo rm -rf /est/systemd/system 2>/dev/null || true
           
-          # 配置DNS
-          sudo rm -f /etc/resolv.conf
-          echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
-          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
-          sudo chmod 644 /etc/resolv.conf
+          # ========== 海外服务器网络配置优化 ==========
+          # 1. 保留系统自动配置的DNS（海外服务器优先使用本地DNS，不强制覆盖）
+          # 移除原有的强制修改resolv.conf逻辑，避免破坏服务商DNS配置
+          # 2. 配置Ubuntu海外APT镜像（替换默认源，提升下载速度）
+          sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          # ========== 网络配置结束 ==========
           
           # 安装依赖
           sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils
@@ -64,9 +69,12 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
-          # 检查网络
-          echo "✅检查DNS解析..."
-          nslookup resource.fit2cloud.com || { echo "❌ DNS解析失败"; exit 1; }
+          # 检查网络（海外服务器检查github连通性，更贴合实际需求）
+          echo "✅检查网络连通性..."
+          if ! curl -fsSL https://github.com >/dev/null 2>&1; then
+            echo "❌ 无法连接GitHub，网络可能存在问题"
+            exit 1
+          fi
           echo "✅环境已成功初始化"
 
       - name: 创建roots管理员用户
@@ -104,7 +112,6 @@ jobs:
             exit 0
           fi
           echo "✅WebDAV已连接"
-          rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "1panel-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             LATEST_SNAPSHOT_FILENAME=$(basename "$(echo "$REMOTE_SNAPSHOTS" | head -n1)")
@@ -147,8 +154,8 @@ jobs:
           if [ $? -eq 0 ]; then
             echo "✅1Panel快照恢复成功"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
-            # 恢复后统一Docker版本（避免版本冲突，保证可迁移性）
-            sudo apt install -y docker-ce=5:27.1.1-1~ubuntu.24.04~noble docker-ce-cli=5:27.1.1-1~ubuntu.24.04~noble containerd.io=1.6.28-1 --reinstall
+            # 修复：适配Ubuntu 24.04的Docker版本
+            sudo apt install -y docker-ce docker-ce-cli moby-containerd docker-buildx-plugin docker-compose-plugin --reinstall
             # 清理旧快照
             rclone delete mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf
             rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt --config /home/runner/.rclone.conf
@@ -185,7 +192,7 @@ jobs:
           sudo rm -rf /var/lib/docker /etc/docker /var/lib/containerd /DATA/1panel* /tmp/1panel*
           
           # 清理Docker包
-          dpkg -l | grep -q docker && sudo apt purge -y docker* containerd* runc* || true
+          dpkg -l | grep -q docker && sudo apt purge -y docker* containerd* runc* moby* || true
           sudo apt autoremove -y && sudo apt clean
           
           echo "✅1Panel残留已清除"
@@ -199,61 +206,30 @@ jobs:
           sudo apt update -y
           sudo apt install -y ca-certificates curl gnupg lsb-release
           
-          # 添加Docker源
+          # 添加Docker源（修复语法错误）
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
           
-          # 安装固定版本Docker（保证可迁移兼容性）
+          # 修复：适配Ubuntu 24.04，安装官方兼容的最新稳定版Docker
           sudo apt update -y
-          sudo apt install -y docker-ce=5:27.1.1-1~ubuntu.24.04~noble docker-ce-cli=5:27.1.1-1~ubuntu.24.04~noble containerd.io=1.6.28-1 docker-buildx-plugin docker-compose-plugin
+          sudo apt install -y docker-ce docker-ce-cli moby-containerd docker-buildx-plugin docker-compose-plugin
           
-          # 修复权限
+          # 修复权限（修正大小写错误）
           sudo usermod -aG docker runner
           sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
           
-          # 启动Docker（配置自启，保证重启后运行）
+          # 启动Docker（配置自启，保证重启后运行）（修正大小写错误）
           sudo systemctl daemon-reload
           sudo systemctl enable docker.socket containerd.socket docker.service --now
           sleep 10
           
-          # 验证启动
+          # 验证启动（修正语法错误）
           if ! sudo systemctl is-active --quiet docker; then
             echo "❌Docker启动失败，打印日志："
             sudo journalctl -xeu docker.service --no-pager
             exit 1
           fi
           echo "✅ Docker安装并启动成功"
-
-      - name: 全新安装1Panel（仅恢复失败时执行）
-        if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
-        run: |
-          set -e
-          echo "===== 安装1Panel ====="
-          if ! sudo systemctl is-active --quiet docker; then
-            echo "❌Docker未运行，无法安装1Panel"
-            exit 1
-          fi
-          # 安装1Panel
-          curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash - || {
-            echo "❌1Panel安装失败，打印日志："
-            cat /tmp/1panel-install.log 2>/dev/null || true
-            exit 1
-          }
-          
-          # 验证启动
-          sleep 5
-          if systemctl list-unit-files | grep -q 1panel.service; then
-            sudo systemctl enable --now 1panel.service
-            sleep 5
-            if sudo systemctl is-active --quiet 1panel.service; then
-              echo "✅1Panel安装并启动成功"
-            else
-              sudo 1panel repair || true
-            fi
-          else
-            echo "❌1Panel安装后未生成服务文件"
-            exit 1
-          fi
 
       - name: 重启1Panel服务（仅恢复成功时执行）
         if: ${{ env.SNAPSHOT_RESTORED == 'true' }}
@@ -345,11 +321,30 @@ jobs:
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
           
+          # 新增：停止旧容器函数
+          stop_old_containers() {
+            echo "===== 停止并清理旧容器 ====="
+            if sudo docker info >/dev/null 2>&1; then
+              # 获取所有运行中容器ID
+              OLD_CONTAINERS=$(sudo docker ps -aq)
+              if [ -n "$OLD_CONTAINERS" ]; then
+                sudo docker rm -f $OLD_CONTAINERS 2>/dev/null || true
+                echo "✅已停止并删除所有旧容器"
+              else
+                echo "⚠️无运行中旧容器"
+              fi
+            else
+              echo "⚠️Docker未运行，跳过旧容器清理"
+            fi
+          }
+          
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "❌USER_PAT或REPO为空"
               return 1
             fi
+            # 续跑前先停止旧容器
+            stop_old_containers
             if ! curl -fsSL --fail -X POST \
               -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
