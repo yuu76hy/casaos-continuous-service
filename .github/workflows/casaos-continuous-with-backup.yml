@@ -4,8 +4,9 @@ on:
   repository_dispatch:
     types: [renew_1panel_snapshot]
 
+# 关键修正：Job ID 改为以字母开头（panel_snapshot_operation），符合 GitHub 规范
 jobs:
-  1panel_snapshot_operation:
+  panel_snapshot_operation:  # 原错误ID：1panel_snapshot_operation（以数字开头）
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -193,7 +194,7 @@ jobs:
           echo "📌 验证 1Panel 核心功能："
           if sudo 1panel status >/dev/null 2>&1; then
             echo "   - 核心功能：正常 ✅"
-            # 修正：兼容不同版本 1Panel，改用 status 提取版本
+            # 兼容不同版本 1Panel，改用 status 提取版本
             echo "   - 版本信息：$(sudo 1panel status | grep -i version | head -n1)"
           else
             echo "⚠️ 警告：服务运行但核心功能异常"
@@ -219,7 +220,7 @@ jobs:
               return 1
             fi
             echo "📌 触发续跑工作流："
-            # 修正：USER_PAT 脱敏输出
+            # USER_PAT 脱敏输出
             echo "   - USER_PAT: ${USER_PAT:0:5}****"
             echo "   - REPO: ${REPO}"
             if ! curl -fsSL --fail -X POST \
@@ -318,7 +319,7 @@ jobs:
                 trigger_renew
               else
                 echo "❌ 快照创建失败，本次跳过，下次继续尝试"
-                # 修正：将 break 改为 continue，不终止循环
+                # 改为 continue 不终止循环
                 continue
               fi
             fi
