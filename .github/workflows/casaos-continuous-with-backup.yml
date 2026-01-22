@@ -12,7 +12,8 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      CORE_DIRS: "/var/lib/docker /etc/docker /DATA /etc/systemd/system /opt/1panel /etc/1panel /var/log/1panel"
+      # 优化后的核心备份目录：补充 /usr/bin/1panel，确保1Panel命令可用
+      CORE_DIRS: "/var/lib/docker /etc/docker /opt/1panel /usr/bin/1panel /etc/systemd/system /DATA"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
         --exclude=/var/lib/docker/overlay2/*/tmp
@@ -26,7 +27,6 @@ jobs:
         --exclude=/etc/systemd/system/*.wants
         --exclude=/opt/1panel/logs
         --exclude=/opt/1panel/tmp
-        --exclude=/etc/1panel/*.tmp
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -40,6 +40,10 @@ jobs:
       - name: 环境初始化与依赖安装
         run: |
           set -e
+          # 修复systemd路径错误（/est → /etc）
+          sudo mkdir -p /etc/systemd/system
+          sudo rm -rf /est/systemd/system 2>/dev/null || true
+          
           # 配置可靠DNS
           sudo rm -f /etc/resolv.conf
           echo "nameserver 8.8.8.8" | sudo tee /etc/resolv.conf
@@ -79,6 +83,8 @@ jobs:
               echo "✅ roots用户创建，密码：$RANDOM_PASS"
             fi
             sudo usermod -aG sudo roots
+            # 给roots添加Docker权限
+            sudo usermod -aG docker roots 2>/dev/null || true
           fi
 
       - name: 配置Rclone for WebDAV
@@ -132,7 +138,9 @@ jobs:
           if systemctl list-unit-files | grep -q docker.socket; then
             sudo systemctl mask docker.socket || true
           fi
-          sudo pkill -9 docker 1panel || true
+          # 修复pkill语法：拆分进程查杀命令
+          sudo pkill -9 docker || true
+          sudo pkill -9 1panel || true
           sync && sleep 3
           
           # 验证快照有效性
@@ -178,7 +186,9 @@ jobs:
           if systemctl list-unit-files | grep -q docker.socket; then
             sudo systemctl mask docker.socket || true
           fi
-          sudo pkill -9 docker 1panel || true
+          # 修复pkill语法
+          sudo pkill -9 docker || true
+          sudo pkill -9 1panel || true
           sync && sleep 3
           
           # 仅当Docker可连接时清理容器/镜像/卷
@@ -212,21 +222,40 @@ jobs:
           sudo apt install -y ca-certificates curl gnupg lsb-release
           # 添加Docker官方GPG密钥
           curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-          # 添加Docker源
+          # 修复源配置语法错误
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-          # 安装Docker引擎
+          # 安装兼容版本Docker，解决Ubuntu 24.04兼容性问题
           sudo apt update -y
-          sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          sudo apt install -y docker-ce=5:27.1.1-1~ubuntu.24.04~noble docker-ce-cli=5:27.1.1-1~ubuntu.24.04~noble containerd.io docker-buildx-plugin docker-compose-plugin
+          
+          # 修复Docker启动权限
+          sudo usermod -aG docker runner
+          sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+          
           # 启动Docker服务
           if systemctl list-unit-files | grep -q docker.socket; then
             sudo systemctl unmask docker.socket || true
           fi
+          # 修复Docker启动逻辑
+          sudo systemctl daemon-reload
           sudo systemctl enable --now docker.service
           sleep 10
-          # 验证Docker启动
+          
+          # 验证Docker启动，失败则修复
           if ! sudo systemctl is-active --quiet docker; then
-            echo "❌Docker启动失败，打印状态："
+            echo "❌Docker启动失败，尝试修复..."
             sudo systemctl status docker --no-pager
+            sudo rm -f /etc/systemd/system/docker.service.d/*
+            sudo systemctl daemon-reload
+            sudo systemctl reset-failed docker.service
+            sudo systemctl start docker.service
+            sleep 5
+          fi
+          
+          # 再次验证
+          if ! sudo systemctl is-active --quiet docker; then
+            echo "❌Docker启动失败，打印详细日志："
+            sudo journalctl -xeu docker.service --no-pager
             exit 1
           fi
           echo "✅ Docker安装并启动成功"
@@ -268,18 +297,34 @@ jobs:
         if: ${{ env.SNAPSHOT_RESTORED == 'true' }}
         run: |
           set -e
-          echo "===== 重启1Panel服务（复用快照环境） ====="
+          echo "===== 重启1Panel服务（复用快照环境） ======"
           # 仅当socket存在时unmask
           systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
           sudo systemctl daemon-reload
           
-          # 启动Docker（复用快照中的Docker）
-          sudo systemctl enable --now docker.service
-          sleep 10
+          # 修复Docker启动逻辑，增加重试
+          echo "🔧 修复Docker启动配置..."
+          sudo systemctl reset-failed docker.service
+          sudo systemctl daemon-reload
+          # 最多重试3次
+          for i in {1..3}; do
+            sudo systemctl enable --now docker.service
+            sleep 5
+            if sudo systemctl is-active --quiet docker; then
+              break
+            fi
+            echo "⚠️Docker启动失败，第${i}次重试..."
+            sudo journalctl -xeu docker.service --no-pager | head -20
+          done
+          
+          # 验证Docker启动
           if ! sudo systemctl is-active --quiet docker; then
-            echo "❌Docker服务启动失败"
+            echo "❌Docker服务启动失败，打印详细日志："
+            sudo systemctl status docker.service --no-pager
+            sudo journalctl -xeu docker.service --no-pager
             exit 1
           fi
+          echo "✅ Docker启动成功"
           
           # 启动并修复1Panel
           if systemctl list-unit-files | grep -q 1panel.service; then
@@ -360,12 +405,21 @@ jobs:
           create_and_upload_snapshot() {
             if [ "${WEBDAV_AVAILABLE}" != "true" ]; then return 1; fi
             echo "🔍验证1Panel关键文件"
-            for file in /etc/systemd/system/1panel.service /usr/bin/1panel /opt/1panel; do
-              if [ ! -e "$file" ]; then
-                echo "❌关键文件/目录不存在：$file"
-                exit 1
+            # 过滤存在的目录，避免tar管道破裂
+            VALID_CORE_DIRS=""
+            for dir in $CORE_DIRS; do
+              if [ -d "$dir" ] || [ -f "$dir" ]; then
+                VALID_CORE_DIRS="$VALID_CORE_DIRS $dir"
+              else
+                echo "⚠️目录不存在，跳过：$dir"
               fi
             done
+            # 无有效目录则退出
+            if [ -z "$VALID_CORE_DIRS" ]; then
+              echo "❌无有效核心目录，无法创建快照"
+              return 1
+            fi
+            
             SNAPSHOT_NAME="1panel-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
@@ -377,26 +431,34 @@ jobs:
             
             # 仅当socket存在时mask
             systemctl list-unit-files | grep -q docker.socket && sudo systemctl mask docker.socket || true
-            sudo pkill -9 docker 1panel || true
+            # 修复pkill语法
+            sudo pkill -9 docker || true
+            sudo pkill -9 1panel || true
             sync && sleep 5
             
-            for dir in $CORE_DIRS; do
-              if [ ! -d "$dir" ] && [ ! -f "$dir" ]; then
-                echo "⚠️目录不存在，跳过：$dir"
-              fi
-            done
-            
-            sudo tar -czf "${TMP_SNAPSHOT}" --absolute-names --ignore-failed-read --warning=no-all $EXCLUDE_RULES $CORE_DIRS
+            # 使用过滤后的有效目录创建快照
+            sudo tar -czf "${TMP_SNAPSHOT}" --absolute-names --ignore-failed-read --warning=no-all $EXCLUDE_RULES $VALID_CORE_DIRS
             sudo chown runner:runner "${TMP_SNAPSHOT}"
             sudo chmod 644 "${TMP_SNAPSHOT}"
             
+            # 校验快照有效性
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
               echo "❌快照无效（大小<1KB）"
-              # 仅当socket存在时unmask
               systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
               systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
               systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
               return 1
+            fi
+
+            # 校验核心目录是否备份成功
+            echo "🔍 校验核心目录备份完整性"
+            tar -tf "${TMP_SNAPSHOT}" | grep -E "/opt/1panel|/var/lib/docker|/etc/docker|/usr/bin/1panel" | head -10
+            if [ $? -ne 0 ]; then
+              echo "❌ 核心目录未完全备份，终止流程"
+              systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
+              systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
+              systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
+              exit 1
             fi
             
             echo "✅快照创建成功，大小：$(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
@@ -404,7 +466,6 @@ jobs:
               echo "❌快照上传失败，查看日志：/tmp/rclone_upload.log"
               cat /tmp/rclone_upload.log || true
               rm -f "${TMP_SNAPSHOT}"
-              # 仅当socket存在时unmask
               systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
               systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
               systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
@@ -417,7 +478,7 @@ jobs:
             sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
             
-            # 仅当socket存在时unmask
+            # 恢复服务运行
             systemctl list-unit-files | grep -q docker.socket && sudo systemctl unmask docker.socket || true
             systemctl list-unit-files | grep -q docker.service && sudo systemctl start docker.service || true
             systemctl list-unit-files | grep -q 1panel.service && sudo systemctl start 1panel.service || true
