@@ -6,7 +6,7 @@ on:
     types: [renew_1panel_snapshot]
 
 jobs:
-  1panel_snapshot_backup_restore:
+  onepanel_snapshot_backup_restore:  # 核心修复：以字母开头，符合ID规则
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
