@@ -33,30 +33,30 @@ jobs:
       - name: 1. Env Initialization (SSH + Encoding Compat)
         run: |
           set -e
-          # SSH免密配置
+          # SSH免密配置（修复第44行核心问题：移除易冲突的EOF写法）
           sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config 2>/dev/null || true
           sudo systemctl restart sshd 2>/dev/null || true
           
-          # 系统源配置
+          # 系统目录准备
           sudo mkdir -p /etc/systemd/system 2>/dev/null || true
           sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
-          cat <<EOF | sudo tee /etc/apt/sources.list
-deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse
-EOF
           
-          # 安装依赖
+          # 核心修复：用echo直接写入源文件，避免EOF解析冲突（第44行错误根源）
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list > /dev/null
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list > /dev/null
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list > /dev/null
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list > /dev/null
+          
+          # 安装核心依赖
           sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils apt-transport-https ca-certificates gnupg lsb-release file iconv
           sudo locale-gen zh_CN.UTF-8 && export LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8
           curl -fsSL https://rclone.org/install.sh | sudo bash
           
-          # Sudo免密
+          # Sudo免密配置
           if grep -q "requiretty" /etc/sudoers 2>/dev/null; then
             sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
           fi
-          echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
+          echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner > /dev/null
           sudo chmod 0440 /etc/sudoers.d/runner && sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
           echo "✅ Env Initialization Completed"
@@ -66,7 +66,7 @@ EOF
           set -e
           if ! id "roots" &>/dev/null; then
             sudo useradd -m -s /bin/bash roots
-            echo "roots ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/roots
+            echo "roots ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/roots > /dev/null
             sudo chmod 0440 /etc/sudoers.d/roots
             echo "✅ roots User Created"
           else
@@ -113,14 +113,14 @@ EOF
           SNAPSHOT_PATH=${{ steps.webdav-config.outputs.latest_snapshot }}
           echo "===== Restore Snapshot：$SNAPSHOT_PATH ====="
           
-          # 停止所有服务
+          # 停止所有服务避免冲突
           sudo systemctl stop 1panel docker containerd 2>/dev/null || true
           sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
           sudo pkill -9 docker containerd 1panel 2>/dev/null || true
           sudo systemctl reset-failed 1panel docker containerd 2>/dev/null || true
           sync && sleep 3
           
-          # 校验快照
+          # 校验快照完整性
           if ! rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
             echo "❌ Snapshot Corrupted"
             echo "restore_success=false" >> "$GITHUB_OUTPUT"
@@ -133,7 +133,7 @@ EOF
           sudo tar -xzf "$TEMP_SNAPSHOT" -C / --overwrite --ignore-failed-read -p --same-owner
           rm -f "$TEMP_SNAPSHOT"
           
-          # 重装Docker
+          # 重装Docker保证兼容性
           sudo apt purge -y moby* containerd* runc* docker* -y || true
           sudo apt autoremove -y && sudo apt clean
           curl -fsSL https://get.docker.com | sudo bash
@@ -150,6 +150,7 @@ EOF
         run: |
           set -e
           echo "===== Clean Residues ====="
+          # 停止服务
           sudo systemctl stop 1panel docker containerd 2>/dev/null || true
           sudo pkill -9 docker containerd 1panel 2>/dev/null || true
           sudo systemctl reset-failed 1panel docker containerd 2>/dev/null || true
@@ -162,7 +163,7 @@ EOF
             sudo docker volume rm -f $(sudo docker volume ls -q) 2>/dev/null || true
           fi
           
-          # 清理1Panel文件
+          # 清理1Panel相关文件
           sudo rm -rf /opt/1panel /etc/1panel /usr/bin/1panel $PANEL_SERVICE_PATH $PANEL_BIN_PATH /var/lib/docker /etc/docker /var/lib/containerd /DATA/*
           sudo apt purge -y docker* moby* containerd* runc* 1panel* -y || true
           sudo apt autoremove -y && sudo apt clean
@@ -173,16 +174,18 @@ EOF
         run: |
           set -e
           echo "===== Install Docker ====="
+          # 重装Docker
           sudo apt purge -y docker* moby* containerd* runc* -y || true
           sudo apt autoremove -y && sudo apt clean
           curl -fsSL https://get.docker.com | sudo bash
           
-          # 配置Docker
+          # 配置Docker权限
           sudo usermod -aG docker runner
           sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
           sudo systemctl enable --now docker.service containerd.service
           sleep 10
           
+          # 校验Docker启动
           if ! sudo systemctl is-active --quiet docker; then
             echo "❌ Docker Start Failed"
             exit 1
@@ -194,9 +197,8 @@ EOF
           curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -
           sleep 5
           
-          # 生成正确的1panel.service文件（核心修复路径）
-          echo "
-[Unit]
+          # 生成正确的1panel.service文件（核心修复路径错误）
+          echo "[Unit]
 Description=1Panel, a modern open source linux panel
 Documentation=https://1panel.cn/
 After=network.target docker.service containerd.service
@@ -212,10 +214,9 @@ WorkingDirectory=/opt/1panel
 StandardOutput=journal+console
 
 [Install]
-WantedBy=multi-user.target
-" | sudo tee $PANEL_SERVICE_PATH > /dev/null
+WantedBy=multi-user.target" | sudo tee $PANEL_SERVICE_PATH > /dev/null
           
-          # 重载配置并启动
+          # 重载配置并启动1Panel
           sudo systemctl daemon-reload && sudo 1panel repair 2>/dev/null || true
           if ! sudo systemctl is-active --quiet 1panel; then
             sudo systemctl start 1panel
@@ -228,7 +229,7 @@ WantedBy=multi-user.target
           set -e
           echo "===== Fix 1Panel Core Issues ====="
           
-          # 修复Docker/containerd
+          # 修复Docker/containerd依赖
           for service in docker.service containerd.service; do
             if sudo systemctl list-unit-files --type=service | grep -q "$service"; then
               sudo systemctl reset-failed "$service" 2>/dev/null || true
@@ -243,9 +244,8 @@ WantedBy=multi-user.target
             sudo cp "$PANEL_SERVICE_PATH" "${PANEL_SERVICE_PATH}.bak" 2>/dev/null || true
           fi
           
-          # 直接生成正确的service文件（避免EOF解析冲突）
-          echo "
-[Unit]
+          # 生成正确的service文件（无EOF，避免解析冲突）
+          echo "[Unit]
 Description=1Panel, a modern open source linux panel
 Documentation=https://1panel.cn/
 After=network.target docker.service containerd.service
@@ -261,8 +261,7 @@ WorkingDirectory=/opt/1panel
 StandardOutput=journal+console
 
 [Install]
-WantedBy=multi-user.target
-" | sudo tee $PANEL_SERVICE_PATH > /dev/null
+WantedBy=multi-user.target" | sudo tee $PANEL_SERVICE_PATH > /dev/null
           
           echo "✅ Fixed 1panel.service Path: /usr/local/bin/1panel"
           
@@ -272,7 +271,7 @@ WantedBy=multi-user.target
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
           else
             sudo chmod +x "$PANEL_BIN_PATH"
-            # 架构检查
+            # 架构检查（适配GitHub Actions x86_64）
             if file "$PANEL_BIN_PATH" | grep -qi "arm\|aarch64"; then
               echo "⚠️ ARM Architecture, Reinstall x86_64 Version"
               sudo rm -f "$PANEL_BIN_PATH"
@@ -280,7 +279,7 @@ WantedBy=multi-user.target
             fi
           fi
           
-          # 终止自动重启循环
+          # 终止1Panel自动重启循环
           sudo systemctl stop 1panel 2>/dev/null || true
           sudo systemctl reset-failed 1panel 2>/dev/null || true
           sudo systemctl daemon-reload && sleep 5
@@ -294,7 +293,7 @@ WantedBy=multi-user.target
             exit 1
           fi
           
-          # 1Panel重试启动
+          # 1Panel重试启动（解决启动延迟）
           panel_active=false
           for retry in {1..3}; do
             if sudo systemctl is-active --quiet 1panel; then
@@ -306,7 +305,7 @@ WantedBy=multi-user.target
             sleep 5
           done
           
-          # 最终兜底
+          # 最终兜底修复
           if [ "$panel_active" = "false" ]; then
             echo "⚠️ Final 1Panel Repair"
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
@@ -319,7 +318,7 @@ WantedBy=multi-user.target
             fi
           fi
           
-          # 验证状态
+          # 验证最终状态
           sudo systemctl status 1panel --no-pager | iconv -f utf-8 -t utf-8 -c 2>/dev/null
           sudo systemctl status docker --no-pager | iconv -f utf-8 -t utf-8 -c 2>/dev/null
           echo "✅ All Services Restarted Successfully"
@@ -331,8 +330,9 @@ WantedBy=multi-user.target
             echo "⚠️ Missing Tailscale Key, Skip"
             exit 0
           fi
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+          # 安装Tailscale
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list > /dev/null
           sudo apt update -y && sudo apt install -y tailscale
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="1panel-snapshot-${{ github.run_id }}"
           TS_IP=$(sudo tailscale ip -4 | iconv -f utf-8 -t utf-8 -c 2>/dev/null)
@@ -390,7 +390,7 @@ WantedBy=multi-user.target
             TMP_SNAPSHOT="/tmp/$SNAPSHOT_NAME"
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/$SNAPSHOT_NAME"
             
-            # 停止服务打包
+            # 停止服务保证快照一致性
             sudo systemctl stop 1panel docker containerd 2>/dev/null || true
             sudo pkill -9 docker containerd 1panel 2>/dev/null || true
             sync && sleep 5
@@ -401,40 +401,40 @@ WantedBy=multi-user.target
               return 1
             }
             
-            # 校验大小
+            # 校验快照大小
             if [ $(stat -c%s "$TMP_SNAPSHOT") -lt 1024 ]; then
-              echo "❌ Invalid Snapshot"
+              echo "❌ Invalid Snapshot (Too Small)"
               rm -f "$TMP_SNAPSHOT"
               return 1
             fi
             sudo chown runner:runner "$TMP_SNAPSHOT"
             
-            # 上传快照
+            # 上传快照到WebDAV
             if ! sudo -u runner rclone copy "$TMP_SNAPSHOT" "$REMOTE_PATH" --config /home/runner/.rclone.conf --transfers 4; then
               echo "❌ Upload Failed"
               rm -f "$TMP_SNAPSHOT"
               return 1
             fi
             
-            # 生成元数据
+            # 生成元数据（记录正确路径）
             printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n1panel_version=%s\n1panel_bin_path=/usr/local/bin/1panel\nservice_path=/etc/systemd/system/1panel.service\n" \
               "$SNAPSHOT_NAME" \
               "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               "$(du -sh "$TMP_SNAPSHOT" | awk '{print $1}')" \
               "$(docker -v 2>/dev/null | awk '{print $3}' | sed 's/,//g')" \
-              "$(1panel -v 2>/dev/null | awk '{print $3}' || echo 'unknown')" | sudo tee /tmp/snapshot_meta.txt
+              "$(1panel -v 2>/dev/null | awk '{print $3}' || echo 'unknown')" | sudo tee /tmp/snapshot_meta.txt > /dev/null
             
             # 上传元数据
             sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             
-            # 清理并重启
+            # 清理临时文件并重启服务
             rm -f "$TMP_SNAPSHOT" /tmp/snapshot_meta.txt
             sudo systemctl start docker containerd 1panel 2>/dev/null || true
             echo "✅ Snapshot Uploaded: $SNAPSHOT_NAME"
             return 0
           }
           
-          # 主循环
+          # 主循环：2分钟后创建快照，6小时超时退出
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             echo "⏱️ Running Time：$run_mins / $MAX_RUN_MINUTES Mins"
@@ -450,7 +450,7 @@ WantedBy=multi-user.target
             sleep 60
           done
 
-      - name: 10. Clean Temp Files (Always)
+      - name: 10. Clean Temp Files (Always Execute)
         if: ${{ always() }}
         run: |
           set -e
@@ -458,7 +458,7 @@ WantedBy=multi-user.target
           sudo rm -rf /tmp/1panel-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /etc/sudoers.d/roots /tmp/rclone_*.log
           sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
           
-          # 恢复SSH配置
+          # 恢复SSH原始配置
           sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config 2>/dev/null || true
           sudo systemctl restart sshd 2>/dev/null || true
           
