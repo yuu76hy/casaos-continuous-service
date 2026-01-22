@@ -35,7 +35,6 @@ jobs:
       - name: 1. 环境初始化（海外服务器适配）
         run: |
           set -e
-          # 修正：只创建目录，不删除
           sudo mkdir -p /etc/systemd/system 2>/dev/null || true
           
           sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
@@ -289,11 +288,10 @@ jobs:
             sudo pkill -9 docker containerd 1panel 2>/dev/null || true
             sync && sleep 5
             
-            # 使用正确的tar参数（兼容所有版本），排除规则需要单独处理
-            if ! sudo tar -czf "$TMP_SNAPSHOT" \
+            # 使用正确的tar参数（兼容所有版本）
+            if ! sudo tar -czpf "$TMP_SNAPSHOT" \
               --ignore-failed-read \
               --preserve-permissions \
-              --preserve-owner \
               --acls \
               --xattrs \
               --exclude='*.log' --exclude='*.tmp' --exclude='*.cache' \
