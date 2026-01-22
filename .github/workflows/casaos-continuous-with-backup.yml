@@ -1,80 +1,80 @@
-name: CasaOS-Server-Snapshot-Backup-Restore
-
+name: 1Panel-Server-Backup-Restore
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [renew_casaos_snapshot]
+    types: [renew_1panel_snapshot]
 
 jobs:
-  casaos_snapshot_backup_restore:
+  1panel_snapshot_operation:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
-      WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      CORE_DIRS: "/var/lib/docker /etc/docker /etc/casaos /var/lib/casaos /DATA /etc/systemd/system /usr/bin/casaos /usr/lib/systemd/system"
-      # 修复排除规则笔误，仅保留正确规则
+      WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu/1panel-backup"
+      CORE_DIRS: "/etc/1panel /var/lib/1panel /usr/local/1panel /etc/systemd/system/1panel.service /usr/bin/1panel"
       EXCLUDE_RULES: >-
-        --exclude=/var/lib/docker/containers/*/*.log
-        --exclude=/var/lib/docker/overlay2/*/tmp
-        --exclude=/var/lib/docker/tmp
+        --exclude=/var/lib/1panel/logs/*
+        --exclude=/var/lib/1panel/tmp/*
         --exclude=*.log
         --exclude=*.tmp
-        --exclude=*.cache
-        --exclude=/DATA/tmp
-        --exclude=/DATA/cache
-        --exclude=/DATA/logs
-        --exclude=/etc/systemd/system/*.wants
-        --exclude=/etc/systemd/system/*.requires
+        --exclude=*.swp
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ github.repository }}
-      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       WEBDAV_AVAILABLE: true
+      SNAPSHOT_RESTORED: true
 
     steps:
-      - name: Environment Initialization & Dependencies Install
+      - name: Initialize System Environment
         run: |
           set -e
+          echo "=================================================="
+          echo "            🚀 环境初始化开始"
+          echo "=================================================="
+          echo "📌 当前系统信息："
+          cat /etc/os-release | grep -E "NAME|VERSION"
+          echo "📌 当前工作目录：$(pwd)"
+          echo "📌 当前用户：$(whoami)"
+          
           sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl
+          echo "✅ 依赖工具安装完成：curl wget jq fuse3 tar gzip locales openssl"
+          
           sudo locale-gen zh_CN.UTF-8
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
+          echo "✅ 语言环境配置完成：zh_CN.UTF-8"
+          
           curl https://rclone.org/install.sh | sudo bash
+          echo "✅ Rclone 安装完成，版本：$(rclone version | head -n1)"
+          
           sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
-          sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          echo "✅ Environment initialized successfully"
+          echo "✅ Sudo 免密权限配置完成"
+          
+          echo "=================================================="
+          echo "            🎉 环境初始化结束"
+          echo "=================================================="
 
-      - name: Create Roots Admin User
+      - name: Configure Rclone for WebDAV Storage
         run: |
           set -e
-          if ! id "roots" &>/dev/null; then
-            sudo useradd -m -s /bin/bash roots
-            if [ -n "$ROOTS_PASSWORD" ]; then
-              echo "roots:$ROOTS_PASSWORD" | sudo chpasswd
-            else
-              RANDOM_PASS=$(openssl rand -base64 12)
-              echo "roots:$RANDOM_PASS" | sudo chpasswd
-              echo "✅ roots user created, password: $RANDOM_PASS"
-            fi
-            sudo usermod -aG sudo roots
-          fi
+          echo "=================================================="
+          echo "            🚀 WebDAV 配置开始"
+          echo "=================================================="
+          echo "📌 配置参数检查："
+          echo "   - WEBDAV_URL: ${WEBDAV_URL:0:20}****"
+          echo "   - WEBDAV_USER: ${WEBDAV_USER}"
+          echo "   - 备份目录: ${WEBDAV_SNAPSHOT_EN_DIR}"
 
-      - name: Configure Rclone for WebDAV (No Mount Mode)
-        run: |
-          set -e
-          export LC_ALL=zh_CN.UTF-8
-          export LANG=zh_CN.UTF-8
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
-            echo "❌ Missing WebDAV credentials"
+            echo "❌ 错误：WebDAV 密钥未配置完整"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
+
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav \
             url="$WEBDAV_URL" \
@@ -82,330 +82,287 @@ jobs:
             user="$WEBDAV_USER" \
             pass="$ENCRYPTED_PASS" \
             --config /home/runner/.rclone.conf
-          sudo chown runner:runner /home/runner/.rclone.conf
-          sudo chmod 600 /home/runner/.rclone.conf
+          echo "✅ Rclone 配置文件生成完成：/home/runner/.rclone.conf"
+
           if ! rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-            echo "❌ WebDAV connection failed"
+            echo "❌ 错误：WebDAV 连接失败，请检查密钥和地址"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
-          echo "✅ WebDAV connected successfully"
+          echo "✅ WebDAV 连接测试成功"
+
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf
-          echo "✅ Remote directory created: mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}"
-          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "casaos-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
+          echo "✅ 远程备份目录创建成功：${WEBDAV_SNAPSHOT_EN_DIR}"
+
+          echo "📌 查找远程最新快照："
+          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_EN_DIR} --config /home/runner/.rclone.conf | grep "1panel-server-snapshot-.*.tar.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             LATEST_SNAPSHOT_FILENAME=$(basename "$(echo "$REMOTE_SNAPSHOTS" | head -n1)")
             LATEST_SNAPSHOT="${WEBDAV_SNAPSHOT_EN_DIR}/${LATEST_SNAPSHOT_FILENAME}"
-            echo "✅ Found latest remote snapshot: ${LATEST_SNAPSHOT}"
+            echo "   - 找到最新快照：${LATEST_SNAPSHOT_FILENAME}"
+            echo "   - 快照完整路径：${LATEST_SNAPSHOT}"
             echo "LATEST_SNAPSHOT=${LATEST_SNAPSHOT}" >> "$GITHUB_ENV"
           else
-            echo "⚠️ No remote snapshots found in WebDAV directory"
+            echo "   - 未找到任何远程快照，本次仅执行备份"
           fi
+          echo "=================================================="
+          echo "            🎉 WebDAV 配置结束"
+          echo "=================================================="
 
-      - name: Restore Snapshot from WebDAV
+      - name: Restore 1Panel from Snapshot (No Reinstall)
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
           set -e
-          export LC_ALL=zh_CN.UTF-8
-          export LANG=zh_CN.UTF-8
-          echo "===== Restore from remote snapshot: $LATEST_SNAPSHOT ====="
-          
-          # 全英文标准语法，移除所有中文
-          sudo systemctl stop docker.service docker.socket || echo "⚠️ Docker service not running, skip stop"
-          sudo systemctl mask docker.socket
-          sudo pkill -9 docker || true
+          echo "=================================================="
+          echo "            🚀 1Panel 快照恢复开始"
+          echo "=================================================="
+          echo "📌 恢复参数信息："
+          echo "   - 待恢复快照：${LATEST_SNAPSHOT}"
+          echo "   - 备份目录：${CORE_DIRS}"
+          echo "   - 排除规则：${EXCLUDE_RULES}"
+
+          echo "📌 停止 1Panel 服务："
+          if sudo systemctl stop 1panel; then
+            echo "   - 1Panel 服务已停止"
+          else
+            echo "   - 1Panel 服务未运行，跳过停止"
+          fi
+          sudo systemctl mask 1panel || true
           sync && sleep 3
-          
-          if systemctl is-active --quiet casaos.service; then
-            sudo systemctl stop casaos.service
-            echo "✅ Stopped casaos.service"
-          else
-            echo "⚠️ casaos.service not loaded, skip stop"
-          fi
-          
+          echo "✅ 服务锁定完成，防止恢复过程中启动"
+
+          echo "📌 验证快照完整性："
           if ! rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
-            echo "❌ Remote snapshot invalid or unreadable"
+            echo "❌ 错误：快照文件损坏或无法读取"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
-            sudo systemctl unmask docker.socket
+            sudo systemctl unmask 1panel
             exit 1
           fi
-          
-          # 恢复快照，修复路径符号（中文冒号→英文冒号）
-          rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --warning=no-all --preserve-permissions --absolute-names $EXCLUDE_RULES
+          echo "✅ 快照完整性校验通过"
+
+          echo "📌 开始恢复快照到系统根目录："
+          echo "   - 解压命令：rclone cat | tar -xzf - -C / --overwrite"
+          rclone cat mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --preserve-permissions --absolute-names $EXCLUDE_RULES
+
           if [ $? -eq 0 ]; then
-            echo "✅ Restored from WebDAV successfully"
+            echo "✅ 1Panel 快照恢复成功（无需重新安装）"
             echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
+            
+            echo "📌 删除已恢复的旧快照："
             rclone delete mywebdav:${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf
-            rclone delete mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt --config /home/runner/.rclone.conf
-            echo "✅ Deleted restored snapshot file: ${LATEST_SNAPSHOT}"
-            sudo systemctl unmask docker.socket
+            echo "   - 已删除快照：${LATEST_SNAPSHOT}"
           else
-            echo "❌ Restore failed"
+            echo "❌ 错误：快照恢复失败"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
-            sudo systemctl unmask docker.socket
-          fi
-
-      - name: Install CasaOS if No Snapshot Restored
-        if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
-        run: |
-          set -e
-          curl -fsSL https://get.casaos.io | sudo bash || {
-            cat /var/log/casaos-install.log || true
+            sudo systemctl unmask 1panel
             exit 1
-          }
-          echo "✅ CasaOS installed successfully"
+          fi
+          sudo systemctl unmask 1panel
+          echo "=================================================="
+          echo "            🎉 1Panel 快照恢复结束"
+          echo "=================================================="
 
-      - name: Start Services (New Install)
-        if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
-        run: |
-          set -e
-          sudo systemctl unmask docker.socket || true
-          for i in $(seq 1 3); do
-            sudo systemctl enable --now docker.service docker.socket
-            sleep 10
-            if sudo systemctl is-active --quiet docker && sudo systemctl is-active --quiet docker.socket; then
-              echo "✅ Docker service started successfully"
-              if systemctl list-unit-files | grep -q casaos.service; then
-                sudo systemctl enable --now casaos.service
-                sleep 5
-                if sudo systemctl is-active --quiet casaos.service; then
-                  echo "✅ CasaOS service started successfully"
-                fi
-              fi
-              exit 0
-            fi
-            echo "⚠️ Docker start attempt $i failed, retrying..."
-          done
-          echo "❌ Docker service failed to start"
-          exit 1
-
-      - name: Restart Services (From Snapshot)
+      - name: Restart 1Panel Service (From Snapshot)
         if: ${{ env.SNAPSHOT_RESTORED == 'true' }}
         run: |
           set -e
-          sudo systemctl unmask docker.socket || true
+          echo "=================================================="
+          echo "            🚀 1Panel 服务重启开始"
+          echo "=================================================="
+          echo "📌 重新加载 systemd 配置："
           sudo systemctl daemon-reload
-          sudo systemctl enable --now docker.service docker.socket
+          echo "✅ systemd 配置重载完成"
+
+          echo "📌 设置开机自启并启动服务："
+          sudo systemctl enable --now 1panel
           sleep 10
-          
-          if sudo systemctl is-active --quiet docker; then
-            echo "✅ Docker service restarted from snapshot"
+          echo "✅ 服务启动命令执行完成"
+
+          echo "📌 验证服务运行状态："
+          if sudo systemctl is-active --quiet 1panel; then
+            echo "   - 服务状态：运行中 ✅"
+            echo "   - 服务详细状态："
+            sudo systemctl status 1panel --no-pager | grep -E "Active|Loaded"
           else
-            echo "❌ Docker service failed to restart from snapshot"
-            exit 1
-          fi
-          
-          # 核心修复：添加CasaOS启动失败的修复逻辑
-          if systemctl list-unit-files | grep -q casaos.service; then
-            # 修复权限+重新加载配置
-            sudo chmod 755 /usr/bin/casaos
-            sudo chown root:root /etc/systemd/system/casaos.service
-            sudo systemctl daemon-reload
-            
-            # 尝试启动CasaOS
-            sudo systemctl enable --now casaos.service
-            sleep 5
-            
-            # 启动失败则执行官方修复命令
-            if sudo systemctl is-active --quiet casaos.service; then
-              echo "✅ CasaOS service restarted from snapshot"
-            else
-              echo "⚠️ CasaOS service failed to start, running official repair..."
-              # 执行CasaOS官方修复
-              curl -fsSL https://get.casaos.io | sudo bash -s -- --repair
-              sudo systemctl daemon-reload
-              sudo systemctl enable --now casaos.service
-              sleep 5
-              
-              # 再次检查状态+输出日志便于排查
-              if sudo systemctl is-active --quiet casaos.service; then
-                echo "✅ CasaOS service restored via repair command"
-              else
-                echo "❌ CasaOS service failed to restart from snapshot"
-                echo "📜 CasaOS service status:"
-                sudo systemctl status casaos.service --no-pager
-                echo "📜 CasaOS journal logs:"
-                sudo journalctl -xeu casaos.service --no-pager | head -50
-              fi
-            fi
-          else
-            echo "❌ CasaOS service file not found! Please generate a new snapshot with the latest workflow config"
+            echo "❌ 错误：1Panel 服务启动失败"
+            echo "📜 服务错误日志："
+            sudo systemctl status 1panel --no-pager
             exit 1
           fi
 
-      - name: Deploy Tailscale
-        run: |
-          set -e
-          export LC_ALL=zh_CN.UTF-8
-          export LANG=en_US.UTF-8
-          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Missing Tailscale auth key, skip deployment"
-            exit 0
+          echo "📌 验证 1Panel 核心功能："
+          if sudo 1panel status >/dev/null 2>&1; then
+            echo "   - 核心功能：正常 ✅"
+            # 修正：兼容不同版本 1Panel，改用 status 提取版本
+            echo "   - 版本信息：$(sudo 1panel status | grep -i version | head -n1)"
+          else
+            echo "⚠️ 警告：服务运行但核心功能异常"
           fi
-          sudo apt update -y && sudo apt install -y apt-transport-https ca-certificates
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          sudo chmod 644 /usr/share/keyrings/tailscale-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo chmod 644 /etc/apt/sources.list.d/tailscale.list
-          sudo apt update -y && sudo apt install -y tailscale
-          TAILSCALE_PATH=$(which tailscale)
-          if [ -z "$TAILSCALE_PATH" ]; then
-            echo "❌ Tailscale installation failed, no executable found"
-            exit 0
-          fi
-          echo "✅ Tailscale installed at: $TAILSCALE_PATH"
-          if ! sudo "$TAILSCALE_PATH" up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="casaos-snapshot-${{ github.run_id }}"; then
-            echo "❌ Tailscale login failed"
-            sudo "$TAILSCALE_PATH" status
-            exit 0
-          fi
-          echo "✅ Tailscale IP address: $(sudo "$TAILSCALE_PATH" ip -4)"
-          echo "✅ Tailscale deployed successfully"
+          echo "=================================================="
+          echo "            🎉 1Panel 服务重启结束"
+          echo "=================================================="
 
-      - name: Create Snapshot and Upload to WebDAV
+      - name: Create Full 1Panel Snapshot and Upload
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         shell: bash
         run: |
           set -e
-          export LC_ALL=zh_CN.UTF-8
-          export LANG=zh_CN.UTF-8
+          echo "=================================================="
+          echo "            🚀 1Panel 全量备份开始"
+          echo "=================================================="
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
-          
+
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-              echo "❌ USER_PAT or REPO is empty"
+              echo "⚠️ 警告：USER_PAT 或 REPO 未配置，跳过续跑触发"
               return 1
             fi
+            echo "📌 触发续跑工作流："
+            # 修正：USER_PAT 脱敏输出
+            echo "   - USER_PAT: ${USER_PAT:0:5}****"
+            echo "   - REPO: ${REPO}"
             if ! curl -fsSL --fail -X POST \
               -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
               -H "Content-Type: application/json" \
               "https://api.github.com/repos/$REPO/dispatches" \
-              -d '{"event_type":"renew_casaos_snapshot"}'; then
-              echo "❌ Failed to trigger renewal workflow"
+              -d '{"event_type":"renew_1panel_snapshot"}'; then
+              echo "❌ 错误：续跑工作流触发失败"
               return 1
             fi
-            echo "✅ Renewal workflow triggered successfully"
+            echo "✅ 续跑工作流触发成功"
             RENEW_TRIGGERED=true
             return 0
           }
-          
-          create_and_upload_snapshot() {
-            if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
-              return 1
-            fi
-            
-            echo "🔍 Verifying critical files before backup..."
-            if [ ! -f "/etc/systemd/system/casaos.service" ] && [ ! -f "/usr/lib/systemd/system/casaos.service" ]; then
-              echo "❌ casaos.service file not found! Cannot create valid snapshot"
-              exit 1
-            fi
-            if [ ! -f "/usr/bin/casaos" ]; then
-              echo "❌ /usr/bin/casaos executable not found! Please reinstall CasaOS"
-              exit 1
-            fi
-            echo "✅ All critical files verified"
-            
-            SNAPSHOT_NAME="casaos-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
-            TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
-            REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
-            echo "🔄 Creating snapshot: $SNAPSHOT_NAME (upload to WebDAV: ${REMOTE_PATH})"
-            
-            sudo systemctl stop docker.service docker.socket || true
-            if systemctl is-active --quiet casaos.service; then
-              sudo systemctl stop casaos.service
-            fi
-            sudo systemctl mask docker.socket
-            sudo pkill -9 docker || true
-            sync && sleep 5
-            
-            for dir in $CORE_DIRS; do
-              if [ ! -d "$dir" ] && [ ! -f "$dir" ]; then
-                echo "⚠️ Path $dir does not exist, skip backup"
+
+          create_1panel_snapshot() {
+            echo "📌 验证 1Panel 关键文件："
+            CRITICAL_FILES=(
+              "/usr/bin/1panel"
+              "/etc/systemd/system/1panel.service"
+              "/var/lib/1panel"
+            )
+            for file in "${CRITICAL_FILES[@]}"; do
+              if [ -e "$file" ]; then
+                echo "   - $file: 存在 ✅"
+              else
+                echo "❌ 错误：关键文件缺失 $file"
+                exit 1
               fi
             done
-            
+
+            SNAPSHOT_NAME="1panel-server-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
+            TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
+            REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/${SNAPSHOT_NAME}"
+            echo "📌 备份参数信息："
+            echo "   - 快照名称：${SNAPSHOT_NAME}"
+            echo "   - 本地临时路径：${TMP_SNAPSHOT}"
+            echo "   - 远程存储路径：${REMOTE_PATH}"
+
+            echo "📌 停止 1Panel 服务保证数据一致性："
+            sudo systemctl stop 1panel || true
+            sudo systemctl mask 1panel || true
+            sync && sleep 5
+            echo "✅ 服务已停止并锁定"
+
+            echo "📌 打包 1Panel 核心目录："
+            echo "   - 打包命令：tar -czf ${TMP_SNAPSHOT} ${CORE_DIRS} ${EXCLUDE_RULES}"
             sudo tar -czf "${TMP_SNAPSHOT}" \
               --absolute-names \
               --ignore-failed-read \
-              --warning=no-all \
               $EXCLUDE_RULES \
               $CORE_DIRS
-            
             sudo chown runner:runner "${TMP_SNAPSHOT}"
             sudo chmod 644 "${TMP_SNAPSHOT}"
-            
+            echo "✅ 打包完成，快照大小：$(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
+
+            echo "📌 验证快照有效性："
             if [ ! -f "${TMP_SNAPSHOT}" ] || [ $(stat -c%s "${TMP_SNAPSHOT}") -lt 1024 ]; then
-              echo "❌ Snapshot is empty or invalid (size < 1KB)"
-              sudo systemctl unmask docker.socket
-              sudo systemctl start docker.service docker.socket || true
-              if systemctl list-unit-files | grep -q casaos.service; then
-                sudo systemctl start casaos.service || true
-              fi
+              echo "❌ 错误：快照文件为空或无效"
+              sudo systemctl unmask 1panel
+              sudo systemctl start 1panel || true
               return 1
             fi
-            
-            echo "✅ Snapshot created: $(du -sh ${TMP_SNAPSHOT} | awk '{print $1}')"
-            
+            echo "✅ 快照有效性校验通过"
+
+            echo "📌 上传快照到 WebDAV："
+            echo "   - 上传命令：rclone copy ${TMP_SNAPSHOT} ${REMOTE_PATH}"
             if ! sudo -u runner rclone copy "${TMP_SNAPSHOT}" "${REMOTE_PATH}" \
               --config /home/runner/.rclone.conf \
               --transfers 4 \
-              --header "Content-Type: application/xml;charset=utf-8" \
-              --log-level INFO \
-              --log-file /tmp/rclone_upload.log; then
-              echo "❌ Upload failed, check log: /tmp/rclone_upload.log"
-              cat /tmp/rclone_upload.log || true
+              --log-level INFO; then
+              echo "❌ 错误：快照上传失败"
               rm -f "${TMP_SNAPSHOT}"
-              sudo systemctl unmask docker.socket
-              sudo systemctl start docker.service docker.socket || true
-              if systemctl list-unit-files | grep -q casaos.service; then
-                sudo systemctl start casaos.service || true
-              fi
+              sudo systemctl unmask 1panel
+              sudo systemctl start 1panel || true
               return 1
             fi
-            
-            echo "✅ Snapshot uploaded to WebDAV: ${REMOTE_PATH}"
-            META_FILE="/tmp/snapshot_meta.txt"
-            echo "snapshot_name=${SNAPSHOT_NAME}" > "${META_FILE}"
-            echo "create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"
-            sudo -u runner rclone copy "${META_FILE}" "mywebdav:${WEBDAV_SNAPSHOT_EN_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
-            rm -f "${TMP_SNAPSHOT}" "${META_FILE}"
-            
-            sudo systemctl unmask docker.socket
-            sudo systemctl start docker.service docker.socket || true
-            if systemctl list-unit-files | grep -q casaos.service; then
-              sudo systemctl start casaos.service || true
-            fi
+            echo "✅ 快照上传成功"
+
+            echo "📌 清理临时文件并重启服务："
+            rm -f "${TMP_SNAPSHOT}"
+            sudo systemctl unmask 1panel
+            sudo systemctl start 1panel || true
+            echo "✅ 临时文件清理完成，服务已重启"
             return 0
           }
-          
+
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
-            echo "📊 Workflow running for $run_mins minutes"
-            
+            echo "📌 工作流运行时长：${run_mins} 分钟"
+
             if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰ Time to create and upload snapshot"
-              if create_and_upload_snapshot; then
+              echo "⏰ 达到备份触发时间（2分钟），开始创建快照"
+              if create_1panel_snapshot; then
                 trigger_renew
               else
-                echo "❌ Snapshot creation failed, skip renewal"
+                echo "❌ 快照创建失败，本次跳过，下次继续尝试"
+                # 修正：将 break 改为 continue，不终止循环
+                continue
               fi
             fi
-            
+
             if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
-              echo "⏹️ Reached maximum run time, exiting"
-              exit 0
+              echo "⏹️ 达到最大运行时间（${MAX_RUN_MINUTES} 分钟），退出备份循环"
+              break
             fi
-            
+
             sleep 60
           done
+          echo "=================================================="
+          echo "            🎉 1Panel 全量备份结束"
+          echo "=================================================="
 
-      - name: Cleanup
+      - name: Cleanup Workflow Files
         if: ${{ always() }}
         run: |
           set -e
-          export LC_ALL=zh_CN.UTF-8
-          export LANG=zh_CN.UTF-8
-          sudo systemctl unmask docker.socket || true
-          sudo rm -rf /tmp/casaos-server-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
-          echo "✅ Cleanup completed successfully"
+          echo "=================================================="
+          echo "            🚀 工作流清理开始"
+          echo "=================================================="
+          echo "📌 解锁 1Panel 服务："
+          sudo systemctl unmask 1panel || true
+          echo "✅ 服务解锁完成"
+
+          echo "📌 清理临时文件："
+          sudo rm -rf /tmp/1panel-server-snapshot-*.tar.gz
+          echo "   - 已清理：/tmp/1panel-server-snapshot-*.tar.gz"
+          
+          echo "📌 清理 Rclone 配置："
+          sudo rm -rf /home/runner/.rclone.conf
+          echo "   - 已清理：/home/runner/.rclone.conf"
+          
+          echo "📌 清理 Sudo 权限文件："
+          sudo rm -rf /etc/sudoers.d/runner
+          echo "   - 已清理：/etc/sudoers.d/runner"
+          
+          echo "📌 最终服务状态检查："
+          if sudo systemctl is-active --quiet 1panel; then
+            echo "   - 1Panel 服务：运行中 ✅"
+          else
+            echo "   - 1Panel 服务：未运行 ⚠️"
+          fi
+          echo "=================================================="
+          echo "            🎉 工作流清理结束"
+          echo "=================================================="
