@@ -35,9 +35,10 @@ jobs:
       - name: 1. 环境初始化（海外服务器适配）
         run: |
           set -e
-          sudo mkdir -p /etc/systemd/system && sudo rm -rf /est/systemd/system 2>/dev/null || true
+          # 修正：只创建目录，不删除
+          sudo mkdir -p /etc/systemd/system 2>/dev/null || true
           
-          sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak
+          sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
           cat <<EOF | sudo tee /etc/apt/sources.list
           deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
           deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse
@@ -50,7 +51,10 @@ jobs:
           
           curl -fsSL https://rclone.org/install.sh | sudo bash
           
-          sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
+          # 只在必要时修改sudoers
+          if grep -q "requiretty" /etc/sudoers 2>/dev/null; then
+            sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
+          fi
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner && sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
@@ -76,7 +80,7 @@ jobs:
           set -e
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "❌ 缺少WebDAV凭证，跳过备份恢复"
-            echo "webav_available=false" >> "$GITHUB_OUTPUT"
+            echo "webdav_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           
@@ -86,7 +90,7 @@ jobs:
           
           if ! rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
             echo "❌ WebDAV连接失败"
-            echo "webav_available=false" >> "$GITHUB_OUTPUT"
+            echo "webdav_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           
@@ -97,10 +101,10 @@ jobs:
           else
             echo "ℹ️ WebDAV无快照，将执行全新安装"
           fi
-          echo "webav_available=true" >> "$GITHUB_OUTPUT"
+          echo "webdav_available=true" >> "$GITHUB_OUTPUT"
 
       - name: 4. 从WebDAV恢复快照
-        if: ${{ steps.webdav-config.outputs.webav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
+        if: ${{ steps.webdav-config.outputs.webdav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
         id: restore
         run: |
           set -e
@@ -118,11 +122,13 @@ jobs:
             exit 1
           fi
           
-          # 恢复时使用无歧义的tar参数
-          rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / \
+          # 恢复时使用正确的tar参数，不使用--absolute-names用于提取
+          TEMP_SNAPSHOT="/tmp/snapshot.tar.gz"
+          rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf > "$TEMP_SNAPSHOT"
+          sudo tar -xzf "$TEMP_SNAPSHOT" -C / \
             --overwrite --ignore-failed-read \
-            --preserve-permissions --preserve-owner \
-            --absolute-names $EXCLUDE_RULES
+            --preserve-permissions --preserve-owner
+          rm -f "$TEMP_SNAPSHOT"
           
           sudo apt purge -y moby* containerd* runc* docker* -y || true
           sudo apt autoremove -y && sudo apt clean
@@ -219,7 +225,7 @@ jobs:
           echo "✅ Tailscale IP：$(sudo tailscale ip -4)"
 
       - name: 9. 创建快照+上传WebDAV+触发续跑
-        if: ${{ steps.webdav-config.outputs.webav_available == 'true' }}
+        if: ${{ steps.webdav-config.outputs.webdav_available == 'true' }}
         run: |
           set -e
           start_time=$(date +%s)
@@ -283,15 +289,19 @@ jobs:
             sudo pkill -9 docker containerd 1panel 2>/dev/null || true
             sync && sleep 5
             
-            # 无歧义的tar参数（兼容所有版本）
+            # 使用正确的tar参数（兼容所有版本），排除规则需要单独处理
             if ! sudo tar -czf "$TMP_SNAPSHOT" \
-              --absolute-names \
               --ignore-failed-read \
               --preserve-permissions \
               --preserve-owner \
               --acls \
               --xattrs \
-              $EXCLUDE_RULES \
+              --exclude='*.log' --exclude='*.tmp' --exclude='*.cache' \
+              --exclude='/var/lib/docker/containers/*/*.log' \
+              --exclude='/var/lib/docker/overlay2/*/tmp' --exclude='/var/lib/docker/tmp' \
+              --exclude='/DATA/tmp' --exclude='/DATA/缓存' --exclude='/DATA/logs' \
+              --exclude='/opt/1panel/logs' --exclude='/opt/1panel/tmp' \
+              --exclude='/var/log/1panel/*' --exclude='/etc/systemd/system/*.wants' \
               $VALID_DIRS; then
               echo "❌ tar打包失败"
               return 1
