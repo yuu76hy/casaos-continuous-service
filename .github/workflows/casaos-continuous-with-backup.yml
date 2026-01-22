@@ -1,18 +1,18 @@
-name: 1Panel-Docker-备份恢复-自动安装兜底
+name: 1Panel-Docker-备份恢复-自动安装-Tailscale
 
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [full_backup_restore_install]
+    types: [full_backup_restore_tailscale]
 
 jobs:
-  backup_restore_install_job:
+  backup_restore_install_tailscale_job:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_DIR: "/1panel_docker_full_backup"
-      # 1Panel + Docker 全量核心备份目录
+      # 🔴 仅备份1Panel+Docker核心目录，剔除Tailscale相关文件
       FULL_CORE_DIRS: |
         /opt/1panel
         /usr/bin/1panel
@@ -26,7 +26,7 @@ jobs:
         /usr/lib/systemd/system/docker.service
         /usr/lib/systemd/system/docker.socket
         /DATA
-      # 仅过滤临时文件和日志
+      # 过滤临时文件和日志
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
         --exclude=/var/lib/docker/overlay2/*/tmp
@@ -41,6 +41,7 @@ jobs:
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       USER_PAT: ${{ secrets.USER_PAT }}
       REPO: ${{ github.repository }}
       WEBDAV_AVAILABLE: true
@@ -110,8 +111,8 @@ jobs:
           echo "===== 开始全量恢复 1Panel + Docker ====="
           
           # 停止所有相关服务
-          sudo systemctl stop 1panel docker docker.socket 2>/dev/null || true
-          sudo pkill -9 1panel docker dockerd 2>/dev/null || true
+          sudo systemctl stop 1panel docker docker.socket tailscaled 2>/dev/null || true
+          sudo pkill -9 1panel docker dockerd tailscaled 2>/dev/null || true
           sync && sleep 5
           
           # 解压快照到根目录，保留权限
@@ -124,7 +125,7 @@ jobs:
           # 重新加载 systemd
           sudo systemctl daemon-reload
           
-          # 启动服务
+          # 启动1Panel+Docker服务
           sudo systemctl enable --now docker.socket docker.service 1panel.service
           sleep 10
           
@@ -204,22 +205,44 @@ jobs:
             sudo 1panel repair || true
           fi
 
-      - name: 全量备份（恢复/安装成功后执行）
+      - name: 部署 Tailscale（所有情况都执行，不依赖备份）
+        if: ${{ env.TAILSCALE_AUTH_KEY != '' }}
+        run: |
+          set -e
+          echo "===== 开始部署 Tailscale ====="
+          
+          # 卸载旧版本（如有），避免残留配置干扰
+          sudo apt remove -y tailscale 2>/dev/null || true
+          sudo rm -rf /etc/tailscale /var/lib/tailscale 2>/dev/null || true
+          
+          # 全新安装 Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sudo bash -
+          
+          # 启动 Tailscaled 服务
+          sudo systemctl enable --now tailscaled.service
+          sleep 3
+          
+          # 认证并启动 Tailscale，生成新配置
+          sudo tailscale up --authkey=${TAILSCALE_AUTH_KEY} --accept-routes --advertise-routes=192.168.1.0/24
+          TAILSCALE_IP=$(sudo tailscale ip -4)
+          echo "✅ Tailscale 部署成功，本机 Tailscale IP: ${TAILSCALE_IP}"
+
+      - name: 全量备份 1Panel + Docker（恢复/安装成功后执行）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && (env.DEPLOY_STATUS == 'restored' || env.DEPLOY_STATUS == 'installed') }}
         run: |
           set -e
           echo "===== 开始全量备份 1Panel + Docker ====="
           
           # 停止服务确保数据一致性
-          sudo systemctl stop 1panel docker docker.socket 2>/dev/null || true
-          sudo pkill -9 1panel docker dockerd 2>/dev/null || true
+          sudo systemctl stop 1panel docker docker.socket tailscaled 2>/dev/null || true
+          sudo pkill -9 1panel docker dockerd tailscaled 2>/dev/null || true
           sync && sleep 5
           
           # 生成快照名称
           SNAPSHOT_NAME="full-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
           TMP_SNAPSHOT="/tmp/${SNAPSHOT_NAME}"
           
-          # 打包核心目录
+          # 打包1Panel+Docker核心目录，不包含Tailscale文件
           sudo tar -czf "${TMP_SNAPSHOT}" --absolute-names --preserve-permissions --warning=no-all $EXCLUDE_RULES $FULL_CORE_DIRS
           
           # 校验快照
@@ -233,8 +256,8 @@ jobs:
             fi
           fi
           
-          # 重启服务
-          sudo systemctl enable --now docker.socket docker.service 1panel.service
+          # 重启所有服务
+          sudo systemctl enable --now docker.socket docker.service 1panel.service tailscaled.service
           sleep 5
           
           # 清理临时文件
