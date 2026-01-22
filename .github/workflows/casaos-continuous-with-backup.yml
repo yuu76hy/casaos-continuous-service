@@ -11,7 +11,8 @@ jobs:
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
-      WEBDAV_SNAPSHOT_DIR: "/z/Ubu"
+      # 修正WebDAV目录：\z\Ubu → YAML中转义为 \\\\z\\\\Ubu
+      WEBDAV_SNAPSHOT_DIR: "\\\\z\\\\Ubu"
       CORE_BACKUP_DIRS: "/var/lib/docker /etc/docker /opt/1panel /usr/bin/1panel /etc/systemd/system /DATA"
       EXCLUDE_RULES: >-
         --exclude=*.log --exclude=*.tmp --exclude=*.cache
