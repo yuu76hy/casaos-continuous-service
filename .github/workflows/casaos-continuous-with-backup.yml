@@ -26,13 +26,19 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ github.repository }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      # 1Panel核心配置：修正后的可执行路径和service文件路径
+      PANEL_BIN_PATH: "/usr/local/bin/1panel"
+      PANEL_SERVICE_PATH: "/etc/systemd/system/1panel.service"
 
     steps:
-      - name: 1. Env Initialization (Oversea Server)
+      - name: 1. Env Initialization (Oversea Server + SSH Compat)
         run: |
           set -e
-          sudo mkdir -p /etc/systemd/system 2>/dev/null || true
+          # 关闭SSH密码验证提示，解决Connect fail问题
+          sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/g' /etc/ssh/sshd_config 2>/dev/null || true
+          sudo systemctl restart sshd 2>/dev/null || true
           
+          sudo mkdir -p /etc/systemd/system 2>/dev/null || true
           sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
           cat <<EOF | sudo tee /etc/apt/sources.list
           deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse
@@ -41,29 +47,29 @@ jobs:
           deb http://archive.ubuntu.com/ubuntu/ noble-backports main restricted universe multiverse
           EOF
           
-          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils apt-transport-https ca-certificates gnupg lsb-release file
+          # 安装核心依赖+乱码过滤工具
+          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils apt-transport-https ca-certificates gnupg lsb-release file iconv
           sudo locale-gen zh_CN.UTF-8 && export LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8
-          
           curl -fsSL https://rclone.org/install.sh | sudo bash
           
+          # 配置sudo免密，解决SSH sudo密码提示
           if grep -q "requiretty" /etc/sudoers 2>/dev/null; then
             sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
           fi
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner && sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
-          echo "✅ Check Network Connectivity..."
-          curl -fsSL https://github.com >/dev/null 2>&1 || { echo "❌ Can't Connect to GitHub"; exit 1; }
-          echo "✅ Env Initialization Completed"
+          echo "✅ Env Initialization Completed (SSH/Encoding Compat)"
 
-      - name: 2. Create roots Admin User
+      - name: 2. Create roots Admin User (No Password)
         run: |
           set -e
           if ! id "roots" &>/dev/null; then
             sudo useradd -m -s /bin/bash roots
-            echo "roots:${ROOTS_PASSWORD:-$(openssl rand -base64 12)}" | sudo chpasswd
-            sudo usermod -aG sudo,docker roots
-            echo "✅ roots User Created Successfully"
+            # 配置roots免密sudo，解决SSH sudo密码问题
+            echo "roots ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/roots
+            sudo chmod 0440 /etc/sudoers.d/roots
+            echo "✅ roots User Created (Passwordless Sudo)"
           else
             echo "ℹ️ roots User Exists, Skip"
           fi
@@ -88,7 +94,6 @@ jobs:
             exit 0
           fi
           
-          # 彻底修复路径：清理目录末尾/ + 仅提取快照文件名（避免重复拼接）
           WEBDAV_SNAPSHOT_DIR_CLEAN=$(echo "$WEBDAV_SNAPSHOT_DIR" | sed 's/\/$//')
           LATEST_SNAPSHOT=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN} --config /home/runner/.rclone.conf | grep "1panel-snapshot-.*.tar.gz" | awk -F '/' '{print $NF}' | sort -r | head -n1)
           
@@ -109,20 +114,23 @@ jobs:
           SNAPSHOT_PATH=${{ steps.webdav-config.outputs.latest_snapshot }}
           echo "===== Restore Snapshot：$SNAPSHOT_PATH ====="
           
+          # 强制停止所有服务，避免快照恢复冲突
           sudo systemctl stop 1panel docker containerd 2>/dev/null || true
           sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
           sudo pkill -9 docker containerd 1panel 2>/dev/null || true
+          sudo systemctl reset-failed 1panel docker containerd 2>/dev/null || true
           sync && sleep 3
           
+          # 校验快照完整性
           if ! rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
             echo "❌ Snapshot Corrupted"
             echo "restore_success=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           
+          # 恢复快照
           TEMP_SNAPSHOT="/tmp/snapshot.tar.gz"
           rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf > "$TEMP_SNAPSHOT"
-          # GNU tar兼容参数：-p(保留权限) + --same-owner(保留所有者)，反斜杠后无空格
           sudo tar -xzf "$TEMP_SNAPSHOT" -C / \
             --overwrite \
             --ignore-failed-read \
@@ -130,10 +138,12 @@ jobs:
             --same-owner
           rm -f "$TEMP_SNAPSHOT"
           
+          # 重装Docker，保证与运行器兼容
           sudo apt purge -y moby* containerd* runc* docker* -y || true
           sudo apt autoremove -y && sudo apt clean
           curl -fsSL https://get.docker.com | sudo bash
           
+          # 删除已恢复的旧快照
           rclone delete mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf
           rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt --config /home/runner/.rclone.conf
           
@@ -147,6 +157,7 @@ jobs:
           echo "===== Clean 1Panel/Docker Residues ====="
           sudo systemctl stop 1panel docker containerd 2>/dev/null || true
           sudo pkill -9 docker containerd 1panel 2>/dev/null || true
+          sudo systemctl reset-failed 1panel docker containerd 2>/dev/null || true
           sync && sleep 3
           
           if sudo docker info >/dev/null 2>&1; then
@@ -155,9 +166,10 @@ jobs:
             sudo docker volume rm -f $(sudo docker volume ls -q) 2>/dev/null || true
           fi
           
+          # 彻底清理错误的service文件和可执行文件
+          sudo rm -rf /opt/1panel /etc/1panel /usr/bin/1panel $PANEL_SERVICE_PATH $PANEL_BIN_PATH /var/lib/docker /etc/docker /var/lib/containerd /DATA/*
           sudo apt purge -y docker* moby* containerd* runc* 1panel* -y || true
           sudo apt autoremove -y && sudo apt clean
-          sudo rm -rf /opt/1panel /etc/1panel /usr/local/bin/1panel /var/lib/docker /etc/docker /var/lib/containerd /DATA/*
           echo "✅ Residues Cleaned Completed"
 
       - name: 6. Install Docker+1Panel (No Snapshot/Restore Failed)
@@ -180,21 +192,44 @@ jobs:
           fi
           echo "✅ Docker Installed Completed：$(docker -v)"
           
-          echo "===== Install 1Panel ====="
+          # 安装1Panel并生成正确的service文件
+          echo "===== Install 1Panel (Correct Service Path) ====="
           curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -
           sleep 5
-          if ! sudo systemctl is-active --quiet 1panel; then
-            sudo 1panel repair
-          fi
-          echo "✅ 1Panel Installed Completed"
+          # 强制修正service文件路径
+          sudo bash -c "cat > $PANEL_SERVICE_PATH" << 'EOF'
+[Unit]
+Description=1Panel, a modern open source linux panel
+Documentation=https://1panel.cn/
+After=network.target docker.service containerd.service
 
-      - name: 7. Restart Services (Restore Success)
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/1panel
+Restart=on-failure
+RestartSec=5s
+WorkingDirectory=/opt/1panel
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+          sudo systemctl daemon-reload && sudo 1panel repair 2>/dev/null || true
+          if ! sudo systemctl is-active --quiet 1panel; then
+            sudo systemctl start 1panel
+          fi
+          echo "✅ 1Panel Installed Completed (Correct Exec Path)"
+
+      - name: 7. Restart Services + Fix Core Issues (Restore Success)
         if: ${{ steps.restore.outputs.restore_success == 'true' }}
         run: |
           set -e
           echo "===== Restart 1Panel/Docker Services ====="
+          echo "===== Core Fix: 1panel.service Path & 203/EXEC Error ====="
           
-          # 步骤1：修复并启动Docker/containerd依赖服务
+          # 步骤1：修复Docker/containerd依赖服务
           for service in docker.service containerd.service; do
             if sudo systemctl list-unit-files --type=service | grep -q "$service"; then
               sudo systemctl reset-failed "$service" 2>/dev/null || true
@@ -203,41 +238,65 @@ jobs:
           sudo systemctl daemon-reload && sleep 15
           sudo systemctl enable --now containerd.service 2>/dev/null || true && sleep 3
           sudo systemctl enable --now docker.service 2>/dev/null || true && sleep 10
+          
+          # 步骤2：强制修正1panel.service文件（核心解决路径错误）
+          # 备份旧service文件
+          if [ -f "$PANEL_SERVICE_PATH" ]; then
+            sudo cp "$PANEL_SERVICE_PATH" "${PANEL_SERVICE_PATH}.bak" 2>/dev/null || true
+          fi
+          # 生成正确的service文件，替换ExecStart错误路径
+          sudo bash -c "cat > $PANEL_SERVICE_PATH" << 'EOF'
+[Unit]
+Description=1Panel, a modern open source linux panel
+Documentation=https://1panel.cn/
+After=network.target docker.service containerd.service
 
-          # 步骤2：核心修复1Panel status=203/EXEC执行失败（保留数据，仅修复程序）
-          echo "===== Fix 1Panel EXEC 203 Error ====="
-          # 检查1Panel主程序是否存在
-          if [ ! -f "/usr/local/bin/1panel" ]; then
-            echo "⚠️ /usr/local/bin/1panel not found, reinstall main program (keep data)"
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/1panel
+Restart=on-failure
+RestartSec=5s
+WorkingDirectory=/opt/1panel
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+          echo "✅ Fixed 1panel.service: ExecStart=/usr/local/bin/1panel (Removed /usr/bin/1panel)"
+          
+          # 步骤3：修复1Panel可执行文件（权限/架构/存在性）
+          if [ ! -f "$PANEL_BIN_PATH" ]; then
+            echo "⚠️ $PANEL_BIN_PATH not found, reinstall main program (keep data)"
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
           else
-            # 修复可执行权限
-            echo "✅ Fix 1Panel execute permission"
-            sudo chmod +x /usr/local/bin/1panel
-            # 检查架构兼容性（GitHub Actions为x86_64，过滤ARM架构）
-            if file /usr/local/bin/1panel | grep -qi "arm\|aarch64"; then
-              echo "⚠️ 1Panel is ARM architecture, incompatible with x86_64 runner, reinstall"
-              sudo rm -f /usr/local/bin/1panel
+            sudo chmod +x "$PANEL_BIN_PATH"
+            # 检查架构兼容性（x86_64 for GitHub Actions）
+            if file "$PANEL_BIN_PATH" | grep -qi "arm\|aarch64"; then
+              echo "⚠️ 1Panel is ARM architecture, reinstall x86_64 version"
+              sudo rm -f "$PANEL_BIN_PATH"
               curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
             fi
           fi
-
-          # 步骤3：重新注册并启动1panel.service
-          if ! sudo systemctl list-unit-files --type=service | grep -q "1panel.service"; then
-            echo "✅ Regenerate 1panel.service file"
-            sudo 1panel repair 2>/dev/null || true
-            sudo systemctl daemon-reload
-          fi
+          
+          # 步骤4：终止1Panel自动重启循环 + 重新启动
+          sudo systemctl stop 1panel 2>/dev/null || true
+          sudo systemctl reset-failed 1panel 2>/dev/null || true
+          sudo systemctl daemon-reload && sleep 5
           sudo systemctl enable --now 1panel.service 2>/dev/null || true && sleep 10
-
-          # 步骤4：状态校验（带重试机制，避免启动延迟）
-          echo "===== Check Service Status ====="
-          # 强制校验Docker状态
+          
+          # 步骤5：状态校验（带重试，过滤乱码）
+          echo "===== Check Service Status (Encoding Compat) ====="
+          # 校验Docker状态
           if ! sudo systemctl is-active --quiet docker; then
-            echo "❌ Docker Start Failed：$(sudo journalctl -xeu docker.service --no-pager | head -20)"
+            # 过滤乱码输出日志
+            LOG_CONTENT=$(sudo journalctl -xeu docker.service --no-pager | head -20 | iconv -f utf-8 -t utf-8 -c 2>/dev/null)
+            echo "❌ Docker Start Failed：$LOG_CONTENT"
             exit 1
           fi
-          # 1Panel多轮重试校验，提升容错性
+          
+          # 1Panel多轮重试校验，解决启动延迟
           panel_active=false
           for retry in {1..3}; do
             if sudo systemctl is-active --quiet 1panel; then
@@ -248,18 +307,26 @@ jobs:
             sudo systemctl restart 1panel
             sleep 5
           done
-          # 最终兜底：重试失败则重装1Panel（保留数据）
+          
+          # 最终兜底修复
           if [ "$panel_active" = "false" ]; then
-            echo "⚠️ 1Panel start failed, final repair (keep DATA/opt/1panel)"
+            echo "⚠️ 1Panel start failed, final repair (keep data)"
             curl -fsSL https://resource.fit2cloud.com/1panel/package/quick_start.sh | sudo bash -s -- --repair
-            sleep 5
+            sudo systemctl daemon-reload && sleep 5
+            sudo systemctl restart 1panel
+            # 再次校验
             if ! sudo systemctl is-active --quiet 1panel; then
-              echo "❌ 1Panel Start Failed：$(sudo journalctl -xeu 1panel.service --no-pager | head -20)"
+              LOG_CONTENT=$(sudo journalctl -xeu 1panel.service --no-pager | head -20 | iconv -f utf-8 -t utf-8 -c 2>/dev/null)
+              echo "❌ 1Panel Start Failed：$LOG_CONTENT"
               exit 1
             fi
           fi
-
+          
+          # 验证最终状态
+          sudo systemctl status 1panel --no-pager | iconv -f utf-8 -t utf-8 -c 2>/dev/null
+          sudo systemctl status docker --no-pager | iconv -f utf-8 -t utf-8 -c 2>/dev/null
           echo "✅ All Services Restarted Successfully"
+          echo "✅ Core Issues Fixed: 1panel.service Path / 203/EXEC / Auto-Restart Loop"
 
       - name: 8. Deploy Tailscale (Optional)
         run: |
@@ -272,7 +339,8 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list
           sudo apt update -y && sudo apt install -y tailscale
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="1panel-snapshot-${{ github.run_id }}"
-          echo "✅ Tailscale IP：$(sudo tailscale ip -4)"
+          TS_IP=$(sudo tailscale ip -4 | iconv -f utf-8 -t utf-8 -c 2>/dev/null)
+          echo "✅ Tailscale Deployed, IP：$TS_IP"
 
       - name: 9. Create Snapshot + Upload WebDAV + Trigger Renew
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' }}
@@ -329,25 +397,22 @@ jobs:
             TMP_SNAPSHOT="/tmp/$SNAPSHOT_NAME"
             REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/$SNAPSHOT_NAME"
             
+            # 停止服务后创建快照，保证一致性
             sudo systemctl stop 1panel docker containerd 2>/dev/null || true
             sudo pkill -9 docker containerd 1panel 2>/dev/null || true
             sync && sleep 5
             
-            # 统一tar兼容参数，反斜杠后无空格，缩进对齐
+            # 打包快照（包含正确的service文件和可执行路径）
             sudo tar -czpf "$TMP_SNAPSHOT" \
               --ignore-failed-read \
               -p \
               --same-owner \
               --acls \
               --xattrs \
-              --exclude='*.log' --exclude='*.tmp' --exclude='*.cache' \
-              --exclude='/var/lib/docker/containers/*/*.log' \
-              --exclude='/var/lib/docker/overlay2/*/tmp' --exclude='/var/lib/docker/tmp' \
-              --exclude='/DATA/tmp' --exclude='/DATA/缓存' --exclude='/DATA/logs' \
-              --exclude='/opt/1panel/logs' --exclude='/opt/1panel/tmp' \
-              --exclude='/var/log/1panel/*' --exclude='/etc/systemd/system/*.wants' \
+              $EXCLUDE_RULES \
               $VALID_DIRS || { echo "❌ Tar Package Failed"; return 1; }
             
+            # 校验快照大小
             if [ $(stat -c%s "$TMP_SNAPSHOT") -lt 1024 ]; then
               echo "❌ Invalid Snapshot (File Too Small)"
               rm -f "$TMP_SNAPSHOT"
@@ -355,14 +420,15 @@ jobs:
             fi
             sudo chown runner:runner "$TMP_SNAPSHOT"
             
+            # 上传快照
             if ! sudo -u runner rclone copy "$TMP_SNAPSHOT" "$REMOTE_PATH" --config /home/runner/.rclone.conf --transfers 4; then
               echo "❌ Upload Failed"
               rm -f "$TMP_SNAPSHOT"
               return 1
             fi
             
-            # 生成快照元数据
-            printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n1panel_version=%s\n" \
+            # 生成元数据（记录正确的路径信息）
+            printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n1panel_version=%s\n1panel_bin_path=/usr/local/bin/1panel\nservice_path=/etc/systemd/system/1panel.service\n" \
               "$SNAPSHOT_NAME" \
               "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               "$(du -sh "$TMP_SNAPSHOT" | awk '{print $1}')" \
@@ -371,14 +437,14 @@ jobs:
             
             sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             
-            # 清理临时文件并重启服务
+            # 清理并重启服务
             rm -f "$TMP_SNAPSHOT" /tmp/snapshot_meta.txt
             sudo systemctl start docker containerd 1panel 2>/dev/null || true
-            echo "✅ Snapshot Created & Uploaded Successfully"
+            echo "✅ Snapshot Created & Uploaded (Included Correct 1Panel Paths)"
             return 0
           }
           
-          # 主循环：运行2分钟后创建快照+触发续跑，超时自动退出
+          # 主循环：2分钟后创建快照，6小时超时退出
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             echo "⏱️ Running Time：$run_mins / $MAX_RUN_MINUTES Mins"
@@ -398,6 +464,11 @@ jobs:
         if: ${{ always() }}
         run: |
           set -e
-          sudo rm -rf /tmp/1panel-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
+          # 清理临时文件+SSH配置+sudo配置
+          sudo rm -rf /tmp/1panel-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /etc/sudoers.d/roots /tmp/rclone_*.log
           sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
-          echo "✅ Temp Files Cleaned Completed"
+          # 恢复SSH原始配置
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config 2>/dev/null || true
+          sudo systemctl restart sshd 2>/dev/null || true
+          echo "✅ All Temp Files Cleaned"
+          echo "✅ SSH Config Restored"
