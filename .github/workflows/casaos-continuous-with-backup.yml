@@ -122,7 +122,7 @@ jobs:
           
           TEMP_SNAPSHOT="/tmp/snapshot.tar.gz"
           rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf > "$TEMP_SNAPSHOT"
-          # 修复tar参数：GNU tar兼容 -p(保留权限) + --same-owner(保留所有者)，反斜杠后无空格
+          # GNU tar兼容参数：-p(保留权限) + --same-owner(保留所有者)，反斜杠后无空格
           sudo tar -xzf "$TEMP_SNAPSHOT" -C / \
             --overwrite \
             --ignore-failed-read \
@@ -193,21 +193,42 @@ jobs:
         run: |
           set -e
           echo "===== Restart 1Panel/Docker Services ====="
-          sudo systemctl reset-failed docker.service containerd.service 1panel.service
+          
+          # 核心修复：仅对存在的服务执行reset-failed，避免1panel.service未加载报错
+          for service in docker.service containerd.service 1panel.service; do
+            if sudo systemctl list-unit-files --type=service | grep -q "$service"; then
+              sudo systemctl reset-failed "$service" 2>/dev/null || true
+            fi
+          done
+          
+          # 修正语法：&& 替代 &，命令全小写
           sudo systemctl daemon-reload && sleep 15
           
-          sudo systemctl enable --now containerd.service && sleep 3
-          sudo systemctl enable --now docker.service && sleep 10
-          sudo systemctl enable --now 1panel.service && sleep 5
+          # 按依赖顺序启动：containerd → docker → 1panel，加错误忽略
+          sudo systemctl enable --now containerd.service 2>/dev/null || true && sleep 3
+          sudo systemctl enable --now docker.service 2>/dev/null || true && sleep 10
           
+          # 关键修复：1panel.service未加载则自动修复并重新注册
+          if command -v 1panel &>/dev/null; then
+            if ! sudo systemctl list-unit-files --type=service | grep -q "1panel.service"; then
+              sudo 1panel repair 2>/dev/null || true
+              sudo systemctl daemon-reload
+            fi
+            sudo systemctl enable --now 1panel.service 2>/dev/null || true && sleep 5
+          fi
+          
+          # 校验Docker状态（必选）
           if ! sudo systemctl is-active --quiet docker; then
             echo "❌ Docker Start Failed：$(sudo journalctl -xeu docker.service --no-pager | head -20)"
             exit 1
           fi
-          if ! sudo systemctl is-active --quiet 1panel; then
+          
+          # 仅当1Panel安装后才校验状态，避免无服务报错
+          if command -v 1panel &>/dev/null && ! sudo systemctl is-active --quiet 1panel; then
             echo "❌ 1Panel Start Failed：$(sudo journalctl -xeu 1panel.service --no-pager | head -20)"
             exit 1
           fi
+          
           echo "✅ All Services Restarted Successfully"
 
       - name: 8. Deploy Tailscale (Optional)
@@ -282,7 +303,7 @@ jobs:
             sudo pkill -9 docker containerd 1panel 2>/dev/null || true
             sync && sleep 5
             
-            # 统一tar参数规范，反斜杠后无空格，缩进对齐
+            # 统一tar兼容参数，反斜杠后无空格，缩进对齐
             sudo tar -czpf "$TMP_SNAPSHOT" \
               --ignore-failed-read \
               -p \
@@ -310,6 +331,7 @@ jobs:
               return 1
             fi
             
+            # 生成快照元数据
             printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n1panel_version=%s\n" \
               "$SNAPSHOT_NAME" \
               "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -319,12 +341,14 @@ jobs:
             
             sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             
+            # 清理临时文件并重启服务
             rm -f "$TMP_SNAPSHOT" /tmp/snapshot_meta.txt
             sudo systemctl start docker containerd 1panel 2>/dev/null || true
             echo "✅ Snapshot Created & Uploaded Successfully"
             return 0
           }
           
+          # 主循环：运行2分钟后创建快照+触发续跑，超时自动退出
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             echo "⏱️ Running Time：$run_mins / $MAX_RUN_MINUTES Mins"
