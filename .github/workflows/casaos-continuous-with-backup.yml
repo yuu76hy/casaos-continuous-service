@@ -254,12 +254,14 @@ jobs:
             [ $(stat -c%s "$TMP_SNAPSHOT") -lt 1024 ] && echo "❌ 快照无效" && return 1
             sudo -u runner rclone copy "$TMP_SNAPSHOT" "$REMOTE_PATH" --config /home/runner/.rclone.conf --transfers 4 || { echo "❌ 上传失败"; return 1; }
             
-            # 生成元数据
-            echo "snapshot_name=$SNAPSHOT_NAME
-create_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-snapshot_size=$(du -sh $TMP_SNAPSHOT | awk '{print $1}')
-docker_version=$(docker -v | awk '{print $3}' | sed 's/,//g')
-1panel_version=$(1panel -v 2>/dev/null | awk '{print $3}' || echo 'unknown')" | sudo tee /tmp/snapshot_meta.txt
+            # 生成元数据（修复YAML语法错误：改用printf，避免换行符问题）
+            printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n1panel_version=%s\n" \
+              "$SNAPSHOT_NAME" \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              "$(du -sh $TMP_SNAPSHOT | awk '{print $1}')" \
+              "$(docker -v | awk '{print $3}' | sed 's/,//g')" \
+              "$(1panel -v 2>/dev/null | awk '{print $3}' || echo 'unknown')" | sudo tee /tmp/snapshot_meta.txt
+            
             sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR}/snapshot_meta.txt" --config /home/runner/.rclone.conf
             
             # 清理临时文件+启动服务
