@@ -1,12 +1,11 @@
 name: Docker-快照-备份-恢复
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
   repository_dispatch:
-    types: [renew_docker_snapshot]  # 调整触发类型名称
+    types: [renew_docker_snapshot]
 
 jobs:
-  # 核心修正：Job ID从中文"Docker-快照-备份-恢复"改为纯英文（符合命名规则）
   docker_snapshot_backup_restore:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -103,7 +102,7 @@ jobs:
 
       - name: 4. 从 WebDAV 恢复Docker快照
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
-        id: restore  # 英文ID，符合规则
+        id: restore
         run: |
           set -e
           SNAPSHOT_PATH=${{ steps.webdav-config.outputs.latest_snapshot }}
@@ -260,7 +259,6 @@ jobs:
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
           
-          # 删除旧容器函数（独立封装）
           stop_old_containers() {
             if sudo docker info >/dev/null 2>&1; then
               OLD_CONTAINERS=$(sudo docker ps -aq)
@@ -274,13 +272,11 @@ jobs:
             fi
           }
           
-          # 触发续跑【核心修改】：续跑API调用成功后，再执行删旧容器
           trigger_renew() {
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "❌缺少PAT/仓库信息，触发续跑失败"
               return 1
             fi
-            # 先调用API触发续跑
             if curl -fsSL --fail -X POST \
               -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
@@ -289,7 +285,6 @@ jobs:
               -d '{"event_type":"renew_docker_snapshot"}'; then
               echo "✅续跑已成功触发"
               RENEW_TRIGGERED=true
-              # 续跑成功后，执行删除旧容器操作
               stop_old_containers
             else
               echo "❌续跑触发失败，不执行旧容器清理"
@@ -297,7 +292,6 @@ jobs:
             fi
           }
           
-          # 创建Docker快照（逻辑不变）
           create_snapshot() {
             VALID_DIRS=""
             for dir in $CORE_BACKUP_DIRS; do
@@ -355,12 +349,13 @@ jobs:
             return 0
           }
           
-          # 主循环：运行2分钟后创建快照+触发续跑，超时自动退出
+          # 🔥核心修改：触发阈值从2分钟改为10分钟，其余不变
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
-            echo "⏱️运行时间：$run_mins / $MAX_RUN_MINUTES 分钟"
+            echo "⏱️运行时间：$run_mins / $MAX_RUN_MINUTES 分钟（10分钟后执行备份+续跑）"
               
-            if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
+            if [ $run_mins -ge 10 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
+              echo "⏰已运行10分钟，开始执行备份+续跑"
               create_snapshot && trigger_renew
             fi
               
