@@ -102,7 +102,7 @@ jobs:
 
       - name: 4. 从 WebDAV 恢复Docker快照
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
-        id: 恢复
+        id: restore  # 核心修正：中文"恢复"→英文"restore"
         run: |
           set -e
           SNAPSHOT_PATH=${{ steps.webdav-config.outputs.latest_snapshot }}
@@ -139,7 +139,8 @@ jobs:
           echo "restore_success=true" >> "$GITHUB_OUTPUT"
 
       - name: 5. 清理Docker残留物（恢复失败）
-        if: ${{ steps.恢复.outputs.restore_success != 'true' }}
+        # 核心修正：steps.恢复→steps.restore
+        if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
           echo "===== 清理Docker残留物 ====="
@@ -159,7 +160,8 @@ jobs:
           echo "✅Docker残留物清理完成"
 
       - name: 6. 全新安装Docker（无快照/恢复失败）
-        if: ${{ steps.恢复.outputs.restore_success != 'true' }}
+        # 核心修正：steps.恢复→steps.restore
+        if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
           echo "===== 全新安装Docker ====="
@@ -180,7 +182,8 @@ jobs:
           echo "✅ Docker 已安装完成：$(docker -v)"
 
       - name: 7. 重启Docker服务（恢复成功）
-        if: ${{ steps.恢复.outputs.restore_success == 'true' }}
+        # 核心修正：steps.恢复→steps.restore
+        if: ${{ steps.restore.outputs.restore_success == 'true' }}
         run: |
           set -e
           echo "===== 重启Docker服务 ====="
