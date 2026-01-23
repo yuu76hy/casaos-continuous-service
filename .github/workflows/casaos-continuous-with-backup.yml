@@ -1,4 +1,4 @@
-name: Docker全量备份-恢复（无缝迁移版）
+name: Docker全量备份-恢复（一键安装版）
 
 on:
   workflow_dispatch:  # 手动触发
@@ -12,7 +12,7 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_DIR: "/z/Ubu"
-      # 🔥全量备份目录：覆盖Docker所有依赖/配置/数据/容器
+      # 全量备份目录：覆盖Docker所有依赖/配置/数据/容器
       CORE_BACKUP_DIRS: >-
         /var/lib/docker 
         /etc/docker 
@@ -39,7 +39,7 @@ jobs:
         --exclude=/tmp/* 
         --exclude=/var/run/docker.sock.lock 
         --exclude=/var/run/containerd/containerd.sock.lock
-      DOCKER_VERSION: "29.1.5"  # 固定版本，兼容Ubuntu 24.04
+      TARGET_DOCKER_VERSION: "29.1.5"  # 目标Docker版本
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -58,12 +58,12 @@ jobs:
         docker.io/dpanel/dpanel:latest
 
     steps:
-      - name: 1. 环境初始化（首次安装Docker+版本检测）
+      - name: 1. 环境初始化（一键安装Docker）
         run: |
           set -e
           sudo mkdir -p /etc/systemd/system 2>/dev/null || true
           
-          # 配置Ubuntu官方源（确保环境一致）
+          # 配置Ubuntu官方源（确保基础依赖可用）
           sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
           cat <<EOF | sudo tee /etc/apt/sources.list
           deb http://archive.ubuntu.com/ubuntu/ noble main universe
@@ -72,40 +72,54 @@ jobs:
           deb http://archive.ubuntu.com/ubuntu/ noble-backports main universe
           EOF
           
-          # 安装Docker依赖库+基础工具
+          # 安装基础依赖（Docker一键脚本可能需要）
           sudo apt update -y && sudo apt install -y \
             curl wget jq fuse3 tar gzip locales openssl dnsutils \
             apt-transport-https ca-certificates gnupg lsb-release file lsof \
             libseccomp2 apparmor iptables bridge-utils iproute2
           sudo locale-gen zh_CN.UTF-8 && export LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8
           
-          # 检测Docker版本，按需安装
+          # 检测Docker版本，按需安装/重装
           echo "===== 检测Docker版本 ====="
+          DOCKER_INSTALLED=false
           if command -v docker &>/dev/null; then
             INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
-            if [ "$INSTALLED_VERSION" = "${{ env.DOCKER_VERSION }}" ]; then
+            if [ "$INSTALLED_VERSION" = "${{ env.TARGET_DOCKER_VERSION }}" ]; then
               echo "✅ Docker $INSTALLED_VERSION 已安装且匹配，跳过重装"
+              DOCKER_INSTALLED=true
             else
-              echo "⚠️ 版本不匹配，将安装 ${{ env.DOCKER_VERSION }}"
+              echo "⚠️ 已安装版本 $INSTALLED_VERSION 不匹配目标版本 ${{ env.TARGET_DOCKER_VERSION }}，将重新安装"
+              # 彻底卸载旧Docker/moby相关包
               sudo apt purge -y docker* moby* containerd* runc* -y || true
               sudo rm -rf /var/lib/docker /etc/docker /var/lib/containerd /etc/containerd
             fi
           else
-            echo "ℹ️ 未检测到Docker，将安装指定版本"
+            echo "ℹ️ 未检测到Docker，将通过一键脚本安装"
           fi
           
-          # 安装/重装指定版本Docker
-          if ! command -v docker &>/dev/null || [ "$INSTALLED_VERSION" != "${{ env.DOCKER_VERSION }}" ]; then
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-            sudo apt update -y && sudo apt install -y \
-              docker-ce=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
-              docker-ce-cli=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
-              containerd.io docker-buildx-plugin docker-compose-plugin runc libcontainerd0
-            # 校验安装结果
-            NEW_INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
-            [ "$NEW_INSTALLED_VERSION" != "${{ env.DOCKER_VERSION }}" ] && { echo "❌ Docker版本安装失败"; exit 1; }
-            echo "✅ Docker ${{ env.DOCKER_VERSION }} 安装完成"
+          # 🔥核心修改：用Docker官方一键脚本安装（无需源配置）
+          if [ "$DOCKER_INSTALLED" = "false" ]; then
+            echo "===== 执行Docker官方一键安装脚本 ====="
+            curl -fsSL https://get.docker.com | sudo bash
+            sleep 5
+            
+            # 校验安装版本（确保是目标版本）
+            INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
+            if [ "$INSTALLED_VERSION" != "${{ env.TARGET_DOCKER_VERSION }}" ]; then
+              echo "⚠️ 一键安装默认版本 $INSTALLED_VERSION 不匹配，尝试安装目标版本"
+              # 手动安装目标版本（一键脚本已配置好源，直接apt安装）
+              sudo apt install -y \
+                docker-ce=${{ env.TARGET_DOCKER_VERSION }} \
+                docker-ce-cli=${{ env.TARGET_DOCKER_VERSION }} \
+                containerd.io docker-buildx-plugin docker-compose-plugin runc
+              # 再次校验
+              INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
+              if [ "$INSTALLED_VERSION" != "${{ env.TARGET_DOCKER_VERSION }}" ]; then
+                echo "❌ Docker版本安装失败，实际：$INSTALLED_VERSION，目标：${{ env.TARGET_DOCKER_VERSION }}"
+                exit 1
+              fi
+            fi
+            echo "✅ Docker ${{ env.TARGET_DOCKER_VERSION }} 一键安装完成"
           fi
           
           # 安装rclone+配置sudo免密
@@ -114,8 +128,19 @@ jobs:
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner && sudo mkdir -p /DATA /opt/dpanel/{config,data,log} && sudo chmod -R 775 /DATA /opt/dpanel
           
-          # 校验依赖完整性
-          ldd $(which docker) | grep -q "not found" && { echo "❌ Docker依赖缺失"; exit 1; }
+          # 校验Docker依赖和服务状态
+          if ldd $(which docker) | grep -q "not found"; then
+            echo "❌ Docker依赖缺失："
+            ldd $(which docker) | grep "not found"
+            exit 1
+          fi
+          sudo systemctl enable --now docker containerd
+          sleep 5
+          if ! sudo systemctl is-active --quiet docker; then
+            echo "❌ Docker服务启动失败"
+            sudo systemctl status docker --no-pager
+            exit 1
+          fi
           echo "✅ 环境初始化完成"
 
       - name: 2. 创建roots管理员用户
@@ -217,19 +242,27 @@ jobs:
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
-          # 兜底安装Docker
+          echo "===== 全新部署Docker（一键安装） ====="
+          # 兜底安装Docker（若步骤1未安装成功）
           if ! command -v docker &>/dev/null; then
+            curl -fsSL https://get.docker.com | sudo bash
+            sleep 5
+            # 确保版本匹配
             sudo apt install -y \
-              docker-ce=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
-              docker-ce-cli=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
-              containerd.io runc libcontainerd0
+              docker-ce=${{ env.TARGET_DOCKER_VERSION }} \
+              docker-ce-cli=${{ env.TARGET_DOCKER_VERSION }} \
+              containerd.io runc
           fi
+          
           sudo usermod -aG docker runner
           sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
           sudo systemctl enable --now docker containerd && sleep 10
+          
           # 校验Docker状态
-          [ "$(docker -v | awk '{print $3}' | sed 's/,//g')" != "${{ env.DOCKER_VERSION }}" ] && { echo "❌ Docker版本错误"; exit 1; }
+          INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
+          [ "$INSTALLED_VERSION" != "${{ env.TARGET_DOCKER_VERSION }}" ] && { echo "❌ Docker版本错误，实际：$INSTALLED_VERSION"; exit 1; }
           ! sudo systemctl is-active --quiet docker && { echo "❌ Docker启动失败"; exit 1; }
+          
           # 部署dpanel容器
           sudo mkdir -p /opt/dpanel/{config,data,log} && sudo chmod -R 775 /opt/dpanel
           sudo bash -c "${{ env.DPANEL_START_CMD }}" && sleep 5
