@@ -134,7 +134,7 @@ jobs:
             LATEST_SNAPSHOT=" $ {WEBDAV_SNAPSHOT_EN_DIR}/ $ {LATEST_SNAPSHOT_FILENAME}"
             echo "✅ 找到最新备份快照： $ {LATEST_SNAPSHOT}"
             echo "LATEST_SNAPSHOT= $ {LATEST_SNAPSHOT}" >> " $ GITHUB_ENV"
-            echo "SNAPSHOT_RESTORED=false" >> " $ GITHUB_ENV"  # 为恢复步骤准备
+            echo "SNAPSHOT_RESTORED=false" >> " $ GITHUB_ENV"
           else
             echo "⚠️ 未找到有效备份快照，将执行全新安装CasaOS"
             echo "SNAPSHOT_RESTORED=false" >> " $ GITHUB_ENV"
