@@ -1,24 +1,45 @@
-name: Docker-快照-备份-恢复
+name: Docker全量备份-恢复（无缝迁移版）
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 手动触发
   repository_dispatch:
-    types: [renew_docker_snapshot]
+    types: [renew_docker_snapshot]  # 续跑触发
 
 jobs:
-  docker_snapshot_backup_restore:
+  docker_full_backup_restore:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_DIR: "/z/Ubu"
-      CORE_BACKUP_DIRS: "/var/lib/docker /etc/docker /etc/systemd/system /DATA"
+      # 🔥全量备份目录：覆盖Docker所有依赖/配置/数据/容器
+      CORE_BACKUP_DIRS: >-
+        /var/lib/docker 
+        /etc/docker 
+        /var/lib/containerd 
+        /etc/containerd 
+        /usr/bin/docker* 
+        /usr/lib/docker 
+        /usr/libexec/docker 
+        /etc/systemd/system/docker* 
+        /etc/systemd/system/containerd* 
+        /etc/default/docker 
+        /etc/group 
+        /etc/passwd 
+        /etc/sudoers.d/runner 
+        /DATA 
+        /opt/dpanel 
+        /var/run/docker.sock 
+        /var/run/containerd
+      # 最小化排除：仅排除临时文件，不遗漏关键数据
       EXCLUDE_RULES: >-
-        --exclude=*.log --exclude=*.tmp --exclude=*.cache
-        --exclude=/var/lib/docker/containers/*/*.log
-        --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/tmp
-        --exclude=/DATA/tmp --exclude=/DATA/缓存 --exclude=/DATA/日志
-        --exclude=/etc/systemd/system/*.wants
+        --exclude=*.tmp 
+        --exclude=/var/lib/docker/tmp 
+        --exclude=/var/lib/containerd/tmp 
+        --exclude=/tmp/* 
+        --exclude=/var/run/docker.sock.lock 
+        --exclude=/var/run/containerd/containerd.sock.lock
+      DOCKER_VERSION: "29.1.5"  # 固定版本，兼容Ubuntu 24.04
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -26,13 +47,23 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ github.repository }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      # dpanel容器固化启动命令（兜底重建）
+      DPANEL_START_CMD: >-
+        docker run -d --name dpanel --restart always
+        -p 80:80 -p 443:443
+        -v /opt/dpanel/config:/etc/dpanel
+        -v /opt/dpanel/data:/var/lib/dpanel
+        -v /opt/dpanel/log:/var/log/dpanel
+        -v /var/run/docker.sock:/var/run/docker.sock
+        docker.io/dpanel/dpanel:latest
 
     steps:
-      - name: 1. 环境初始化（海外服务器）
+      - name: 1. 环境初始化（首次安装Docker+版本检测）
         run: |
           set -e
           sudo mkdir -p /etc/systemd/system 2>/dev/null || true
           
+          # 配置Ubuntu官方源（确保环境一致）
           sudo mv /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null || true
           cat <<EOF | sudo tee /etc/apt/sources.list
           deb http://archive.ubuntu.com/ubuntu/ noble main universe
@@ -41,328 +72,279 @@ jobs:
           deb http://archive.ubuntu.com/ubuntu/ noble-backports main universe
           EOF
           
-          sudo apt update -y && sudo apt install -y curl wget jq fuse3 tar gzip locales openssl dnsutils apt-transport-https ca-certificates gnupg lsb-release file lsof
+          # 安装Docker依赖库+基础工具
+          sudo apt update -y && sudo apt install -y \
+            curl wget jq fuse3 tar gzip locales openssl dnsutils \
+            apt-transport-https ca-certificates gnupg lsb-release file lsof \
+            libseccomp2 apparmor iptables bridge-utils iproute2
           sudo locale-gen zh_CN.UTF-8 && export LC_ALL=zh_CN.UTF-8 LANG=zh_CN.UTF-8
           
-          curl -fsSL https://rclone.org/install.sh | sudo bash
-          
-          if grep -q "requiretty" /etc/sudoers 2>/dev/null; then
-            sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
+          # 检测Docker版本，按需安装
+          echo "===== 检测Docker版本 ====="
+          if command -v docker &>/dev/null; then
+            INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
+            if [ "$INSTALLED_VERSION" = "${{ env.DOCKER_VERSION }}" ]; then
+              echo "✅ Docker $INSTALLED_VERSION 已安装且匹配，跳过重装"
+            else
+              echo "⚠️ 版本不匹配，将安装 ${{ env.DOCKER_VERSION }}"
+              sudo apt purge -y docker* moby* containerd* runc* -y || true
+              sudo rm -rf /var/lib/docker /etc/docker /var/lib/containerd /etc/containerd
+            fi
+          else
+            echo "ℹ️ 未检测到Docker，将安装指定版本"
           fi
-          echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
-          sudo chmod 0440 /etc/sudoers.d/runner && sudo mkdir -p /DATA && sudo chmod 755 /DATA
           
-          echo "✅检查网络连接......"
-          curl -fsSL https://github.com >/dev/null 2>&1 || { echo "❌无法连接 GitHub"; exit 1; }
-          echo "✅环境初始化完成"
+          # 安装/重装指定版本Docker
+          if ! command -v docker &>/dev/null || [ "$INSTALLED_VERSION" != "${{ env.DOCKER_VERSION }}" ]; then
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt update -y && sudo apt install -y \
+              docker-ce=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
+              docker-ce-cli=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
+              containerd.io docker-buildx-plugin docker-compose-plugin runc libcontainerd0
+            # 校验安装结果
+            NEW_INSTALLED_VERSION=$(docker -v | awk '{print $3}' | sed 's/,//g')
+            [ "$NEW_INSTALLED_VERSION" != "${{ env.DOCKER_VERSION }}" ] && { echo "❌ Docker版本安装失败"; exit 1; }
+            echo "✅ Docker ${{ env.DOCKER_VERSION }} 安装完成"
+          fi
+          
+          # 安装rclone+配置sudo免密
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          grep -q "requiretty" /etc/sudoers 2>/dev/null && sudo sed -i 's/^Defaults requiretty/#Defaults requiretty/' /etc/sudoers
+          echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
+          sudo chmod 0440 /etc/sudoers.d/runner && sudo mkdir -p /DATA /opt/dpanel/{config,data,log} && sudo chmod -R 775 /DATA /opt/dpanel
+          
+          # 校验依赖完整性
+          ldd $(which docker) | grep -q "not found" && { echo "❌ Docker依赖缺失"; exit 1; }
+          echo "✅ 环境初始化完成"
 
-      - name: 2. 创建根管理员用户
+      - name: 2. 创建roots管理员用户
         run: |
           set -e
           if ! id "roots" &>/dev/null; then
             sudo useradd -m -s /bin/bash roots
             echo "roots:${ROOTS_PASSWORD:-$(openssl rand -base64 12)}" | sudo chpasswd
             sudo usermod -aG sudo,docker roots
-            echo "✅ roots 用户成功创建"
+            echo "✅ roots用户创建成功"
           else
-            echo "ℹ️ roots 用户存在，跳过"
+            echo "ℹ️ roots用户已存在，跳过"
           fi
 
-      - name: 3. 配置 WebDAV（Rclone）
+      - name: 3. 配置WebDAV（Rclone）
         id: webdav-config
         run: |
           set -e
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
-            echo "❌缺少WebDAV凭证，跳过备份/恢复"
+            echo "❌ 缺少WebDAV凭证，跳过备份/恢复"
             echo "webdav_available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          
+          # 配置rclone
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" vendor="generic" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf
           sudo chown runner:runner /home/runner/.rclone.conf && sudo chmod 600 /home/runner/.rclone.conf
-          
-          if ! rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-            echo "❌ WebDAV 连接失败"
-            echo "webdav_available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          
+          # 测试连接
+          rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1 || { echo "❌ WebDAV连接失败"; echo "webdav_available=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          # 获取最新快照
           WEBDAV_SNAPSHOT_DIR_CLEAN=$(echo "$WEBDAV_SNAPSHOT_DIR" | sed 's/\/$//')
-          LATEST_SNAPSHOT=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN} --config /home/runner/.rclone.conf | grep "docker-snapshot-.*.tar.gz" | awk -F '/' '{print $NF}' | sort -r | head -n1)
-          
-          if [ -n "$LATEST_SNAPSHOT" ]; then
-            echo "latest_snapshot=${WEBDAV_SNAPSHOT_DIR_CLEAN}/${LATEST_SNAPSHOT}" >> "$GITHUB_OUTPUT"
-            echo "✅最新快照：$LATEST_SNAPSHOT"
-          else
-            echo "ℹ️ WebDAV 没有快照，将执行全新安装Docker"
-          fi
+          LATEST_SNAPSHOT=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN} --config /home/runner/.rclone.conf | grep "docker-full-snapshot-.*.tar.gz" | awk -F '/' '{print $NF}' | sort -r | head -n1)
+          [ -n "$LATEST_SNAPSHOT" ] && echo "latest_snapshot=${WEBDAV_SNAPSHOT_DIR_CLEAN}/${LATEST_SNAPSHOT}" >> "$GITHUB_OUTPUT" && echo "✅ 最新快照：$LATEST_SNAPSHOT"
           echo "webdav_available=true" >> "$GITHUB_OUTPUT"
           echo "WEBDAV_SNAPSHOT_DIR_CLEAN=${WEBDAV_SNAPSHOT_DIR_CLEAN}" >> "$GITHUB_ENV"
 
-      - name: 4. 从 WebDAV 恢复Docker快照
+      - name: 4. 全量恢复Docker+dpanel（无缝迁移）
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
         id: restore
         run: |
           set -e
           SNAPSHOT_PATH=${{ steps.webdav-config.outputs.latest_snapshot }}
-          echo "===== 恢复Docker快照：$SNAPSHOT_PATH ====="
+          echo "===== 全量恢复快照：$SNAPSHOT_PATH ====="
           
+          # 停止服务，确保数据一致性
           sudo systemctl stop docker containerd 2>/dev/null || true
-          sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
-          sudo pkill -9 docker containerd 2>/dev/null || true
-          sync && sleep 3
+          sudo pkill -9 docker containerd runc 2>/dev/null || true
+          sync && sleep 10
           
-          if ! rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf | head -c 100 >/dev/null 2>&1; then
-            echo "❌快照损坏"
+          # 校验快照完整性
+          rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf | head -c 1024 >/dev/null 2>&1 || { echo "❌ 快照损坏"; echo "restore_success=false" >> "$GITHUB_OUTPUT"; exit 1; }
+          
+          # 全量恢复数据
+          TEMP_SNAPSHOT="/tmp/snapshot.tar.gz"
+          rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf > "$TEMP_SNAPSHOT"
+          sudo tar -xzf "$TEMP_SNAPSHOT" -C / --overwrite --ignore-failed-read -p --same-owner --acls --xattrs
+          rm -f "$TEMP_SNAPSHOT"
+          
+          # 修复权限+重启服务
+          sudo chown -R root:root /var/lib/docker /etc/docker /var/lib/containerd /etc/containerd
+          sudo chmod -R 755 /usr/bin/docker* /usr/lib/docker /usr/libexec/docker
+          sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+          sudo systemctl daemon-reload && sudo systemctl enable --now docker containerd 2>/dev/null || true
+          sleep 15
+          
+          # 校验服务状态
+          if ! sudo systemctl is-active --quiet docker || ! sudo systemctl is-active --quiet containerd; then
+            echo "❌ Docker/containerd启动失败"
+            sudo systemctl status docker --no-pager && sudo journalctl -u docker --no-pager | tail -30
             echo "restore_success=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           
-          TEMP_SNAPSHOT="/tmp/snapshot.tar.gz"
-          rclone cat mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf > "$TEMP_SNAPSHOT"
-          sudo tar -xzf "$TEMP_SNAPSHOT" -C / \
-            --overwrite \
-            --ignore-failed-read \
-            -p \
-            --same-owner
-          rm -f "$TEMP_SNAPSHOT"
+          # 兜底启动dpanel容器
+          if ! sudo docker ps | grep -q "dpanel"; then
+            sudo docker start dpanel || { sudo docker rm -f dpanel; sudo bash -c "${{ env.DPANEL_START_CMD }}"; }
+          fi
+          [ ! "$(sudo docker ps | grep dpanel)" ] && { echo "❌ dpanel容器启动失败"; echo "restore_success=false" >> "$GITHUB_OUTPUT"; exit 1; }
           
-          sudo apt purge -y moby* containerd* runc* docker* -y || true
-          sudo apt autoremove -y && sudo apt clean
-          curl -fsSL https://get.docker.com | sudo bash
-          
+          # 删除旧快照
           rclone delete mywebdav:${SNAPSHOT_PATH} --config /home/runner/.rclone.conf
           rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt --config /home/runner/.rclone.conf
           
-          echo "✅Docker快照已成功恢复"
+          echo "✅ 全量恢复成功，无缝衔接完成"
           echo "restore_success=true" >> "$GITHUB_OUTPUT"
 
-      - name: 5. 清理Docker残留物（恢复失败）
+      - name: 5. 清理残留物（恢复失败）
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
-          echo "===== 清理Docker残留物 ====="
           sudo systemctl stop docker containerd 2>/dev/null || true
           sudo pkill -9 docker containerd 2>/dev/null || true
           sync && sleep 3
-          
-          if sudo docker info >/dev/null 2>&1; then
-            sudo docker rm -f $(sudo docker ps -aq) 2>/dev/null || true
-            sudo docker rmi -f $(sudo docker images -aq) 2>/dev/null || true
-            sudo docker volume rm -f $(sudo docker volume ls -q) 2>/dev/null || true
-          fi
-          
-          sudo apt purge -y docker* moby* containerd* runc* -y || true
-          sudo apt autoremove -y && sudo apt clean
-          sudo rm -rf /var/lib/docker /etc/docker /var/lib/containerd /DATA/*
-          echo "✅Docker残留物清理完成"
+          [ "$(sudo docker info 2>/dev/null)" ] && { sudo docker rm -f $(sudo docker ps -aq); sudo docker rmi -f $(sudo docker images -aq); }
+          sudo rm -rf /var/lib/docker /etc/docker /var/lib/containerd /etc/containerd /DATA/* /opt/dpanel/*
+          echo "✅ 残留物清理完成"
 
-      - name: 6. 全新安装Docker（无快照/恢复失败）
+      - name: 6. 全新部署Docker+dpanel（无快照/恢复失败）
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
-          echo "===== 全新安装Docker ====="
-          sudo apt purge -y docker* moby* containerd* runc* -y || true
-          sudo apt autoremove -y && sudo apt clean
-          
-          curl -fsSL https://get.docker.com | sudo bash
-          
+          # 兜底安装Docker
+          if ! command -v docker &>/dev/null; then
+            sudo apt install -y \
+              docker-ce=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
+              docker-ce-cli=${{ env.DOCKER_VERSION }}~ubuntu.24.04~noble \
+              containerd.io runc libcontainerd0
+          fi
           sudo usermod -aG docker runner
           sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
-          sudo systemctl enable --now docker.service containerd.service
-          sleep 10
-          
-          if ! sudo systemctl is-active --quiet docker; then
-            echo "❌ Docker 启动失败"
-            exit 1
-          fi
-          echo "✅ Docker 已安装完成：$(docker -v)"
+          sudo systemctl enable --now docker containerd && sleep 10
+          # 校验Docker状态
+          [ "$(docker -v | awk '{print $3}' | sed 's/,//g')" != "${{ env.DOCKER_VERSION }}" ] && { echo "❌ Docker版本错误"; exit 1; }
+          ! sudo systemctl is-active --quiet docker && { echo "❌ Docker启动失败"; exit 1; }
+          # 部署dpanel容器
+          sudo mkdir -p /opt/dpanel/{config,data,log} && sudo chmod -R 775 /opt/dpanel
+          sudo bash -c "${{ env.DPANEL_START_CMD }}" && sleep 5
+          [ ! "$(sudo docker ps | grep dpanel)" ] && { echo "❌ dpanel容器部署失败"; sudo docker logs dpanel; exit 1; }
+          echo "✅ 全新部署完成"
 
-      - name: 7. 重启Docker服务（恢复成功）
+      - name: 7. 重启服务（恢复成功后兜底）
         if: ${{ steps.restore.outputs.restore_success == 'true' }}
         run: |
           set -e
-          echo "===== 重启Docker服务 ====="
-          
-          for service in docker.service containerd.service; do
-            if sudo systemctl list-unit-files --type=service | grep -q "$service"; then
-              sudo systemctl reset-failed "$service" 2>/dev/null || true
-            fi
+          # 清理占用端口
+          for port in 80 443 2375 2376 7946 4789; do
+            sudo lsof -i:$port -t >/dev/null && { echo "⚠️ 终止$port端口占用进程"; sudo kill -9 $(sudo lsof -i:$port -t); }
           done
-          sudo systemctl daemon-reload && sleep 15
-          sudo systemctl enable --now containerd.service 2>/dev/null || true && sleep 3
-          sudo systemctl enable --now docker.service 2>/dev/null || true && sleep 10
-          
-          echo "=====启动前检查===="
-          for port in 2375 2376 7946 4789; do
-            if sudo lsof -i:$port -t >/dev/null; then
-              echo "⚠️ $port端口已被占用，正在终止进程"
-              sudo kill -9 $(sudo lsof -i:$port -t) 2>/dev/null || true
-            fi
-          done
-          
-          sudo chown -R root:root /var/lib/docker /etc/docker
-          sudo chmod -R 755 /var/lib/docker /etc/docker
-          sudo chmod 775 /DATA 2>/dev/null || true
-          
-          sudo systemctl restart docker containerd
-          sleep 5
-          
-          echo "=====检查Docker服务状态===="
-          docker_active=false
-          for retry in {1..5}; do
-            if sudo systemctl is-active --quiet docker; then
-              docker_active=true
-              break
-            fi
-            echo "ℹ️ Docker未激活，重试$retry/5......"
-            sudo systemctl reset-failed docker 2>/dev/null || true
-            sudo systemctl restart docker
-            sleep 8
-          done
-          
-          if [ "$docker_active" = "false" ]; then
-            echo "⚠️ Docker启动失败，重新安装"
-            curl -fsSL https://get.docker.com | sudo bash
-            sudo systemctl daemon-reload
-            sleep 10
-            
-            if ! sudo systemctl is-active --quiet docker; then
-              echo "❌ Docker启动失败，调试信息："
-              echo "--- Docker服务状态---"
-              sudo systemctl status docker --no-pager
-              echo "--- Docker最新日志---"
-              sudo journalctl -u docker --no-pager | tail -30
-              exit 1
-            fi
-          fi
-          echo "✅Docker服务已成功重启"
+          # 重启服务+容器
+          sudo systemctl restart docker containerd && sleep 10
+          ! sudo docker ps | grep -q "dpanel" && { sudo docker start dpanel || { sudo docker rm -f dpanel; sudo bash -c "${{ env.DPANEL_START_CMD }}"; }; }
+          # 最终校验
+          ! sudo systemctl is-active --quiet docker && { echo "❌ Docker启动失败"; exit 1; }
+          ! sudo docker ps | grep -q "dpanel" && { echo "❌ dpanel容器启动失败"; exit 1; }
+          echo "✅ 服务重启完成，可直接使用"
 
       - name: 8. 部署Tailscale（可选）
         run: |
           set -e
-          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️缺少Tailscale授权密钥，跳过"
-            exit 0
-          fi
+          [ -z "$TAILSCALE_AUTH_KEY" ] && { echo "⚠️ 缺少Tailscale密钥，跳过"; exit 0; }
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list
           sudo apt update -y && sudo apt install -y tailscale
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --accept-routes --hostname="docker-snapshot-${{ github.run_id }}"
           echo "✅ Tailscale IP：$(sudo tailscale ip -4)"
 
-      - name: 9. 创建Docker快照 + 上传 WebDAV + 触发更新
+      - name: 9. 全量备份+上传+触发续跑
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' }}
         run: |
           set -e
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
           
+          # 清理旧容器函数
           stop_old_containers() {
-            if sudo docker info >/dev/null 2>&1; then
+            [ "$(sudo docker info 2>/dev/null)" ] && {
               OLD_CONTAINERS=$(sudo docker ps -aq)
-              if [ -n "$OLD_CONTAINERS" ]; then
-                sudo docker rm -f $OLD_CONTAINERS && echo "✅续跑成功，旧容器已清理"
-              else
-                echo "ℹ️续跑成功，无旧容器可清理"
-              fi
-            else
-                echo "ℹ️Docker未就绪，跳过旧容器清理"
-            fi
+              [ -n "$OLD_CONTAINERS" ] && sudo docker rm -f $OLD_CONTAINERS && echo "✅ 旧容器已清理" || echo "ℹ️ 无旧容器可清理"
+            }
           }
           
+          # 触发续跑函数
           trigger_renew() {
-            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-              echo "❌缺少PAT/仓库信息，触发续跑失败"
-              return 1
-            fi
-            if curl -fsSL --fail -X POST \
+            [ -z "$USER_PAT" ] || [ -z "$REPO" ] && { echo "❌ 缺少PAT/仓库信息"; return 1; }
+            curl -fsSL --fail -X POST \
               -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              "https://api.github.com/repos/$REPO/dispatches" \
-              -d '{"event_type":"renew_docker_snapshot"}'; then
-              echo "✅续跑已成功触发"
+              -d '{"event_type":"renew_docker_snapshot"}' \
+              "https://api.github.com/repos/$REPO/dispatches" && {
+              echo "✅ 续跑触发成功"
               RENEW_TRIGGERED=true
               stop_old_containers
-            else
-              echo "❌续跑触发失败，不执行旧容器清理"
-              return 1
-            fi
+            } || { echo "❌ 续跑触发失败"; return 1; }
           }
           
-          create_snapshot() {
+          # 全量备份函数
+          create_full_snapshot() {
+            # 筛选有效目录
             VALID_DIRS=""
             for dir in $CORE_BACKUP_DIRS; do
-              if [ -d "$dir" ] || [ -f "$dir" ]; then
-                VALID_DIRS="$VALID_DIRS $dir"
-              else
-                echo "ℹ️跳过不存在的路径：$dir"
-              fi
+              [ -d "$dir" ] || [ -f "$dir" ] && VALID_DIRS="$VALID_DIRS $dir" || echo "ℹ️ 跳过不存在路径：$dir"
             done
-            if [ -z "$VALID_DIRS" ]; then
-              echo "❌无有效备份路径"
-              return 1
-            fi
-              
-            SNAPSHOT_NAME="docker-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
+            [ -z "$VALID_DIRS" ] && { echo "❌ 无有效备份路径"; return 1; }
+            # 备份配置
+            SNAPSHOT_NAME="docker-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             TMP_SNAPSHOT="/tmp/$SNAPSHOT_NAME"
-            REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/$SNAPSHOT_NAME"
-              
+            REMOTE_PATH="mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/${SNAPSHOT_NAME}"
+            # 停止服务
+            sudo docker stop $(sudo docker ps -q) 2>/dev/null || true
+            sleep 5
             sudo systemctl stop docker containerd 2>/dev/null || true
-            sudo pkill -9 docker containerd 2>/dev/null || true
-            sync && sleep 5
-              
+            sudo pkill -9 docker containerd runc 2>/dev/null || true
+            sync && sleep 10
+            # 压缩备份
             sudo tar -czpf "$TMP_SNAPSHOT" \
-              --ignore-failed-read \
-              -p \
-              --same-owner \
-              --acls \
-              --xattrs \
-              $EXCLUDE_RULES \
-              $VALID_DIRS || { echo "❌压缩失败"; return 1; }
-              
-            if [ $(stat -c%s "$TMP_SNAPSHOT") -lt 1024 ]; then
-              echo "❌无效快照（文件过小）"
-              rm -f "$TMP_SNAPSHOT"
-              return 1
-            fi
+              --ignore-failed-read -p --same-owner --acls --xattrs --exclude-caches-all \
+              $EXCLUDE_RULES $VALID_DIRS || { echo "❌ 压缩失败"; return 1; }
+            # 校验快照大小（最小100MB）
+            [ $(stat -c%s "$TMP_SNAPSHOT") -lt $((100 * 1024 * 1024)) ] && { echo "❌ 快照过小"; rm -f "$TMP_SNAPSHOT"; return 1; }
+            # 上传快照
             sudo chown runner:runner "$TMP_SNAPSHOT"
-              
-            if ! sudo -u runner rclone copy "$TMP_SNAPSHOT" "$REMOTE_PATH" --config /home/runner/.rclone.conf --transfers 4; then
-              echo "❌上传失败"
-              rm -f "$TMP_SNAPSHOT"
-              return 1
-            fi
-              
-            printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\n" \
-              "$SNAPSHOT_NAME" \
-              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              "$(du -sh "$TMP_SNAPSHOT" | awk '{print $1}')" \
-              "$(docker -v 2>/dev/null | awk '{print $3}' | sed 's/,//g')" | sudo tee /tmp/snapshot_meta.txt
-            sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt" --config /home/runner/.rclone.conf
-              
-            rm -f "$TMP_SNAPSHOT" /tmp/snapshot_meta.txt
+            sudo -u runner rclone copy "$TMP_SNAPSHOT" "$REMOTE_PATH" --config /home/runner/.rclone.conf --transfers 8 --checkers 8 || { echo "❌ 上传失败"; rm -f "$TMP_SNAPSHOT"; return 1; }
+            # 重启服务
             sudo systemctl start docker containerd 2>/dev/null || true
-            echo "✅Docker快照已创建并成功上传"
+            sleep 10
+            sudo docker start $(sudo docker ps -aq) 2>/dev/null || true
+            # 上传元数据
+            printf "snapshot_name=%s\ncreate_time=%s\nsnapshot_size=%s\ndocker_version=%s\ncontainerd_version=%s\n" \
+              "$SNAPSHOT_NAME" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(du -sh "$TMP_SNAPSHOT" | awk '{print $1}')" \
+              "$(docker -v 2>/dev/null | awk '{print $3}' | sed 's/,//g')" \
+              "$(containerd -v 2>/dev/null | awk '{print $3}' | sed 's/,//g')" | sudo tee /tmp/snapshot_meta.txt
+            sudo -u runner rclone copy /tmp/snapshot_meta.txt "mywebdav:${WEBDAV_SNAPSHOT_DIR_CLEAN}/snapshot_meta.txt" --config /home/runner/.rclone.conf
+            # 清理临时文件
+            rm -f "$TMP_SNAPSHOT" /tmp/snapshot_meta.txt
+            echo "✅ 全量备份上传成功"
             return 0
           }
           
-          # 🔥核心修改：触发阈值从2分钟改为10分钟，其余不变
+          # 主循环：10分钟后执行备份+续跑
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
-            echo "⏱️运行时间：$run_mins / $MAX_RUN_MINUTES 分钟（10分钟后执行备份+续跑）"
-              
+            echo "⏱️ 运行时间：$run_mins / $MAX_RUN_MINUTES 分钟"
+            # 10分钟后触发备份+续跑
             if [ $run_mins -ge 10 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰已运行10分钟，开始执行备份+续跑"
-              create_snapshot && trigger_renew
+              echo "⏰ 开始全量备份+续跑"
+              create_full_snapshot && trigger_renew
             fi
-              
-            if [ $run_mins -ge $MAX_RUN_MINUTES ]; then
-              echo "⏹️超时，退出"
-              exit 0
-            fi
+            # 超时退出
+            [ $run_mins -ge $MAX_RUN_MINUTES ] && { echo "⏹️ 超时退出"; exit 0; }
             sleep 60
           done
 
@@ -370,6 +352,6 @@ jobs:
         if: ${{ always() }}
         run: |
           set -e
-          sudo rm -rf /tmp/docker-snapshot-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
+          sudo rm -rf /tmp/docker-*.tar.gz /home/runner/.rclone.conf /etc/sudoers.d/runner /tmp/rclone_*.log
           sudo systemctl unmask docker.socket containerd.socket 2>/dev/null || true
-          echo "✅临时文件清理完成"
+          echo "✅ 临时文件清理完成"
