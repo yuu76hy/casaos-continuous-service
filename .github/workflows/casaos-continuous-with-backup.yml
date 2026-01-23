@@ -12,8 +12,8 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      # 全量备份目录【核心扩容】：含系统依赖/运行时/配置/数据/服务/环境变量，无遗漏
-      CORE_DIRS: "/var/lib/docker /etc/docker /etc/casaos /var/lib/casaos /DATA /etc/systemd/system /usr/bin/casaos /usr/lib/systemd/system /usr/local/bin /usr/local/lib /usr/lib /usr/share /etc/apt /etc/profile /etc/environment /var/lib/apt /var/cache/apt /usr/sbin /bin /sbin /etc/ld.so.conf.d /lib/x86_64-linux-gnu /lib64"
+      # 【核心修改1】移除/etc/profile（文件），替换为/etc/profile.d（目录）；移除其他非目录文件路径
+      CORE_DIRS: "/var/lib/docker /etc/docker /etc/casaos /var/lib/casaos /DATA /etc/systemd/system /usr/bin/casaos /usr/lib/systemd/system /usr/local/bin /usr/local/lib /usr/lib /usr/share /etc/apt /etc/profile.d /etc/environment /var/lib/apt /var/cache/apt /usr/sbin /bin /sbin /etc/ld.so.conf.d /lib/x86_64-linux-gnu /lib64"
       # 极简排除规则【只删无用垃圾】：不碰任何依赖/配置/数据，杜绝误删核心文件
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
@@ -62,8 +62,20 @@ jobs:
           echo "runner ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/runner
           sudo chmod 0440 /etc/sudoers.d/runner
           sudo mkdir -p /DATA && sudo chmod 755 /DATA
-          # 预创建关键目录，避免备份时目录缺失告警
-          for dir in $CORE_DIRS; do sudo mkdir -p $dir; done
+          # 【核心修改2】优化目录创建逻辑：只创建目录，跳过文件
+          for path in $CORE_DIRS; do
+            # 如果是文件，直接跳过；如果是目录且不存在，才创建
+            if [ -f "$path" ]; then
+              echo "⚠️ $path 是文件，跳过创建"
+              continue
+            fi
+            if [ ! -d "$path" ]; then
+              sudo mkdir -p "$path"
+              echo "✅ 创建目录：$path"
+            else
+              echo "✅ 目录已存在：$path"
+            fi
+          done
           echo "✅全量环境初始化完成，关键目录已预创建"
 
       - name: 创建管理员用户（权限兜底）
