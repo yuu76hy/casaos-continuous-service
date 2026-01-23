@@ -6,7 +6,8 @@ on:
     types: [renew_docker_snapshot]  # 调整触发类型名称
 
 jobs:
-  Docker-快照-备份-恢复:
+  # 核心修正：Job ID从中文"Docker-快照-备份-恢复"改为纯英文（符合命名规则）
+  docker_snapshot_backup_restore:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -102,7 +103,7 @@ jobs:
 
       - name: 4. 从 WebDAV 恢复Docker快照
         if: ${{ steps.webdav-config.outputs.webdav_available == 'true' && steps.webdav-config.outputs.latest_snapshot != '' }}
-        id: restore  # 核心修正：中文"恢复"→英文"restore"
+        id: restore  # 英文ID，符合规则
         run: |
           set -e
           SNAPSHOT_PATH=${{ steps.webdav-config.outputs.latest_snapshot }}
@@ -139,7 +140,6 @@ jobs:
           echo "restore_success=true" >> "$GITHUB_OUTPUT"
 
       - name: 5. 清理Docker残留物（恢复失败）
-        # 核心修正：steps.恢复→steps.restore
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
@@ -160,7 +160,6 @@ jobs:
           echo "✅Docker残留物清理完成"
 
       - name: 6. 全新安装Docker（无快照/恢复失败）
-        # 核心修正：steps.恢复→steps.restore
         if: ${{ steps.restore.outputs.restore_success != 'true' }}
         run: |
           set -e
@@ -182,7 +181,6 @@ jobs:
           echo "✅ Docker 已安装完成：$(docker -v)"
 
       - name: 7. 重启Docker服务（恢复成功）
-        # 核心修正：steps.恢复→steps.restore
         if: ${{ steps.restore.outputs.restore_success == 'true' }}
         run: |
           set -e
