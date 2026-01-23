@@ -12,8 +12,8 @@ jobs:
     env:
       MAX_RUN_MINUTES: 360
       WEBDAV_SNAPSHOT_EN_DIR: "/z/Ubu"
-      # 已修复：移除文件路径，仅保留目录
-      CORE_DIRS: "/var/lib/docker /etc/docker /etc/casaos /var/lib/casaos /DATA /etc/systemd/system /usr/bin/casaos /usr/lib/systemd/system /usr/local/bin /usr/local/lib /usr/lib /usr/share /etc/apt /etc/profile.d /etc/environment /var/lib/apt /var/cache/apt /usr/sbin /bin /sbin /etc/ld.so.conf.d /lib/x86_64-linux-gnu /lib64"
+      # 已修复：仅保留目录路径，避免文件/目录混淆
+      CORE_DIRS: "/var/lib/docker /etc/docker /etc/casaos /var/lib/casaos /DATA /etc/systemd/system /usr/lib/systemd/system /usr/local/bin /usr/local/lib /usr/lib /usr/share /etc/apt /etc/profile.d /etc/environment /var/lib/apt /var/cache/apt /usr/sbin /bin /sbin /etc/ld.so.conf.d /lib/x86_64-linux-gnu /lib64"
       # 极简排除规则：只删无用垃圾
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
@@ -74,6 +74,11 @@ jobs:
               echo "✅ 目录已存在：$path"
             fi
           done
+          # 【提前清理】删除可能残留的错误目录/usr/bin/casaos
+          if [ -d "/usr/bin/casaos" ]; then
+            sudo rm -rf /usr/bin/casaos
+            echo "✅ 清理残留的错误目录：/usr/bin/casaos"
+          fi
           echo "✅全量环境初始化完成"
 
       - name: 创建管理员用户（权限兜底）
@@ -196,21 +201,51 @@ jobs:
           set -e
           export LC_ALL=zh_CN.UTF-8
           export LANG=zh_CN.UTF-8
-          # 【核心修改1】预装所有必要依赖，确保安装脚本无缺失
+          # 【核心修改1】彻底清理残留的错误目录/文件
+          echo "🔄清理CasaOS残留文件/目录"
+          # 删除错误的/usr/bin/casaos目录（如果存在）
+          if [ -d "/usr/bin/casaos" ]; then
+            sudo rm -rf /usr/bin/casaos
+            echo "✅ 删除错误目录：/usr/bin/casaos"
+          fi
+          # 删除其他可能的残留
+          sudo rm -rf /etc/casaos /var/lib/casaos /usr/lib/casaos 2>/dev/null || true
+          sudo systemctl stop casaos.service 2>/dev/null || true
+          sudo systemctl disable casaos.service 2>/dev/null || true
+          sudo systemctl reset-failed casaos.service 2>/dev/null || true
+          
+          # 预装所有必要依赖
           sudo apt install -y cgroupfs-mount fuse3 dbus avahi-daemon libssl-dev libcurl4-openssl-dev libnss-mdns
-          # 【核心修改2】移除不兼容的--force参数，使用官方标准安装命令
-          # 增加详细日志输出，便于排查安装问题
+          
+          # 【核心修改2】使用官方标准安装命令，增加重试机制
           echo "🔄开始安装CasaOS（官方标准命令）"
           curl -fsSL https://get.casaos.io -o /tmp/casaos_install.sh
           sudo chmod +x /tmp/casaos_install.sh
-          # 执行安装脚本，输出详细日志
-          sudo /tmp/casaos_install.sh 2>&1 | tee /var/log/casaos-install.log
-          # 检查安装是否成功
-          if [ $? -ne 0 ] || [ ! -f "/usr/bin/casaos" ]; then
-            echo "❌CasaOS安装失败，日志如下："
-            cat /var/log/casaos-install.log
+          
+          # 执行安装脚本，最多重试2次
+          INSTALL_SUCCESS=false
+          for i in 1 2 3; do
+            echo "📌 第$i次尝试安装CasaOS"
+            sudo /tmp/casaos_install.sh 2>&1 | tee /var/log/casaos-install-$i.log
+            # 检查安装是否成功（关键：/usr/bin/casaos必须是文件且可执行）
+            if [ -f "/usr/bin/casaos" ] && [ -x "/usr/bin/casaos" ]; then
+              INSTALL_SUCCESS=true
+              echo "✅ CasaOS安装成功（第$i次尝试）"
+              break
+            else
+              echo "⚠️ 第$i次安装失败，清理残留后重试"
+              sudo rm -rf /usr/bin/casaos /etc/casaos /var/lib/casaos 2>/dev/null || true
+              sleep 5
+            fi
+          done
+          
+          # 最终校验安装结果
+          if [ "$INSTALL_SUCCESS" = "false" ]; then
+            echo "❌CasaOS安装失败，最后一次日志如下："
+            cat /var/log/casaos-install-3.log
             exit 1
           fi
+          
           # 安装后补全依赖
           sudo apt install -y --fix-missing
           echo "✅CasaOS全新安装完成"
