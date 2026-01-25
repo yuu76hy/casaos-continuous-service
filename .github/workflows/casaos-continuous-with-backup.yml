@@ -98,7 +98,7 @@ jobs:
           fi
           
           # 配置 rclone
-          cat > /tmp/rclone.conf << EOF
+          cat > /tmp/rclone.conf << 'EOF'
 [webdav]
 type = webdav
 url = ${{ secrets.WEBDAV_URL }}${{ env.WEBDAV_REMOTE_PATH }}
@@ -375,7 +375,7 @@ EOF
                 --exclude="*.log" \
                 --exclude="*.tmp" \
                 --exclude="*.cache" \
-                --exclude="docket/tmp" \
+                --exclude="docker/tmp" \
                 2>/dev/null
             else
               sudo tar -czf "$backup_dir/docker_state.tar.gz" \
@@ -384,7 +384,7 @@ EOF
                 --exclude="*.log" \
                 --exclude="*.tmp" \
                 --exclude="*.cache" \
-                --exclude="docket/tmp" \
+                --exclude="docker/tmp" \
                 2>/dev/null
             fi
             
@@ -437,7 +437,7 @@ EOF
             chmod +x "$backup_dir/restore.sh"
             
             # 保存快照信息
-            cat > "$backup_dir/snapshot_info.json" << EOF
+            cat > "$backup_dir/snapshot_info.json" << 'EOF'
 {
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "type": "full_backup",
@@ -453,6 +453,13 @@ EOF
   }
 }
 EOF
+            
+            # 修复JSON文件中的变量替换
+            sed -i "s/\\\$\\\${{ github.run_id }}/${{ github.run_id }}/g" "$backup_dir/snapshot_info.json"
+            sed -i "s/\\\$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")/$(date -u +"%Y-%m-%dT%H:%M:%SZ")/g" "$backup_dir/snapshot_info.json"
+            sed -i "s/\\\$(lsb_release -ds 2\\>\\/dev\\/null || echo \"unknown\")/$(lsb_release -ds 2>/dev/null || echo "unknown")/g" "$backup_dir/snapshot_info.json"
+            sed -i "s/\\\$(uname -r)/$(uname -r)/g" "$backup_dir/snapshot_info.json"
+            sed -i "s/\\\$(uname -m)/$(uname -m)/g" "$backup_dir/snapshot_info.json"
             
             echo "✅ 完整备份完成: $backup_dir"
             
