@@ -11,19 +11,32 @@ jobs:
     timeout-minutes: 360
     
     env:
+      # 核心配置
       MAX_RUN_MINUTES: 360
       WEBDAV_MOUNT_POINT: /mnt/webdav
       WEBDAV_REMOTE_PATH: /z/Ubu
+      
+      # WebDAV 配置
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+      
+      # GitHub 配置
       USER_PAT: ${{ secrets.USER_PAT }}
       REPO: ${{ github.repository }}
+      
+      # Tailscale 配置
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      
+      # 备份配置
       BACKUP_COMPRESSION: zstd
       SNAPSHOT_RETENTION: 3
+      
+      # 调试用户
       DEBUG_USER: roots
       DEBUG_PASSWORD: roots1234
+      
+      # 挂载配置
       MAX_MOUNT_RETRIES: 3
       RETRY_DELAY: 15
 
