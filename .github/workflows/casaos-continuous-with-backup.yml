@@ -5,6 +5,16 @@ on:
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
+# 可选：根层级定义secrets（也可直接在步骤中引用，二选一）
+# secrets:
+#   WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+#   WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+#   WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+#   ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+#   USER_PAT: ${{ secrets.USER_PAT }}
+#   TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+#   REPO: ${{ secrets.REPO }}
+
 jobs:
   casaos-full-backup-restore:
     runs-on: ubuntu-24.04
@@ -26,14 +36,14 @@ jobs:
         --exclude=/DATA/logs
         --exclude=/etc/systemd/system/*.wants
         --exclude=/etc/systemd/system/*.requires
-    secrets:
+      # 注意：env里直接引用secrets，这是正确的写法
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-      WEBDAV_PASS: ${{ secrets.WEBDAV_PASSWORD }}
-      ROOT_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      GITHUB_USER_PAT: ${{ secrets.USER_PAT }}
+      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      GITHUB_REPO: ${{ secrets.REPO }}
+      REPO: ${{ secrets.REPO }}
 
     steps:
       - name: 1-系统初始化&依赖全量安装（基础必备）
@@ -69,8 +79,8 @@ jobs:
             echo "✅ $USER_NAME用户创建成功"
           fi
           # 设置用户密码（优先用secret配置，无则生成随机密码）
-          if [ -n "${{ secrets.ROOTS_PASSWORD }}" ]; then
-            echo "$USER_NAME:${{ secrets.ROOTS_PASSWORD }}" | sudo chpasswd
+          if [ -n "$ROOTS_PASSWORD" ]; then
+            echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd
             echo "✅ $USER_NAME用户密码已配置（自定义密码）"
           else
             RANDOM_PASS=$(openssl rand -base64 12)
@@ -92,17 +102,17 @@ jobs:
           set -e
           echo "===== 配置Rclone，校验WebDAV连通性 ====="
           # 校验WebDAV凭证完整性
-          if [ -z "${{ secrets.WEBDAV_URL }}" ] || [ -z "${{ secrets.WEBDAV_USER }}" ] || [ -z "${{ secrets.WEBDAV_PASSWORD }}" ]; then
+          if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "❌ WebDAV凭证缺失，备份恢复功能禁用"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
           # 配置rclone WebDAV远程
-          ENCRYPTED_PASS=$(rclone obscure "${{ secrets.WEBDAV_PASSWORD }}")
+          ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav \
-            url="${{ secrets.WEBDAV_URL }}" \
+            url="$WEBDAV_URL" \
             vendor="webdav" \
-            user="${{ secrets.WEBDAV_USER }}" \
+            user="$WEBDAV_USER" \
             pass="$ENCRYPTED_PASS" \
             --config /home/runner/.rclone.conf
           sudo chown runner:runner /home/runner/.rclone.conf
@@ -284,7 +294,7 @@ jobs:
         run: |
           set -e
           echo "===== 部署Tailscale组网，实现远程访问 ====="
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ 未配置Tailscale密钥，跳过组网部署"
             exit 0
           fi
@@ -296,7 +306,7 @@ jobs:
           # 启动Tailscale，配置完整参数（固定主机名+路由转发+自动重连）
           TS_HOSTNAME="CasaOS-Server-$(hostname | cut -c1-8)"
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="$TS_HOSTNAME" \
             --accept-routes \
             --accept-dns \
@@ -327,16 +337,16 @@ jobs:
           
           # 续跑触发函数（防超时，无缝衔接）
           trigger_workflow_renew() {
-            if [ -z "${{ secrets.GITHUB_USER_PAT }}" ] || [ -z "${{ secrets.GITHUB_REPO }}" ]; then
+            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
               echo "❌ 续跑配置缺失，无法触发续跑"
               return 1
             fi
             echo "🔄 触发续跑工作流，避免超时中断..."
             if ! curl -fsSL --fail -X POST \
-              -H "Authorization: token ${{ secrets.GITHUB_USER_PAT }}" \
+              -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
               -H "Content-Type: application/json" \
-              "https://api.github.com/repos/${{ secrets.GITHUB_REPO }}/dispatches" \
+              "https://api.github.com/repos/$REPO/dispatches" \
               -d '{"event_type":"renew_casaos_snapshot"}'; then
               echo "❌ 续跑触发失败，检查USER_PAT权限"
               return 1
