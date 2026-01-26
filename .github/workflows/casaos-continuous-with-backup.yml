@@ -350,33 +350,32 @@ jobs:
             return 0
           }
           
-          # 创建并上传快照函数（补充service文件检查）
+          # 创建并上传快照函数（移除EOF，改用echo逐行创建文件）
           create_and_upload_snapshot() {
             if [ "${WEBDAV_AVAILABLE}" != "true" ]; then
               return 1
             fi
             
-            # 关键验证：检查并生成缺失的casaos.service文件
+            # 关键验证：检查并生成缺失的casaos.service文件（核心修复：用echo替代EOF）
             echo "🔍 Verifying critical files before backup..."
             if [ ! -f "/etc/systemd/system/casaos.service" ] && [ ! -f "/usr/lib/systemd/system/casaos.service" ]; then
               echo "⚠️ casaos.service file not found, generate default file..."
               sudo mkdir -p /etc/systemd/system
-              # 修复：EOF顶格，无缩进，避免YAML解析错误
-              cat > /tmp/casaos.service <<EOF
-[Unit]
-Description=CasaOS Service
-After=docker.service network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/casaos
-Restart=always
-RestartSec=5
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
+              # 改用echo逐行写入，彻底规避YAML的EOF解析问题
+              echo "[Unit]" > /tmp/casaos.service
+              echo "Description=CasaOS Service" >> /tmp/casaos.service
+              echo "After=docker.service network.target" >> /tmp/casaos.service
+              echo "" >> /tmp/casaos.service
+              echo "[Service]" >> /tmp/casaos.service
+              echo "Type=simple" >> /tmp/casaos.service
+              echo "ExecStart=/usr/bin/casaos" >> /tmp/casaos.service
+              echo "Restart=always" >> /tmp/casaos.service
+              echo "RestartSec=5" >> /tmp/casaos.service
+              echo "User=root" >> /tmp/casaos.service
+              echo "" >> /tmp/casaos.service
+              echo "[Install]" >> /tmp/casaos.service
+              echo "WantedBy=multi-user.target" >> /tmp/casaos.service
+              # 复制到目标目录
               sudo cp /tmp/casaos.service /etc/systemd/system/
               rm -f /tmp/casaos.service
             fi
