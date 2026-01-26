@@ -76,10 +76,14 @@ jobs:
             echo "WEBDAV_AVAILABLE=false" >> $GITHUB_ENV
             exit 0
           fi
+          # 修正：正确拼接URL路径
+          WEBDAV_FULL_URL="${{ secrets.WEBDAV_URL }}${{ env.WEBDAV_REMOTE_PATH }}"
+          echo "WebDAV完整URL: $WEBDAV_FULL_URL"
+          
           cat > /tmp/rclone.conf <<EOF
 [webdav]
 type = webdav
-url = ${{ secrets.WEBDAV_URL }}${{ env.WEBDAV_REMOTE_PATH }}
+url = $WEBDAV_FULL_URL
 vendor = other
 user = ${{ secrets.WEBDAV_USER }}
 pass = ${{ secrets.WEBDAV_PASSWORD }}
@@ -154,7 +158,8 @@ EOF
             else
               echo "❌ CasaOS 数据恢复失败"
             fi
-            if [ "$DOCKER_RESTORED" = true ] || [ "$CASAOS_RESTORED" = true ]; then
+            # 修正：使用字符串比较
+            if [ "$DOCKER_RESTORED" = "true" ] || [ "$CASAOS_RESTORED" = "true" ]; then
               echo "✅ 系统状态恢复完成"
               echo "RESTORED_FROM_BACKUP=true" >> $GITHUB_ENV
             else
@@ -271,6 +276,8 @@ EOF
           SNAPSHOT_RETENTION=${{ env.SNAPSHOT_RETENTION }}
           MAX_RUN_MINUTES=${{ env.MAX_RUN_MINUTES }}
           BACKUP_COMPRESSION=${{ env.BACKUP_COMPRESSION }}
+          BACKUP_DONE=false
+          
           full_backup() {
             local timestamp=$(date +%Y%m%d_%H%M%S)
             local backup_dir="${{ env.WEBDAV_MOUNT_POINT }}/backups/snapshots/$timestamp"
@@ -280,14 +287,15 @@ EOF
             sudo systemctl stop casaos docker 2>/dev/null || true
             sleep 5
             echo "🐳 备份 Docker 数据..."
+            # 修正：使用正确的排除路径格式
             if [ "$BACKUP_COMPRESSION" = "zstd" ]; then
               sudo tar -I 'zstd -T0 -3' -cf "$backup_dir/docker_state.tar.zst" \
                 /var/lib/docker /etc/docker \
-                --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" --exclude="docker/tmp" 2>/dev/null
+                --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" --exclude="/var/lib/docker/tmp" 2>/dev/null
             else
               sudo tar -czf "$backup_dir/docker_state.tar.gz" \
                 /var/lib/docker /etc/docker \
-                --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" --exclude="docker/tmp" 2>/dev/null
+                --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" --exclude="/var/lib/docker/tmp" 2>/dev/null
             fi
             echo "🏠 备份 CasaOS 数据..."
             if [ "$BACKUP_COMPRESSION" = "zstd" ]; then
@@ -389,15 +397,22 @@ JSON_EOF
           }
           echo "⏰ 等待300分钟后执行备份..."
           echo "📅 备份将在 $(date -d '+300 minutes' '+%H:%M:%S') 执行"
-          while true; do
+          
+          # 修正：修复无限循环逻辑
+          while [ $(( ($(date +%s) - START_TIME) / 60 )) -lt $MAX_RUN_MINUTES ]; do
             CURRENT_TIME=$(date +%s)
             RUN_MINUTES=$(( (CURRENT_TIME - START_TIME) / 60 ))
+            RUN_SECONDS=$(( CURRENT_TIME - START_TIME ))
             REMAINING_MINUTES=$(( MAX_RUN_MINUTES - RUN_MINUTES ))
+            
             echo "⏱️  运行: ${RUN_MINUTES}分钟 | 剩余: ${REMAINING_MINUTES}分钟"
-            if [ $RUN_MINUTES -ge 300 ]; then
+            
+            # 检查是否到达备份时间且未执行备份
+            if [ $RUN_MINUTES -ge 300 ] && [ "$BACKUP_DONE" = "false" ]; then
               echo "🚨 到达300分钟，执行完整备份..."
               if full_backup; then
                 echo "✅ 备份完成，触发续期..."
+                BACKUP_DONE=true
                 cleanup_old_backups
                 if trigger_renewal; then
                   echo "🎉 新工作流已触发"
@@ -407,24 +422,24 @@ JSON_EOF
                 sleep 30
                 if full_backup; then
                   echo "✅ 重试备份成功，触发续期..."
+                  BACKUP_DONE=true
+                  cleanup_old_backups
                   trigger_renewal
                 else
                   echo "❌ 重试备份失败，跳过续期"
+                  BACKUP_DONE=true
                 fi
               fi
               echo "⏳ 当前工作流将继续运行到360分钟超时..."
-              while [ $RUN_MINUTES -lt $MAX_RUN_MINUTES ]; do
-                sleep 60
-                CURRENT_TIME=$(date +%s)
-                RUN_MINUTES=$(( (CURRENT_TIME - START_TIME) / 60 ))
-                REMAINING_MINUTES=$(( MAX_RUN_MINUTES - RUN_MINUTES ))
-                echo "⏱️  运行: ${RUN_MINUTES}分钟 | 剩余: ${REMAINING_MINUTES}分钟"
-              done
             fi
+            
+            # 检查是否超时
             if [ $RUN_MINUTES -ge $MAX_RUN_MINUTES ]; then
               echo "⏹️ 工作流超时，退出"
               exit 0
             fi
+            
+            # 等待1分钟后再次检查
             sleep 60
           done
 
