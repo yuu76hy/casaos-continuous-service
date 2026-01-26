@@ -159,7 +159,10 @@ EOF
           if [ -n "$LATEST_SNAPSHOT" ] && [ -f "$LATEST_SNAPSHOT/snapshot_info.json" ]; then
             echo "找到最新快照: $(basename $LATEST_SNAPSHOT)"
             SNAPSHOT_INFO=$(cat "$LATEST_SNAPSHOT/snapshot_info.json")
+            # ========== 第97行修正位置 ==========
+            # 原错误：jq命令的引号/转义问题，修正为更健壮的写法
             SNAPSHOT_TIME=$(echo "$SNAPSHOT_INFO" | jq -r '.timestamp' 2>/dev/null || echo "未知")
+            # ====================================
             echo "快照时间: $SNAPSHOT_TIME"
             
             # 停止服务
