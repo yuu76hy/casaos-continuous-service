@@ -361,7 +361,8 @@ jobs:
             if [ ! -f "/etc/systemd/system/casaos.service" ] && [ ! -f "/usr/lib/systemd/system/casaos.service" ]; then
               echo "⚠️ casaos.service file not found, generate default file..."
               sudo mkdir -p /etc/systemd/system
-              cat > /tmp/casaos.service << EOF
+              # 修复：EOF顶格，无缩进，避免YAML解析错误
+              cat > /tmp/casaos.service <<EOF
 [Unit]
 Description=CasaOS Service
 After=docker.service network.target
