@@ -1,14 +1,16 @@
+# CasaOS + Tailscale 自动化部署工作流
+# 支持手动触发/API续期触发，集成WebDAV备份/恢复、自动续期功能
 name: CasaOS-Tailscale-简单部署
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 手动触发（GitHub页面点击运行）
   repository_dispatch:
-    types: [renew_casaos_tailscale]
+    types: [renew_casaos_tailscale]  # API触发续期
 
 jobs:
   deploy-casaos:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 360  # 最大运行时长6小时
     
     env:
       # 核心配置
@@ -16,25 +18,12 @@ jobs:
       WEBDAV_MOUNT_POINT: /mnt/webdav
       WEBDAV_REMOTE_PATH: /z/Ubu
       
-      # WebDAV 配置
-      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-      
-      # GitHub 配置
-      USER_PAT: ${{ secrets.USER_PAT }}
-      REPO: ${{ github.repository }}
-      
-      # Tailscale 配置
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      
       # 备份配置
-      BACKUP_COMPRESSION: zstd
-      SNAPSHOT_RETENTION: 3
+      BACKUP_COMPRESSION: zstd  # 压缩格式：zstd（高效）/gz（通用）
+      SNAPSHOT_RETENTION: 3     # 保留最新3个快照
       
-      # 调试用户
+      # 调试配置（敏感信息移至Secrets）
       DEBUG_USER: roots
-      DEBUG_PASSWORD: roots1234
       
       # 挂载配置
       MAX_MOUNT_RETRIES: 3
@@ -45,57 +34,94 @@ jobs:
         run: |
           echo "===== 步骤1: 系统环境初始化 ====="
           echo "开始时间: $(date)"
+          # 更新系统并安装基础依赖
           sudo apt update -y
           sudo apt install -y curl wget git jq tar gzip zstd rsync fuse3 psmisc net-tools iputils-ping ca-certificates lsb-release
+          
+          # 安装rclone（WebDAV挂载工具）
           echo "安装 rclone..."
           curl -s https://rclone.org/install.sh | sudo bash
+          
+          # 配置fuse允许非root访问
           echo "user_allow_other" | sudo tee -a /etc/fuse.conf
+          
+          # 创建WebDAV挂载点
           sudo mkdir -p ${{ env.WEBDAV_MOUNT_POINT }}
           sudo chmod 777 ${{ env.WEBDAV_MOUNT_POINT }}
+          
           echo "✅ 系统初始化完成"
 
       - name: 步骤2 - 创建调试用户
         run: |
           echo "===== 步骤2: 创建调试用户 ====="
+          # 从Secrets读取密码（避免硬编码）
+          DEBUG_PASSWORD="${{ secrets.DEBUG_PASSWORD }}"
+          if [ -z "$DEBUG_PASSWORD" ]; then
+            echo "⚠️ 未配置DEBUG_PASSWORD，使用默认密码（仅测试用）"
+            DEBUG_PASSWORD="roots1234"
+          fi
+          
+          # 创建/更新调试用户
           if id "${{ env.DEBUG_USER }}" &>/dev/null; then
             echo "用户已存在，修改密码"
-            echo "${{ env.DEBUG_USER }}:${{ env.DEBUG_PASSWORD }}" | sudo chpasswd
+            echo "${{ env.DEBUG_USER }}:$DEBUG_PASSWORD" | sudo chpasswd
           else
             sudo useradd -m -s /bin/bash "${{ env.DEBUG_USER }}"
-            echo "${{ env.DEBUG_USER }}:${{ env.DEBUG_PASSWORD }}" | sudo chpasswd
+            echo "${{ env.DEBUG_USER }}:$DEBUG_PASSWORD" | sudo chpasswd
             sudo usermod -aG sudo "${{ env.DEBUG_USER }}"
           fi
+          
           echo "✅ 调试用户创建完成"
 
-      - name: 步骤3 - 挂载 WebDAV
+      - name: 步骤3 - 挂载 WebDAV（带重试）
         id: mount_webdav
         run: |
           echo "===== 步骤3: 挂载 WebDAV ====="
-          if [ -z "${{ secrets.WEBDAV_URL }}" ] || [ -z "${{ secrets.WEBDAV_USER }}" ] || [ -z "${{ secrets.WEBDAV_PASSWORD }}" ]; then
-            echo "❌ WebDAV 凭据未配置"
+          # 校验WebDAV凭据
+          WEBDAV_URL="${{ secrets.WEBDAV_URL }}"
+          WEBDAV_USER="${{ secrets.WEBDAV_USER }}"
+          WEBDAV_PASSWORD="${{ secrets.WEBDAV_PASSWORD }}"
+          
+          if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
+            echo "❌ WebDAV 凭据未配置，跳过挂载"
             echo "WEBDAV_AVAILABLE=false" >> $GITHUB_ENV
             exit 0
           fi
-          # 修正：正确拼接URL路径
-          WEBDAV_FULL_URL="${{ secrets.WEBDAV_URL }}${{ env.WEBDAV_REMOTE_PATH }}"
+          
+          # 拼接完整WebDAV URL
+          WEBDAV_FULL_URL="${WEBDAV_URL}${{ env.WEBDAV_REMOTE_PATH }}"
           echo "WebDAV完整URL: $WEBDAV_FULL_URL"
           
+          # 生成rclone配置文件
           cat > /tmp/rclone.conf <<EOF
 [webdav]
 type = webdav
 url = $WEBDAV_FULL_URL
 vendor = other
-user = ${{ secrets.WEBDAV_USER }}
-pass = ${{ secrets.WEBDAV_PASSWORD }}
+user = $WEBDAV_USER
+pass = $WEBDAV_PASSWORD
 EOF
-          echo "测试 WebDAV 连接..."
-          if rclone lsd webdav: --config=/tmp/rclone.conf; then
-            echo "✅ WebDAV 连接成功"
-          else
-            echo "❌ WebDAV 连接失败"
+          
+          # 测试WebDAV连接（带重试）
+          CONNECT_SUCCESS=false
+          for i in $(seq 1 ${{ env.MAX_MOUNT_RETRIES }}); do
+            echo "测试连接（第$i次）..."
+            if rclone lsd webdav: --config=/tmp/rclone.conf; then
+              CONNECT_SUCCESS=true
+              echo "✅ WebDAV 连接成功"
+              break
+            fi
+            echo "❌ 连接失败，${{ env.RETRY_DELAY }}秒后重试"
+            sleep ${{ env.RETRY_DELAY }}
+          done
+          
+          if [ "$CONNECT_SUCCESS" = "false" ]; then
+            echo "❌ WebDAV 连接失败（重试${{ env.MAX_MOUNT_RETRIES }}次）"
             echo "WEBDAV_AVAILABLE=false" >> $GITHUB_ENV
             exit 0
           fi
+          
+          # 挂载WebDAV（后台运行）
           echo "挂载 WebDAV..."
           rclone mount webdav: "${{ env.WEBDAV_MOUNT_POINT }}" \
             --config=/tmp/rclone.conf \
@@ -104,10 +130,13 @@ EOF
             --daemon \
             --log-level INFO \
             --log-file /tmp/rclone.log
+          
+          # 验证挂载
           sleep 5
           if mountpoint -q "${{ env.WEBDAV_MOUNT_POINT }}"; then
             echo "✅ WebDAV 挂载成功"
             echo "WEBDAV_AVAILABLE=true" >> $GITHUB_ENV
+            # 创建备份目录
             mkdir -p "${{ env.WEBDAV_MOUNT_POINT }}/backups/snapshots"
           else
             echo "❌ WebDAV 挂载失败"
@@ -118,19 +147,25 @@ EOF
         if: env.WEBDAV_AVAILABLE == 'true'
         run: |
           echo "===== 步骤4: 智能恢复系统状态 ====="
+          # 查找最新快照
           find_snapshot() {
             local snapshot_dir="${{ env.WEBDAV_MOUNT_POINT }}/backups/snapshots"
             if [ -d "$snapshot_dir" ]; then
               find "$snapshot_dir" -maxdepth 1 -type d -name "2*" 2>/dev/null | sort -r | head -1
             fi
           }
+          
           LATEST_SNAPSHOT=$(find_snapshot)
           if [ -n "$LATEST_SNAPSHOT" ] && [ -f "$LATEST_SNAPSHOT/snapshot_info.json" ]; then
-            echo "找到快照: $(basename $LATEST_SNAPSHOT)"
+            echo "找到最新快照: $(basename $LATEST_SNAPSHOT)"
             SNAPSHOT_INFO=$(cat "$LATEST_SNAPSHOT/snapshot_info.json")
             SNAPSHOT_TIME=$(echo "$SNAPSHOT_INFO" | jq -r '.timestamp' 2>/dev/null || echo "未知")
             echo "快照时间: $SNAPSHOT_TIME"
+            
+            # 停止服务
             sudo systemctl stop casaos docker 2>/dev/null || true
+            
+            # 恢复函数
             restore_from_tar() {
               local tar_file="$1"
               local target_dir="$2"
@@ -144,6 +179,8 @@ EOF
               fi
               return 1
             }
+            
+            # 恢复Docker和CasaOS数据
             DOCKER_RESTORED=false
             if restore_from_tar "$LATEST_SNAPSHOT/docker_state.tar.${{ env.BACKUP_COMPRESSION }}" "/"; then
               echo "✅ Docker 数据恢复成功"
@@ -151,6 +188,7 @@ EOF
             else
               echo "❌ Docker 数据恢复失败"
             fi
+            
             CASAOS_RESTORED=false
             if restore_from_tar "$LATEST_SNAPSHOT/casaos_state.tar.${{ env.BACKUP_COMPRESSION }}" "/"; then
               echo "✅ CasaOS 数据恢复成功"
@@ -158,7 +196,8 @@ EOF
             else
               echo "❌ CasaOS 数据恢复失败"
             fi
-            # 修正：使用字符串比较
+            
+            # 标记恢复状态
             if [ "$DOCKER_RESTORED" = "true" ] || [ "$CASAOS_RESTORED" = "true" ]; then
               echo "✅ 系统状态恢复完成"
               echo "RESTORED_FROM_BACKUP=true" >> $GITHUB_ENV
@@ -167,21 +206,24 @@ EOF
               echo "RESTORED_FROM_BACKUP=false" >> $GITHUB_ENV
             fi
           else
-            echo "未找到可用快照"
+            echo "ℹ️ 未找到可用快照，将执行全新安装"
             echo "RESTORED_FROM_BACKUP=false" >> $GITHUB_ENV
           fi
 
-      - name: 步骤5 - 安装 CasaOS
+      - name: 步骤5 - 安装/恢复 CasaOS
         run: |
           echo "===== 步骤5: 安装 CasaOS ====="
+          # 区分恢复/全新安装
           if [ "$RESTORED_FROM_BACKUP" = "true" ]; then
-            echo "✅ 已从备份恢复，验证组件..."
+            echo "✅ 从备份恢复，验证组件..."
+            # 补装Docker（如果缺失）
             if ! command -v docker &>/dev/null; then
               echo "🐳 安装 Docker..."
               curl -fsSL https://get.docker.com | sudo bash
             else
               echo "✅ Docker 已安装"
             fi
+            # 补装CasaOS（如果缺失）
             if [ ! -f "/usr/local/bin/casaos" ]; then
               echo "🏠 安装 CasaOS..."
               curl -fsSL https://get.casaos.io | sudo bash
@@ -190,14 +232,20 @@ EOF
             fi
           else
             echo "🆕 执行全新安装..."
+            # 安装Docker
             curl -fsSL https://get.docker.com | sudo bash
+            # 安装CasaOS
             curl -fsSL https://get.casaos.io | sudo bash
           fi
+          
+          # 重启并验证服务
           sudo systemctl daemon-reload
           sudo systemctl enable docker casaos
           sudo systemctl start docker
           sleep 10
           sudo systemctl start casaos
+          
+          # 检查CasaOS Web界面是否可用
           for i in $(seq 1 30); do
             if curl -s http://localhost:80 &>/dev/null; then
               echo "✅ CasaOS Web 界面可访问"
@@ -205,6 +253,8 @@ EOF
             fi
             sleep 2
           done
+          
+          # 输出版本信息
           echo "📊 安装验证:"
           echo "  🐳 Docker: $(docker --version 2>/dev/null || echo '未安装')"
           echo "  🏠 CasaOS: $(sudo casaos version 2>/dev/null || echo '未安装')"
@@ -212,18 +262,25 @@ EOF
       - name: 步骤6 - 部署 Tailscale
         run: |
           echo "===== 步骤6: 部署 Tailscale ====="
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ] || [ "${{ secrets.TAILSCALE_AUTH_KEY }}" = "" ]; then
+          TAILSCALE_AUTH_KEY="${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ 未配置 TAILSCALE_AUTH_KEY，跳过组网"
             echo "TAILSCALE_CONNECTED=false" >> $GITHUB_ENV
             exit 0
           fi
+          
+          # 安装Tailscale
           curl -fsSL https://tailscale.com/install.sh | sudo bash
+          
+          # 启动Tailscale并组网
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --authkey="$TAILSCALE_AUTH_KEY" \
             --accept-routes \
             --hostname="casaos-runner-${{ github.run_id }}" \
             --accept-dns=false \
             --reset
+          
+          # 验证连接
           sleep 5
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "")
           if [ -n "$TAILSCALE_IP" ]; then
@@ -236,11 +293,18 @@ EOF
             echo "TAILSCALE_CONNECTED=false" >> $GITHUB_ENV
           fi
 
-      - name: 步骤7 - 访问信息
+      - name: 步骤7 - 输出访问信息
         run: |
           echo "===== 步骤7: 访问信息 ====="
+          # 获取IP信息
           PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || echo "未知")
           LOCAL_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "未知")
+          DEBUG_PASSWORD="${{ secrets.DEBUG_PASSWORD }}"
+          if [ -z "$DEBUG_PASSWORD" ]; then
+            DEBUG_PASSWORD="roots1234"
+          fi
+          
+          # 输出访问信息
           echo "========================================"
           echo "🎉 CasaOS 部署完成"
           echo "========================================"
@@ -256,7 +320,7 @@ EOF
           fi
           echo "🔧 管理访问:"
           echo "  SSH: ssh ${{ env.DEBUG_USER }}@$LOCAL_IP"
-          echo "  密码: ${{ env.DEBUG_PASSWORD }}"
+          echo "  密码: $DEBUG_PASSWORD"
           echo ""
           echo "📊 系统状态:"
           echo "  🐳 Docker: $(systemctl is-active docker 2>/dev/null || echo 'unknown')"
@@ -269,26 +333,29 @@ EOF
           echo "  2. 通过 Tailscale 访问更安全"
           echo "========================================"
 
-      - name: 步骤8 - 完整备份与续期
+      - name: 步骤8 - 自动备份与工作流续期
         run: |
           echo "===== 步骤8: 完整备份与续期 ====="
           START_TIME=$(date +%s)
-          SNAPSHOT_RETENTION=${{ env.SNAPSHOT_RETENTION }}
-          MAX_RUN_MINUTES=${{ env.MAX_RUN_MINUTES }}
-          BACKUP_COMPRESSION=${{ env.BACKUP_COMPRESSION }}
           BACKUP_DONE=false
           
+          # 全量备份函数
           full_backup() {
             local timestamp=$(date +%Y%m%d_%H%M%S)
             local backup_dir="${{ env.WEBDAV_MOUNT_POINT }}/backups/snapshots/$timestamp"
-            echo "💾 执行完整备份..."
+            echo "💾 执行全量备份（时间戳: $timestamp）..."
+            
+            # 创建备份目录
             mkdir -p "$backup_dir"
+            
+            # 停止服务
             echo "⏸️ 停止 Docker 和 CasaOS 服务..."
             sudo systemctl stop casaos docker 2>/dev/null || true
             sleep 5
+            
+            # 备份Docker数据（排除日志/缓存）
             echo "🐳 备份 Docker 数据..."
-            # 修正：使用正确的排除路径格式
-            if [ "$BACKUP_COMPRESSION" = "zstd" ]; then
+            if [ "${{ env.BACKUP_COMPRESSION }}" = "zstd" ]; then
               sudo tar -I 'zstd -T0 -3' -cf "$backup_dir/docker_state.tar.zst" \
                 /var/lib/docker /etc/docker \
                 --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" --exclude="/var/lib/docker/tmp" 2>/dev/null
@@ -297,8 +364,10 @@ EOF
                 /var/lib/docker /etc/docker \
                 --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" --exclude="/var/lib/docker/tmp" 2>/dev/null
             fi
+            
+            # 备份CasaOS数据
             echo "🏠 备份 CasaOS 数据..."
-            if [ "$BACKUP_COMPRESSION" = "zstd" ]; then
+            if [ "${{ env.BACKUP_COMPRESSION }}" = "zstd" ]; then
               sudo tar -I 'zstd -T0 -3' -cf "$backup_dir/casaos_state.tar.zst" \
                 /var/lib/casaos /etc/casaos /usr/local/bin/casaos* \
                 --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" 2>/dev/null
@@ -307,147 +376,152 @@ EOF
                 /var/lib/casaos /etc/casaos /usr/local/bin/casaos* \
                 --exclude="*.log" --exclude="*.tmp" --exclude="*.cache" 2>/dev/null
             fi
+            
+            # 重启服务
             echo "▶️ 重新启动服务..."
             sudo systemctl start docker
             sleep 5
             sudo systemctl start casaos
+            
             # 创建恢复脚本
             cat > "$backup_dir/restore.sh" <<'RESTORE_EOF'
 #!/bin/bash
-echo "恢复 CasaOS 系统..."
+echo "开始恢复 CasaOS 系统..."
+# 恢复CasaOS数据
 if [ -f "casaos_state.tar.gz" ]; then
-  tar -xzf casaos_state.tar.gz -C / 2>/dev/null
-fi
-if [ -f "docker_state.tar.gz" ]; then
-  tar -xzf docker_state.tar.gz -C / 2>/dev/null
+  sudo tar -xzf casaos_state.tar.gz -C / 2>/dev/null && echo "✅ CasaOS(gz) 恢复完成"
 fi
 if [ -f "casaos_state.tar.zst" ]; then
-  tar -I 'zstd -d' -xf casaos_state.tar.zst -C / 2>/dev/null
+  sudo tar -I 'zstd -d' -xf casaos_state.tar.zst -C / 2>/dev/null && echo "✅ CasaOS(zstd) 恢复完成"
+fi
+# 恢复Docker数据
+if [ -f "docker_state.tar.gz" ]; then
+  sudo tar -xzf docker_state.tar.gz -C / 2>/dev/null && echo "✅ Docker(gz) 恢复完成"
 fi
 if [ -f "docker_state.tar.zst" ]; then
-  tar -I 'zstd -d' -xf docker_state.tar.zst -C / 2>/dev/null
+  sudo tar -I 'zstd -d' -xf docker_state.tar.zst -C / 2>/dev/null && echo "✅ Docker(zstd) 恢复完成"
 fi
-echo "恢复完成"
+echo "📌 恢复完成，建议重启服务: sudo systemctl restart docker casaos"
 RESTORE_EOF
             chmod +x "$backup_dir/restore.sh"
+            
             # 创建快照信息文件
-            cat > "$backup_dir/snapshot_info.json" <<'JSON_EOF'
+            cat > "$backup_dir/snapshot_info.json" <<EOF
 {
-  "timestamp": "TIMESTAMP_PLACEHOLDER",
+  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "type": "full_backup",
-  "runner_id": "RUNNER_ID_PLACEHOLDER",
+  "runner_id": "${{ github.run_id }}",
   "components": {
     "docker": true,
     "casaos": true
   },
   "system_info": {
-    "distro": "DISTRO_PLACEHOLDER",
-    "kernel": "KERNEL_PLACEHOLDER",
-    "arch": "ARCH_PLACEHOLDER"
+    "distro": "$(lsb_release -ds 2>/dev/null | sed 's/"/\\"/g' || echo "unknown")",
+    "kernel": "$(uname -r)",
+    "arch": "$(uname -m)"
   }
 }
-JSON_EOF
-            # 替换占位符
-            sed -i "s/TIMESTAMP_PLACEHOLDER/$(date -u +"%Y-%m-%dT%H:%M:%SZ")/g" "$backup_dir/snapshot_info.json"
-            sed -i "s/RUNNER_ID_PLACEHOLDER/${{ github.run_id }}/g" "$backup_dir/snapshot_info.json"
-            sed -i "s/DISTRO_PLACEHOLDER/$(lsb_release -ds 2>/dev/null | sed 's/"/\\"/g' || echo "unknown")/g" "$backup_dir/snapshot_info.json"
-            sed -i "s/KERNEL_PLACEHOLDER/$(uname -r)/g" "$backup_dir/snapshot_info.json"
-            sed -i "s/ARCH_PLACEHOLDER/$(uname -m)/g" "$backup_dir/snapshot_info.json"
-            echo "✅ 完整备份完成: $backup_dir"
-            if [ -f "$backup_dir/docker_state.tar.$BACKUP_COMPRESSION" ] && [ -f "$backup_dir/casaos_state.tar.$BACKUP_COMPRESSION" ]; then
-              echo "✅ 备份文件验证成功"
+EOF
+            
+            # 验证备份文件
+            if [ -f "$backup_dir/docker_state.tar.${{ env.BACKUP_COMPRESSION }}" ] && [ -f "$backup_dir/casaos_state.tar.${{ env.BACKUP_COMPRESSION }}" ]; then
+              echo "✅ 全量备份完成: $backup_dir"
               return 0
             else
               echo "❌ 备份文件验证失败"
               return 1
             fi
           }
+          
+          # 清理旧备份函数
           cleanup_old_backups() {
             local snapshot_dir="${{ env.WEBDAV_MOUNT_POINT }}/backups/snapshots"
             if [ -d "$snapshot_dir" ]; then
-              echo "🧹 清理旧备份，保留最近 $SNAPSHOT_RETENTION 个..."
-              ls -1t "$snapshot_dir" 2>/dev/null | tail -n +$((SNAPSHOT_RETENTION + 1)) | while read old; do
-                echo "删除旧备份: $old"
-                rm -rf "$snapshot_dir/$old"
+              echo "🧹 清理旧备份（保留最新${{ env.SNAPSHOT_RETENTION }}个）..."
+              ls -1t "$snapshot_dir" 2>/dev/null | tail -n +$(( ${{ env.SNAPSHOT_RETENTION }} + 1 )) | while read old_snap; do
+                if [ -n "$old_snap" ]; then
+                  echo "删除旧快照: $old_snap"
+                  rm -rf "$snapshot_dir/$old_snap"
+                fi
               done
             fi
           }
+          
+          # 触发工作流续期函数
           trigger_renewal() {
-            if [ -z "${{ secrets.USER_PAT }}" ] || [ -z "${{ github.repository }}" ]; then
-              echo "❌ 未配置 USER_PAT，无法触发续期"
+            USER_PAT="${{ secrets.USER_PAT }}"
+            REPO="${{ github.repository }}"
+            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
+              echo "❌ 未配置USER_PAT，无法触发续期"
               return 1
             fi
+            
             echo "🔄 触发工作流续期..."
             for i in 1 2 3; do
-              echo "尝试 $i/3"
               response=$(curl -s -o /dev/null -w "%{http_code}" \
                 -X POST \
                 -H "Accept: application/vnd.github.v3+json" \
-                -H "Authorization: token ${{ secrets.USER_PAT }}" \
-                "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+                -H "Authorization: token $USER_PAT" \
+                "https://api.github.com/repos/$REPO/dispatches" \
                 -d '{"event_type": "renew_casaos_tailscale"}')
               if [ "$response" = "204" ]; then
-                echo "✅ 续期触发成功"
+                echo "✅ 续期触发成功（新工作流已启动）"
                 return 0
               fi
+              echo "⚠️ 续期触发失败（第$i次），10秒后重试"
               sleep 10
             done
-            echo "❌ 续期触发失败"
+            echo "❌ 续期触发失败（重试3次）"
             return 1
           }
-          echo "⏰ 等待300分钟后执行备份..."
-          echo "📅 备份将在 $(date -d '+300 minutes' '+%H:%M:%S') 执行"
           
-          # 修正：修复无限循环逻辑
-          while [ $(( ($(date +%s) - START_TIME) / 60 )) -lt $MAX_RUN_MINUTES ]; do
+          # 主循环：运行至超时，300分钟时执行备份
+          echo "⏰ 开始监控运行时长（最大${{ env.MAX_RUN_MINUTES }}分钟）..."
+          while true; do
             CURRENT_TIME=$(date +%s)
             RUN_MINUTES=$(( (CURRENT_TIME - START_TIME) / 60 ))
-            RUN_SECONDS=$(( CURRENT_TIME - START_TIME ))
-            REMAINING_MINUTES=$(( MAX_RUN_MINUTES - RUN_MINUTES ))
+            REMAINING_MINUTES=$(( ${{ env.MAX_RUN_MINUTES }} - RUN_MINUTES ))
             
-            echo "⏱️  运行: ${RUN_MINUTES}分钟 | 剩余: ${REMAINING_MINUTES}分钟"
+            echo "⏱️  已运行: ${RUN_MINUTES}分钟 | 剩余: ${REMAINING_MINUTES}分钟"
             
-            # 检查是否到达备份时间且未执行备份
+            # 300分钟时执行备份（仅执行一次）
             if [ $RUN_MINUTES -ge 300 ] && [ "$BACKUP_DONE" = "false" ]; then
-              echo "🚨 到达300分钟，执行完整备份..."
+              echo "🚨 到达300分钟，执行全量备份..."
               if full_backup; then
-                echo "✅ 备份完成，触发续期..."
-                BACKUP_DONE=true
                 cleanup_old_backups
-                if trigger_renewal; then
-                  echo "🎉 新工作流已触发"
-                fi
+                trigger_renewal
+                BACKUP_DONE=true
               else
-                echo "❌ 备份失败，尝试重试..."
+                echo "❌ 首次备份失败，30秒后重试..."
                 sleep 30
                 if full_backup; then
-                  echo "✅ 重试备份成功，触发续期..."
-                  BACKUP_DONE=true
                   cleanup_old_backups
                   trigger_renewal
+                  BACKUP_DONE=true
                 else
-                  echo "❌ 重试备份失败，跳过续期"
+                  echo "❌ 重试备份仍失败，跳过续期"
                   BACKUP_DONE=true
                 fi
               fi
-              echo "⏳ 当前工作流将继续运行到360分钟超时..."
             fi
             
-            # 检查是否超时
-            if [ $RUN_MINUTES -ge $MAX_RUN_MINUTES ]; then
-              echo "⏹️ 工作流超时，退出"
+            # 超时退出
+            if [ $RUN_MINUTES -ge ${{ env.MAX_RUN_MINUTES }} ]; then
+              echo "⏹️ 到达最大运行时长（${{ env.MAX_RUN_MINUTES }}分钟），退出"
               exit 0
             fi
             
-            # 等待1分钟后再次检查
+            # 每分钟检查一次
             sleep 60
           done
 
-      - name: 步骤9 - 清理环境
+      - name: 步骤9 - 清理环境（无论成败）
         if: always()
         run: |
           echo "===== 步骤9: 清理环境 ====="
-          fusermount -u "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null || true
+          # 卸载WebDAV
+          fusermount -u "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null || sudo umount "${{ env.WEBDAV_MOUNT_POINT }}" 2>/dev/null || true
+          # 清理临时文件
           sudo rm -rf /tmp/* /var/tmp/*
-          echo "清理完成"
+          echo "✅ 环境清理完成"
           echo "结束时间: $(date)"
