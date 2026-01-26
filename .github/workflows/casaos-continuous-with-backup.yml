@@ -194,7 +194,7 @@ jobs:
           sudo systemctl daemon-reload
           echo "✅ 恢复完成，服务配置就绪"
 
-      - name: 5-无快照全新安装CasaOS（兜底无报错）
+      - name: 5-无快照全新安装CasaOS（修复参数错误，兜底无报错）
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
         run: |
           set -e
@@ -210,9 +210,9 @@ jobs:
             echo "❌ Docker启动失败，终止安装"
             exit 1
           fi
-          # 官方安装+重试，无安装报错
+          # 官方标准安装命令（移除无效的--force参数）+重试，无参数报错
           INSTALL_RETRY=3
-          until curl -fsSL https://get.casaos.io | sudo bash -s -- --force; do
+          until curl -fsSL https://get.casaos.io | sudo bash; do
             INSTALL_RETRY=$((INSTALL_RETRY-1))
             if [ $INSTALL_RETRY -eq 0 ]; then
               echo "❌ CasaOS安装失败"
@@ -255,9 +255,9 @@ jobs:
           sudo chown -R root:root /etc/casaos /var/lib/casaos
           sudo chmod -R 755 /etc/casaos /var/lib/casaos
           sudo chmod 660 /run/docker.sock && sudo chown root:docker /run/docker.sock
-          # 补全可执行文件，双路径兼容
+          # 补全可执行文件（移除--force参数，使用官方标准命令）
           if [ ! -f "/usr/bin/casaos" ] && [ ! -f "/usr/local/bin/casaos" ]; then
-            curl -fsSL https://get.casaos.io | sudo bash -s -- --skip-config --force
+            curl -fsSL https://get.casaos.io | sudo bash -s -- --skip-config
           fi
           [ -f "/usr/local/bin/casaos" ] && sudo ln -sf /usr/local/bin/casaos /usr/bin/casaos 2>/dev/null || true
           # 修复服务文件，无配置错乱
