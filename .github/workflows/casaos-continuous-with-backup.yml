@@ -87,7 +87,6 @@ jobs:
           fi
           echo "✅ Docker安装完成，状态：$(sudo systemctl is-active docker)"
           echo "✅ 系统初始化完成，所有依赖就绪"
-
       - name: 2-创建根权限用户（完整权限，无权限报错）
         run: |
           set -e
@@ -116,7 +115,6 @@ jobs:
           sudo chown -R "$USER_NAME:$USER_NAME" /home/"$USER_NAME"
           sudo chmod 755 /home/"$USER_NAME"
           echo "✅ 根权限用户配置完成：免密sudo+docker管理"
-
       - name: 3-Rclone配置&WebDAV连通校验（无连接报错）
         run: |
           set -e
@@ -156,7 +154,6 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV配置完成，连通正常"
-
       - name: 4-自动恢复（快照完整还原，无解压报错）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
@@ -170,9 +167,9 @@ jobs:
           sync && sleep 3
           echo "✅ 服务停止，锁文件清理完成"
           
-          # 快照完整性校验，避免损坏恢复
+          # 快照完整性校验，避免损坏恢复，加sudo解决权限读取问题
           echo "🔍 校验快照完整性..."
-          if ! timeout 60 rclone cat mywebdav:${{ env.LATEST_SNAPSHOT }} --config /home/runner/.rclone.conf | tar -tzf - >/dev/null 2>&1; then
+          if ! timeout 60 rclone cat mywebdav:${{ env.LATEST_SNAPSHOT }} --config /home/runner/.rclone.conf | sudo tar -tzf - >/dev/null 2>&1; then
             echo "❌ 快照损坏，恢复终止"
             echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
             sudo systemctl unmask docker.socket casaos
@@ -180,8 +177,8 @@ jobs:
           fi
           echo "✅ 快照完整有效，开始恢复"
           
-          # 解压恢复，保留权限，无覆盖报错
-          rclone cat mywebdav:${{ env.LATEST_SNAPSHOT }} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --preserve-permissions $EXCLUDE_RULES
+          # 解压恢复，保留权限，无覆盖报错，sudo+P适配绝对路径备份
+          rclone cat mywebdav:${{ env.LATEST_SNAPSHOT }} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --ignore-failed-read --preserve-permissions --preserve-owner $EXCLUDE_RULES
           echo "✅ 全量恢复完成，数据完整还原"
           echo "SNAPSHOT_RESTORED=true" >> "$GITHUB_ENV"
           
@@ -193,7 +190,6 @@ jobs:
           sudo systemctl unmask docker.socket casaos
           sudo systemctl daemon-reload
           echo "✅ 恢复完成，服务配置就绪"
-
       - name: 5-无快照全新安装CasaOS（修复参数错误，兜底无报错）
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
         run: |
@@ -224,7 +220,6 @@ jobs:
           done
           echo "✅ CasaOS全新安装成功"
           echo "SNAPSHOT_RESTORED=false" >> "$GITHUB_ENV"
-
       - name: 6-恢复后环境修复+服务启动（无缝可用）
         if: ${{ env.SNAPSHOT_RESTORED == 'true' }}
         run: |
@@ -286,7 +281,6 @@ jobs:
           sudo systemctl status docker --no-pager
           sudo systemctl status casaos --no-pager
           echo "✅ 环境修复完成，正常运行"
-
       - name: 7-全新安装后服务初始化（稳定无报错）
         if: ${{ env.SNAPSHOT_RESTORED != 'true' }}
         run: |
@@ -298,7 +292,6 @@ jobs:
           sudo systemctl status docker --no-pager
           sudo systemctl status casaos --no-pager
           echo "✅ CasaOS全新环境就绪，可直接访问"
-
       - name: 8-Tailscale组网部署（极简核心参数，零解析错误）
         run: |
           set -e
@@ -340,8 +333,7 @@ jobs:
           else
             echo "⚠️ 组网完成但未获取到IP，状态：$(sudo tailscale status | head -3)"
           fi
-
-      - name: 9-全量备份+自动续跑（修复Shell算术语法错误）
+      - name: 9-全量备份+自动续跑（修复权限不足+核心文件缺失+管道破裂）
         shell: bash
         run: |
           set -e
@@ -371,20 +363,29 @@ jobs:
             return 0
           }
           
-          # 备份核心函数：无打包/上传报错
+          # 备份核心函数：权限拉满+完整打包+精准校验
           full_backup_and_upload() {
             if [ "${{ env.WEBDAV_AVAILABLE }}" != "true" ]; then
               echo "❌ WebDAV不可用，跳过备份"
               return 1
             fi
-            # 前置检查：目录+空间充足
+            
+            # 打包前强制检查核心目录+补全，避免空打包
+            echo "🔍 检查核心备份目录完整性..."
+            MISSING_DIRS=""
             for dir in $CORE_BACKUP_DIRS; do
-              sudo mkdir -p "$dir" 2>/dev/null || true
+              if [ ! -e "$dir" ]; then
+                echo "⚠️ 核心目录 $dir 不存在，root权限创建"
+                sudo mkdir -p "$dir" && sudo chown -R root:root "$dir"
+                MISSING_DIRS="$MISSING_DIRS $dir"
+              fi
             done
+            [ -n "$MISSING_DIRS" ] && echo "✅ 已补全缺失目录：$MISSING_DIRS" || echo "✅ 核心目录全部存在"
+            
+            # 前置准备：目录+权限+空间校验
             BACKUP_TMP_DIR="/home/runner/casaos-backup-tmp"
             sudo rm -rf "$BACKUP_TMP_DIR" && sudo mkdir -p "$BACKUP_TMP_DIR"
-            sudo chown -R runner:runner "$BACKUP_TMP_DIR"
-            sudo chmod 777 "$BACKUP_TMP_DIR"
+            sudo chown -R runner:runner "$BACKUP_TMP_DIR" && sudo chmod 777 "$BACKUP_TMP_DIR"
             # 空间校验，避免写满
             FREE_SPACE=$(df -k "$BACKUP_TMP_DIR" | awk 'NR==2{print $4}')
             FREE_SPACE_GB=$((FREE_SPACE/1024/1024))
@@ -395,31 +396,56 @@ jobs:
             fi
             echo "✅ 前置检查通过，可用空间：$FREE_SPACE_GB GB"
             
-            # 打包：无权限/文件占用报错
+            # 核心修复：sudo+P+preserve参数，完整打包root权限目录，无遗漏
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             LOCAL_SNAPSHOT="$BACKUP_TMP_DIR/$SNAPSHOT_NAME"
             REMOTE_SNAPSHOT="${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}"
-            echo "🔄 全量打包中..."
-            sudo tar -czf "$LOCAL_SNAPSHOT" \
+            echo "🔄 全量打包中（root权限完整打包）..."
+            sudo tar -czPf "$LOCAL_SNAPSHOT" \
               --ignore-failed-read \
               --warning=no-all \
               --preserve-permissions \
+              --preserve-owner \
               --dereference \
               $EXCLUDE_RULES \
-              $CORE_BACKUP_DIRS >/dev/null 2>&1
+              $CORE_BACKUP_DIRS > "$BACKUP_TMP_DIR/tar_log.txt" 2>&1
             sudo chown runner:runner "$LOCAL_SNAPSHOT"
             SNAPSHOT_SIZE=$(du -sh "$LOCAL_SNAPSHOT" | awk '{print $1}')
-            echo "✅ 打包完成，快照大小：$SNAPSHOT_SIZE"
+            echo "✅ 打包完成，快照大小：$SNAPSHOT_SIZE（含完整root核心数据）"
             
-            # 三重校验：杜绝无效备份
+            # 三重校验：全加sudo，解决读包权限不足，杜绝误判
+            # 1. 大小校验：排除空包
             SNAPSHOT_KB=$(du -k "$LOCAL_SNAPSHOT" | awk '{print $1}')
-            if [ $SNAPSHOT_KB -lt 1024 ]; then echo "❌ 快照过小，无效"; sudo rm -rf "$BACKUP_TMP_DIR"; return 1; fi
-            TAR_CONTENT=$(tar -tzf "$LOCAL_SNAPSHOT" 2>/dev/null)
-            if ! echo "$TAR_CONTENT" | grep -q "var/lib/docker" || ! echo "$TAR_CONTENT" | grep -q "var/lib/casaos"; then echo "❌ 核心文件缺失"; sudo rm -rf "$BACKUP_TMP_DIR"; return 1; fi
-            tar -tzf "$LOCAL_SNAPSHOT" 2>/dev/null | head -5 >/dev/null || { echo "❌ 快照损坏"; sudo rm -rf "$BACKUP_TMP_DIR"; return 1; }
-            echo "✅ 快照校验通过，完整有效"
+            if [ $SNAPSHOT_KB -lt 2048 ]; then 
+              echo "❌ 快照过小（<2MB），打包失败"
+              echo "打包日志前20行：" && head -20 "$BACKUP_TMP_DIR/tar_log.txt"
+              sudo rm -rf "$BACKUP_TMP_DIR"
+              return 1
+            fi
             
-            # 停止服务+上传，无占用/上传报错
+            # 2. 内容校验：sudo读包+文件存储，彻底解决Broken pipe，精准校验
+            echo "🔍 校验快照核心内容..."
+            sudo tar -tzf "$LOCAL_SNAPSHOT" 2>"$BACKUP_TMP_DIR/tar_error.txt" > "$BACKUP_TMP_DIR/tar_content.txt"
+            HAS_DOCKER=$(grep -c "var/lib/docker" "$BACKUP_TMP_DIR/tar_content.txt")
+            HAS_CASAOS=$(grep -c "var/lib/casaos" "$BACKUP_TMP_DIR/tar_content.txt")
+            HAS_DATA=$(grep -c "DATA" "$BACKUP_TMP_DIR/tar_content.txt")
+            if [ $HAS_DOCKER -eq 0 ] || [ $HAS_CASAOS -eq 0 ] || [ $HAS_DATA -eq 0 ]; then
+              echo "❌ 核心文件缺失！打包内容预览："
+              head -25 "$BACKUP_TMP_DIR/tar_content.txt"
+              echo "Tar报错信息：" && cat "$BACKUP_TMP_DIR/tar_error.txt"
+              sudo rm -rf "$BACKUP_TMP_DIR"
+              return 1
+            fi
+            
+            # 3. 完整性校验：sudo读包，避免权限不足误判损坏
+            if ! sudo tar -tzf "$LOCAL_SNAPSHOT" 2>/dev/null | head -10 >/dev/null; then
+              echo "❌ 快照损坏，校验失败"
+              sudo rm -rf "$BACKUP_TMP_DIR"
+              return 1
+            fi
+            echo "✅ 快照三重校验通过，完整有效"
+            
+            # 停止服务防占用，安全上传
             sudo systemctl stop docker docker.socket casaos 2>/dev/null || true
             sudo pkill -9 docker containerd casaos 2>/dev/null || true
             sync && sleep 2
@@ -437,25 +463,24 @@ jobs:
             fi
             echo "✅ 上传成功，远程地址：$REMOTE_SNAPSHOT"
             
-            # 上传元数据，无写入报错
+            # 上传元数据，记录备份信息
             META_FILE="$BACKUP_TMP_DIR/backup-meta.txt"
             echo "snapshot_name=$SNAPSHOT_NAME" > "$META_FILE"
             echo "backup_time=$(date '+%Y-%m-%d %H:%M:%S')" >> "$META_FILE"
             echo "backup_size=$SNAPSHOT_SIZE" >> "$META_FILE"
-            echo "backup_content=Docker+CasaOS+DATA全量" >> "$META_FILE"
+            echo "backup_content=Docker+CasaOS+DATA全量(root权限完整备份)" >> "$META_FILE"
             rclone copy "$META_FILE" "${WEBDAV_SNAPSHOT_DIR}/backup-meta.txt" --config /home/runner/.rclone.conf 2>/dev/null || true
             
-            # 清理+恢复服务，无残留报错
+            # 清理临时文件+恢复服务
             sudo rm -rf "$BACKUP_TMP_DIR"
             sudo systemctl start docker docker.socket casaos 2>/dev/null || true
             sleep 3
-            echo "✅ 备份完成，服务恢复正常"
+            echo "✅ 全量备份完成，服务恢复正常运行"
             return 0
           }
           
-          # 主循环：定时备份+防超时，修复算术扩展语法错误
+          # 主循环：定时备份+防超时，逻辑不变
           while true; do
-            # 核心修复：用$(date +%s)执行命令并获取结果，再进行算术运算
             current_time=$(date +%s)
             run_mins=$(( (current_time - start_time) / 60 ))
             echo "📊 已运行${run_mins}分钟，状态稳定"
@@ -476,7 +501,6 @@ jobs:
             fi
             sleep 60
           done
-
       - name: 10-收尾清理（无论成败必执行，无残留）
         if: ${{ always() }}
         run: |
