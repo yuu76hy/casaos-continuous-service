@@ -299,7 +299,7 @@ jobs:
           sudo systemctl status casaos --no-pager
           echo "✅ CasaOS全新环境就绪，可直接访问"
 
-      - name: 8-Tailscale组网部署（完整配置，无组网报错）
+      - name: 8-Tailscale组网部署（修复无效参数，无组网报错）
         run: |
           set -e
           echo "===== Tailscale组网配置 ====="
@@ -311,7 +311,7 @@ jobs:
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y tailscale -qq
-          # 组网配置，无权限/连接报错
+          # 组网配置：移除废弃的--no-single-routing-table参数，仅保留有效参数
           TS_HOSTNAME="CasaOS-Server-$(hostname | cut -c1-8)"
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTH_KEY" \
@@ -319,8 +319,7 @@ jobs:
             --accept-routes \
             --accept-dns \
             --advertise-routes=192.168.0.0/24,10.0.0.0/24 \
-            --auto-approve \
-            --no-single-routing-table >/dev/null
+            --auto-approve >/dev/null
           sudo systemctl enable --now tailscaled
           # 验证组网，无查询报错
           TS_IP=$(sudo tailscale ip -4 2>/dev/null)
