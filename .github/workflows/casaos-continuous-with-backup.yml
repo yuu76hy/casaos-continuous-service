@@ -299,7 +299,7 @@ jobs:
           sudo systemctl status casaos --no-pager
           echo "✅ CasaOS全新环境就绪，可直接访问"
 
-      - name: 8-Tailscale组网部署（修复无效参数，无组网报错）
+      - name: 8-Tailscale组网部署（极简核心参数，零解析错误）
         run: |
           set -e
           echo "===== Tailscale组网配置 ====="
@@ -307,27 +307,38 @@ jobs:
             echo "⚠️ 未配置Tailscale密钥，跳过组网"
             exit 0
           fi
-          # 安装Tailscale，适配Ubuntu24.04无报错
+          
+          # 安装Tailscale，适配Ubuntu24.04，强制更新到最新版
+          echo "===== 安装/更新Tailscale ====="
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt update -y -qq && sudo apt install -y tailscale -qq
-          # 组网配置：移除废弃的--no-single-routing-table参数，仅保留有效参数
+          sudo apt update -y -qq
+          sudo apt install -y tailscale -qq --upgrade
+          
+          # 确保tailscaled服务就绪（核心修复：先重启服务）
+          echo "===== 重启tailscaled服务 ====="
+          sudo systemctl stop tailscaled 2>/dev/null || true
+          sudo systemctl start tailscaled
+          sudo systemctl enable tailscaled
+          sleep 5 # 等待服务完全启动
+          
+          # 极简组网命令：仅保留核心必选参数（避免参数解析错误）
+          echo "===== 执行Tailscale组网 ====="
           TS_HOSTNAME="CasaOS-Server-$(hostname | cut -c1-8)"
-          sudo tailscale up \
-            --authkey="$TAILSCALE_AUTH_KEY" \
-            --hostname="$TS_HOSTNAME" \
-            --accept-routes \
-            --accept-dns \
-            --advertise-routes=192.168.0.0/24,10.0.0.0/24 \
-            --auto-approve >/dev/null
-          sudo systemctl enable --now tailscaled
-          # 验证组网，无查询报错
+          # 仅使用--authkey和--hostname（官方最稳定的核心参数）
+          if ! sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME"; then
+            echo "⚠️ Tailscale组网命令执行失败，输出详细日志："
+            sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --verbose
+            exit 1
+          fi
+          
+          # 验证组网结果
           TS_IP=$(sudo tailscale ip -4 2>/dev/null)
           if [ -n "$TS_IP" ]; then
             echo "✅ Tailscale组网成功，远程IPv4：$TS_IP"
             echo "✅ 主机名：$TS_HOSTNAME，开机自动重连"
           else
-            echo "⚠️ 组网异常，状态：$(sudo tailscale status | head -3)"
+            echo "⚠️ 组网完成但未获取到IP，状态：$(sudo tailscale status | head -3)"
           fi
 
       - name: 9-全量备份+自动续跑（核心闭环，无备份报错）
