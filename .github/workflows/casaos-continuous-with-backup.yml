@@ -157,8 +157,9 @@ jobs:
             curl -fsSL --fail --connect-timeout 30 -X POST -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" https://api.github.com/repos/$REPO/dispatches -d '{"event_type":"renew_casaos_snapshot"}'
             echo "✅ 自动续跑已触发"
           }
+          # 修复核心语法错误：$(date +%s) 必须用$()包裹执行
           while true; do
-            run_mins=$(( (date +%s - start_time)/60 ))
+            run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then full_backup && trigger_renew && RENEW_TRIGGERED=true; fi
             [ $run_mins -ge 60 ] && exit 0
             sleep 60
