@@ -11,7 +11,8 @@ jobs:
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
-      WEBDAV_SNAPSHOT_DIR: "/z/Ubu/CasaOS-Backup"
+      # 核心修正：Ubu→Udu，匹配实际服务端目录
+      WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       CORE_BACKUP_DIRS: "/var/lib/docker /etc/docker /etc/default/docker /usr/lib/systemd/system/docker.service /etc/systemd/system/docker.service.d /etc/casaos /var/lib/casaos /usr/bin/casaos /usr/lib/systemd/system/casaos.service /DATA"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
@@ -107,7 +108,7 @@ jobs:
           sudo chown -R "$USER_NAME:$USER_NAME" /home/"$USER_NAME"
           sudo chmod 755 /home/"$USER_NAME"
           echo "✅ 根权限用户配置完成：免密sudo+docker管理"
-      - name: 3-Rclone配置&WebDAV连通校验（修复查找最新快照逻辑）
+      - name: 3-Rclone配置&WebDAV连通校验（适配/z/Udu目录）
         run: |
           set -e
           echo "===== 配置Rclone+校验WebDAV ====="
@@ -131,17 +132,23 @@ jobs:
             --config /home/runner/.rclone.conf >/dev/null
           sudo chown runner:runner /home/runner/.rclone.conf
           sudo chmod 600 /home/runner/.rclone.conf
-          # 关键：预检服务端/z目录是否存在且可访问
-          echo "🔍 校验WebDAV服务端/z目录权限..."
-          if ! timeout 30 rclone ls mywebdav:/z --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-            echo "❌ 服务端/z目录不存在或无访问权限"
-            echo "请确认：1. WebDAV URL是否映射到/z根目录；2. 用户是否有/z目录权限"
+          
+          # 核心修正：不再校验/z根目录，改为校验实际目标父目录/z/Udu
+          echo "🔍 校验WebDAV服务端/z/Udu目录权限..."
+          # 先尝试创建/z/Udu目录（如果不存在）
+          rclone mkdir mywebdav:/z/Udu --config /home/runner/.rclone.conf 2>/dev/null || true
+          # 校验/z/Udu目录是否可访问
+          if ! timeout 30 rclone ls mywebdav:/z/Udu --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+            echo "❌ 服务端/z/Udu目录不存在或无访问权限"
+            echo "请确认：1. WebDAV URL是否正确；2. 用户是否有/z/Udu目录权限"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
-          # 创建备份目录（服务端/z已存在，直接创建子目录）
+          
+          # 创建最终备份目录/z/Udu/CasaOS-Backup
           rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null || true
-          # 修复核心：正确查找最新快照（只提取文件名，不重复拼接）
+          
+          # 正确查找最新快照（只提取文件名，不重复拼接）
           echo "🔍 查找最新备份快照..."
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null | \
             grep "casaos-full-snapshot-.*\.tar\.gz" | \
@@ -158,7 +165,7 @@ jobs:
             echo "⚠️ 无备份快照，将执行全新安装"
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-          echo "✅ WebDAV配置完成，服务端/z目录可访问"
+          echo "✅ WebDAV配置完成，服务端/z/Udu目录可访问"
       - name: 4-自动恢复（修复快照路径，确保访问正确）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
@@ -172,7 +179,7 @@ jobs:
           echo "✅ 服务停止，锁文件清理完成"
           
           echo "🔍 校验快照完整性..."
-          # 修复核心：使用完整的WebDAV路径（/z/Ubu/CasaOS-Backup/快照名.tar.gz）
+          # 使用完整的WebDAV路径（/z/Udu/CasaOS-Backup/快照名.tar.gz）
           if ! timeout 60 rclone cat mywebdav:${{ env.FULL_SNAPSHOT_PATH }} --config /home/runner/.rclone.conf | sudo tar -tzf - >/dev/null 2>&1; then
             echo "❌ 快照损坏或路径错误，恢复终止"
             echo "当前访问路径：mywebdav:${{ env.FULL_SNAPSHOT_PATH }}"
@@ -323,7 +330,7 @@ jobs:
           else
             echo "⚠️ 组网完成但未获取到IP，状态：$(sudo tailscale status | head -3)"
           fi
-      - name: 9-全量备份+自动续跑（仅校验完整性，适配/z目录）
+      - name: 9-全量备份+自动续跑（适配/z/Udu目录）
         shell: bash
         run: |
           set -e
@@ -452,7 +459,7 @@ jobs:
             # 停止服务后上传
             sudo systemctl stop docker docker.socket casaos 2>/dev/null || true
             sync && sleep 2
-            echo "📤 上传快照到WebDAV（服务端/z目录）..."
+            echo "📤 上传快照到WebDAV（服务端/z/Udu目录）..."
             # 上传前再次确认备份目录存在
             rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null || true
             # 明确指定服务端绝对路径上传
@@ -462,9 +469,9 @@ jobs:
               --fast-list \
               --progress \
               --log-level INFO \
-              --webdav-url "$WEBDAV_URL"  # 强制指定WebDAV URL，避免路径解析错误
+              --webdav-url "$WEBDAV_URL"
             if [ $? -ne 0 ]; then
-              echo "❌ 上传失败，排查：1. WebDAV URL是否映射到/z；2. 用户是否有/z/Ubu/CasaOS-Backup写入权限"
+              echo "❌ 上传失败，排查：1. WebDAV URL是否正确；2. 用户是否有/z/Udu/CasaOS-Backup写入权限"
               sudo rm -rf "$BACKUP_TMP_DIR"
               return 1
             fi
