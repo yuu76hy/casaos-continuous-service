@@ -11,8 +11,8 @@ jobs:
     timeout-minutes: 360
     env:
       MAX_RUN_MINUTES: 360
+      # 保留服务端实际绝对路径
       WEBDAV_SNAPSHOT_DIR: "/z/Ubu/CasaOS-Backup"
-      # 已更新为你机器实际存在的服务文件路径
       CORE_BACKUP_DIRS: "/var/lib/docker /etc/docker /etc/default/docker /usr/lib/systemd/system/docker.service /etc/systemd/system/docker.service.d /etc/casaos /var/lib/casaos /usr/bin/casaos /usr/lib/systemd/system/casaos.service /DATA"
       EXCLUDE_RULES: >-
         --exclude=/var/lib/docker/containers/*/*.log
@@ -108,12 +108,18 @@ jobs:
           sudo chown -R "$USER_NAME:$USER_NAME" /home/"$USER_NAME"
           sudo chmod 755 /home/"$USER_NAME"
           echo "✅ 根权限用户配置完成：免密sudo+docker管理"
-      - name: 3-Rclone配置&WebDAV连通校验（无连接报错）
+      - name: 3-Rclone配置&WebDAV连通校验（适配服务端/z目录）
         run: |
           set -e
           echo "===== 配置Rclone+校验WebDAV ====="
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "❌ WebDAV凭证缺失，备份恢复禁用"
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # 校验URL协议前缀
+          if ! echo "$WEBDAV_URL" | grep -qE "^http://|^https://"; then
+            echo "❌ WebDAV地址缺失http/https前缀，配置无效"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -126,12 +132,17 @@ jobs:
             --config /home/runner/.rclone.conf >/dev/null
           sudo chown runner:runner /home/runner/.rclone.conf
           sudo chmod 600 /home/runner/.rclone.conf
-          if ! timeout 30 rclone ls mywebdav:/ --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-            echo "❌ WebDAV连接失败，检查凭证地址"
+          # 关键：预检服务端/z目录是否存在且可访问
+          echo "🔍 校验WebDAV服务端/z目录权限..."
+          if ! timeout 30 rclone ls mywebdav:/z --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+            echo "❌ 服务端/z目录不存在或无访问权限"
+            echo "请确认：1. WebDAV URL是否映射到/z根目录；2. 用户是否有/z目录权限"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
-          rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf >/dev/null 2>&1 || true
+          # 创建备份目录（服务端/z已存在，直接创建子目录）
+          rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null || true
+          # 查找最新快照
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null | grep "casaos-full-snapshot-.*\.tar\.gz" | awk '{print $2}' | sort -r)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             LATEST_SNAPSHOT=$(echo "$REMOTE_SNAPSHOTS" | head -n1)
@@ -141,7 +152,7 @@ jobs:
             echo "⚠️ 无备份快照，将执行全新安装"
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-          echo "✅ WebDAV配置完成，连通正常"
+          echo "✅ WebDAV配置完成，服务端/z目录可访问"
       - name: 4-自动恢复（快照完整还原，无解压报错）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.LATEST_SNAPSHOT != '' }}
         run: |
@@ -302,7 +313,7 @@ jobs:
           else
             echo "⚠️ 组网完成但未获取到IP，状态：$(sudo tailscale status | head -3)"
           fi
-      - name: 9-全量备份+自动续跑（仅校验完整性，移除大小判断）
+      - name: 9-全量备份+自动续跑（仅校验完整性，适配/z目录）
         shell: bash
         run: |
           set -e
@@ -431,19 +442,23 @@ jobs:
             # 停止服务后上传
             sudo systemctl stop docker docker.socket casaos 2>/dev/null || true
             sync && sleep 2
-            echo "📤 上传快照到WebDAV..."
-            rclone copy "$LOCAL_SNAPSHOT" "$REMOTE_SNAPSHOT" \
+            echo "📤 上传快照到WebDAV（服务端/z目录）..."
+            # 上传前再次确认备份目录存在
+            rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null || true
+            # 明确指定服务端绝对路径上传
+            rclone copy "$LOCAL_SNAPSHOT" "mywebdav:${REMOTE_SNAPSHOT}" \
               --config /home/runner/.rclone.conf \
               --transfers 4 \
               --fast-list \
               --progress \
-              --log-level ERROR
+              --log-level INFO \
+              --webdav-url "$WEBDAV_URL"  # 强制指定WebDAV URL，避免路径解析错误
             if [ $? -ne 0 ]; then
-              echo "❌ 上传失败"
+              echo "❌ 上传失败，排查：1. WebDAV URL是否映射到/z；2. 用户是否有/z/Ubu/CasaOS-Backup写入权限"
               sudo rm -rf "$BACKUP_TMP_DIR"
               return 1
             fi
-            echo "✅ 上传成功，远程地址：$REMOTE_SNAPSHOT"
+            echo "✅ 上传成功，远程地址：${REMOTE_SNAPSHOT}"
       
             # 生成元数据
             META_FILE="$BACKUP_TMP_DIR/backup-meta.txt"
@@ -451,7 +466,7 @@ jobs:
             echo "backup_time=$(date '+%Y-%m-%d %H:%M:%S')" >> "$META_FILE"
             echo "backup_size=$SNAPSHOT_SIZE" >> "$META_FILE"
             echo "backup_content=Docker+CasaOS+DATA全量备份（仅校验完整性，无大小限制）" >> "$META_FILE"
-            rclone copy "$META_FILE" "${WEBDAV_SNAPSHOT_DIR}/backup-meta.txt" --config /home/runner/.rclone.conf 2>/dev/null || true
+            rclone copy "$META_FILE" "mywebdav:${WEBDAV_SNAPSHOT_DIR}/backup-meta.txt" --config /home/runner/.rclone.conf 2>/dev/null || true
       
             # 清理+重启服务
             sudo rm -rf "$BACKUP_TMP_DIR"
