@@ -1,8 +1,8 @@
-name: CasaOS纯净部署（无卡顿+备份必上传 稳定版）
+name: CasaOS纯净部署（备份保留2份+自动清理 稳定版）
 on:
-  workflow_dispatch:                # 手动触发优先
+  workflow_dispatch:
   repository_dispatch:
-    types: [renew_casaos_snapshot]  # 自动续跑触发
+    types: [renew_casaos_snapshot]
 
 jobs:
   casaos-deploy:
@@ -20,6 +20,7 @@ jobs:
       USER_PAT: ${{ secrets.USER_PAT }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
+      KEEP_BACKUPS: 2  # 保留最新2份备份
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -62,19 +63,15 @@ jobs:
             echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
             exit 0
           fi
-          # WebDAV配置+加密密码
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
-          # 强制创建远程备份目录，确保上传路径存在
-          echo "📌 预创建远程备份目录：${WEBDAV_SNAPSHOT_DIR}"
           if rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf; then
             echo "✅ 远程备份目录创建成功"
           else
             echo "⚠️ 远程目录创建失败，重试一次"
             rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf || { echo "❌ 远程目录不可达，跳过备份"; echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"; exit 0; }
           fi
-          # 检测最新快照
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 找到最新快照：$REMOTE_SNAPSHOTS"
@@ -103,20 +100,15 @@ jobs:
         run: |
           set -e
           echo "===== 恢复个人数据（精准防错乱）====="
-          # 强制关停所有进程，杜绝文件占用错乱
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
           sync && sleep 2
-          # 提前创建目录，避免恢复路径缺失错乱
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 精准恢复指定目录，绝不越界
           echo "📌 仅恢复目录：$PERSONAL_DATA_DIRS"
           rclone cat mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
-          # 恢复后立即校权，避免权限错乱
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config && sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          # 删除已恢复快照，避免重复恢复错乱
           rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf 2>/dev/null || true
           echo "✅ 数据恢复完成，权限已校正，无错乱"
 
@@ -155,31 +147,57 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           echo "✅ Tailscale组网完成，IP：$(sudo tailscale ip -4 2>/dev/null || echo '未获取')"
 
-      - name: 9-个人数据备份+强制上传校验+自动续跑（核心补全上传功能）
+      - name: 9-个人数据备份+保留2份自动清理+防卡住
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 个人数据备份+强制上传校验 ====="
+          echo "===== 个人数据备份+保留2份自动清理 ====="
           start_time=$(date +%s)
           RENEW_TRIGGERED=false
-          # 备份函数：打包+上传+校验，三步一体，上传失败不算完成
+
+          # 自动清理旧备份：仅保留最新2份
+          cleanup_old_backups(){
+            echo "📌 清理旧备份，仅保留最新${KEEP_BACKUPS}份"
+            # 按时间倒序获取所有备份文件
+            BACKUPS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
+            # 统计备份数量
+            BACKUP_COUNT=$(echo "$BACKUPS" | wc -l)
+            if [ $BACKUP_COUNT -gt $KEEP_BACKUPS ]; then
+              # 计算需要删除的旧备份数量
+              DELETE_COUNT=$((BACKUP_COUNT - KEEP_BACKUPS))
+              # 获取需要删除的旧备份文件名
+              DELETE_LIST=$(echo "$BACKUPS" | tail -n $DELETE_COUNT)
+              echo "⚠️ 发现${BACKUP_COUNT}份备份，需要删除${DELETE_COUNT}份旧备份"
+              for FILE in $DELETE_LIST; do
+                if rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$FILE --config /home/runner/.rclone.conf; then
+                  echo "✅ 已删除旧备份：$FILE"
+                else
+                  echo "⚠️ 删除旧备份$FILE失败，跳过"
+                fi
+              done
+              echo "✅ 清理完成，当前保留${KEEP_BACKUPS}份最新备份"
+            else
+              echo "✅ 当前备份数量（${BACKUP_COUNT}）≤${KEEP_BACKUPS}，无需清理"
+            fi
+          }
+
+          # 备份函数
           full_backup(){
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
             echo "📌 开始打包个人数据，排除垃圾文件"
-            # sudo全权限打包，避免权限不足漏文件
             sudo tar -czPf $SNAPSHOT_PATH --exclude=${EXCLUDE_RULES} $PERSONAL_DATA_DIRS || { echo "❌ 打包失败"; return 1; }
             echo "✅ 本地打包完成，文件大小：$(du -sh $SNAPSHOT_PATH | awk '{print $1}')"
             
             echo "📌 开始上传至远程目录：${WEBDAV_SNAPSHOT_DIR}"
-            # 断点续传+多线程上传，提高成功率
             rclone copy $SNAPSHOT_PATH mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3 || { echo "❌ 上传失败，重试"; return 1; }
             
             echo "📌 校验远程文件是否上传成功"
-            # 上传后校验，确保云端文件存在
             if rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR}/$SNAPSHOT_NAME --config /home/runner/.rclone.conf >/dev/null; then
               echo "✅ 远程校验成功，备份已落地云端"
               sudo rm -f $SNAPSHOT_PATH
+              # 上传成功后立即清理旧备份
+              cleanup_old_backups
               return 0
             else
               echo "❌ 远程无备份文件，上传失败"
@@ -187,31 +205,52 @@ jobs:
               return 1
             fi
           }
+
           # 自动续跑触发函数
           trigger_renew(){
-            [ -z "$USER_PAT" ] || [ -z "$REPO" ] && { echo "⚠️ 续跑配置缺失，跳过"; return 1; }
-            curl -fsSL --fail --connect-timeout 30 -X POST \
+            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
+              echo "⚠️ 续跑配置缺失（USER_PAT/REPO未填），跳过续跑"
+              return 1
+            fi
+            if curl -fsSL --fail --connect-timeout 30 -X POST \
               -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
               -H "Content-Type: application/json" \
               https://api.github.com/repos/$REPO/dispatches \
-              -d '{"event_type":"renew_casaos_snapshot"}'
-            echo "✅ 自动续跑已触发"
+              -d '{"event_type":"renew_casaos_snapshot"}'; then
+              echo "✅ 自动续跑已触发"
+              return 0
+            else
+              echo "⚠️ 自动续跑触发失败"
+              return 1
+            fi
           }
-          # 备份逻辑：2分钟后执行，上传成功才触发续跑，失败重试
+
+          # 备份逻辑：仅执行1次，成功即停
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰ 运行满2分钟，开始执行备份（上传成功才算完成）"
+              echo "⏰ 运行满2分钟，开始执行备份（仅执行1次）"
               if full_backup; then
-                trigger_renew && RENEW_TRIGGERED=true
-                echo "✅ 备份+续跑完成，后续无需重复备份"
+                echo "✅ 备份成功！"
+                trigger_renew
+                RENEW_TRIGGERED=true
               else
-                echo "❌ 备份/上传失败，10分钟后重试"
+                echo "❌ 备份/上传失败，10分钟后重试（仅重试1次）"
                 sleep 600
+                if full_backup; then
+                  echo "✅ 重试备份成功！"
+                  RENEW_TRIGGERED=true
+                else
+                  echo "❌ 多次备份失败，跳过备份"
+                  RENEW_TRIGGERED=true
+                fi
               fi
             fi
-            [ $run_mins -ge 60 ] && { echo "✅ 达到运行上限，流程结束"; exit 0; }
+            if [ $run_mins -ge 60 ]; then
+              echo "✅ 达到运行上限，流程结束"
+              exit 0
+            fi
             sleep 60
           done
 
@@ -223,4 +262,4 @@ jobs:
           sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "🎉 全流程执行完成！"
-          echo "✅ 访问服务器IP（80端口）进入CasaOS初始化，备份已安全落地云端"
+          echo "✅ 访问服务器IP（80端口）进入CasaOS初始化，备份已保留最新2份"
