@@ -23,7 +23,6 @@ jobs:
       KEEP_BACKUPS: 2
       CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
       CURRENT_WORKFLOW_FILE: "casaos-continuous-with-backup.yml"
-      # CasaOS官方服务列表（关键修复：精准管理所有服务）
       CASA_SERVICES: "casaos-gateway casaos-message-bus casaos-user-service casaos-local-storage casaos-app-management rclone casaos"
 
     steps:
@@ -62,7 +61,6 @@ jobs:
               echo "✅ 禁用工作流： $ WORKFLOW_NAME"
           done <<< " $ ALL_WORKFLOWS"
           
-          # 终止其他运行中实例
           RUNNING= $ (curl -s -H "Authorization: token  $ USER_PAT" \
             "https://api.github.com/repos/ $ REPO/actions/runs?status=in_progress" | \
             jq -r ".workflow_runs[] | select(.workflow_name != \" $ CURRENT_WORKFLOW_NAME\") | \"  $ .id)\"")
@@ -81,7 +79,6 @@ jobs:
           sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
           
           install_docker() {
-            # 关键修复：移除错误的 --install-options 参数
             curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
           }
           
@@ -160,7 +157,6 @@ jobs:
           echo "===== 安装纯净CasaOS ====="
           sudo systemctl restart docker containerd && sleep 2
           
-          # 关键修复：停止所有CasaOS官方服务（避免残留进程干扰）
           for svc in  $ CASA_SERVICES; do
             sudo systemctl stop " $ svc" 2>/dev/null || true
             sudo systemctl disable " $ svc" 2>/dev/null || true
@@ -170,7 +166,6 @@ jobs:
           
           curl -fsSL https://get.casaos.io | sudo bash
           
-          # 安装后立即停止所有CasaOS服务（关键！防止恢复数据时冲突）
           for svc in  $ CASA_SERVICES; do
             sudo systemctl stop " $ svc" 2>/dev/null || true
           done
@@ -191,12 +186,10 @@ jobs:
           rclone cat "mywebdav: $ {WEBDAV_SNAPSHOT_DIR}/ $ {LATEST_SNAPSHOT}" --config /home/runner/.rclone.conf | \
             sudo tar -xzf - -C / --overwrite --preserve-permissions  $ PERSONAL_DATA_DIRS
           
-          # 精准权限修复（匹配官方要求）
           sudo chown -R root:root  $ PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker 2>/dev/null || true
           
-          # 清理已恢复快照（避免重复恢复）
           rclone delete "mywebdav: $ {WEBDAV_SNAPSHOT_DIR}/ $ {LATEST_SNAPSHOT}" --config /home/runner/.rclone.conf 2>/dev/null || true
           echo "✅ 数据恢复完成，权限校正完毕"
 
@@ -205,7 +198,6 @@ jobs:
           set -e
           echo "===== 权限校正与服务启动 ====="
           
-          # 统一权限处理（无论是否有快照）
           sudo mkdir -p /etc/casaos /var/lib/casaos /DATA /run/docker 2>/dev/null || true
           sudo chown -R root:root /etc/casaos /var/lib/casaos /var/lib/docker
           sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
@@ -214,11 +206,9 @@ jobs:
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
           sudo systemctl daemon-reload
           
-          # 启动基础服务
           sudo systemctl enable --now docker containerd
           sleep 3
           
-          # 启动CasaOS核心服务链（按依赖顺序）
           for svc in casaos-gateway casaos-message-bus casaos-user-service \
                      casaos-local-storage casaos-app-management casaos; do
             sudo systemctl enable " $ svc" 2>/dev/null || true
@@ -254,7 +244,6 @@ jobs:
           set -e
           echo "===== 执行安全备份（服务暂停保障数据一致性） ====="
           
-          # === 关键修复：备份前暂停服务 ===
           echo "⏸️ 暂停Docker与CasaOS服务（保障备份一致性）"
           sudo systemctl stop docker containerd
           for svc in  $ CASA_SERVICES; do
@@ -262,7 +251,6 @@ jobs:
           done
           sleep 3
           
-          # 清理函数
           cleanup_old_backups() {
             local backups= $ (rclone ls "mywebdav: $ {WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf | \
               grep "casaos-full-snapshot" | awk '{print  $ 2}' | sort -r)
@@ -276,7 +264,6 @@ jobs:
             fi
           }
           
-          # 备份执行（带重试）
           SNAPSHOT_NAME="casaos-full-snapshot- $ (date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/ $ SNAPSHOT_NAME"
           
@@ -302,7 +289,6 @@ jobs:
             BACKUP_SUCCESS="false"
           fi
           
-          # === 关键修复：备份后立即恢复服务 ===
           echo "▶️ 恢复Docker与CasaOS服务"
           sudo systemctl start docker containerd
           for svc in casaos-gateway casaos-message-bus casaos-user-service \
@@ -311,7 +297,6 @@ jobs:
             sleep 0.5
           done
           
-          # 触发续跑（仅当备份成功）
           if [ " $ BACKUP_SUCCESS" = "true" ] && [ -n " $ USER_PAT" ] && [ -n " $ REPO" ]; then
             echo "🔄 触发自动续跑（保留备份链）"
             curl -fsSL -X POST \
@@ -329,7 +314,7 @@ jobs:
         run: |
           set -e
           echo "===== 收尾清理 ====="
-          # 保留 roots 用户 sudo 权限（关键修复：避免部署后无法管理）
+          # 保留 roots 用户 sudo 权限（关键：避免部署后无法管理）
           # sudo rm -f /etc/sudoers.d/roots  # 已注释：保留长期管理能力
           sudo rm -rf /tmp/* /home/runner/.rclone.conf 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
