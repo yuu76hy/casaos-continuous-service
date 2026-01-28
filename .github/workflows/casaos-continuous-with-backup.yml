@@ -21,7 +21,6 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -31,38 +30,32 @@ jobs:
           sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "✅ 初始化完成"
-      - name: 2-自动关闭其他运行中的工作流（抗异常+容错，精准关闭）
+      - name: 2-关闭其他所有运行中工作流（仅保留自身）
         run: |
           set -e
-          echo "===== 关闭其他运行中的工作流，仅保留当前 ====="
-          if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-            echo "⚠️ 缺少USER_PAT或REPO配置，跳过关闭其他工作流"
-            exit 0
-          fi
-          CURRENT_RUN_ID="${{ github.run_id }}"
-          echo "📌 当前工作流Run ID：$CURRENT_RUN_ID"
-          # 拉取仓库所有运行中工作流，过滤掉当前ID，直接提取待关闭ID
-          RUNNING_WORKFLOW_IDS=$(curl -s -H "Authorization: token $USER_PAT" \
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=100" | \
-            jq -r '.workflow_runs[] | select(.run_id != null and .run_id != '$CURRENT_RUN_ID') | .run_id')
-          # 无其他运行中工作流直接结束
-          if [ -z "$RUNNING_WORKFLOW_IDS" ] || [ "$RUNNING_WORKFLOW_IDS" = "null" ]; then
-            echo "✅ 无其他运行中工作流，无需处理"
-            exit 0
-          fi
-          echo "📌 检测到待关闭工作流Run ID列表："
-          echo "$RUNNING_WORKFLOW_IDS"
-          # 批量关闭，http202校验成功，容错不中断
-          for RUN_ID in $RUNNING_WORKFLOW_IDS; do
-            echo "⚠️ 正在关闭工作流Run ID：$RUN_ID"
-            if curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: token $USER_PAT" \
-              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" | grep -q "202"; then
-              echo "✅ 成功关闭工作流Run ID：$RUN_ID"
-            else
-              echo "⚠️ 关闭Run ID:$RUN_ID失败（可能已结束），跳过"
-            fi
+          echo "===== 仅保留当前工作流，关闭其他所有运行中任务 ====="
+          [ -z "$USER_PAT" ] || [ -z "$REPO" ] && { echo "⚠️ 缺失USER_PAT/REPO，跳过"; exit 0; }
+          
+          CURRENT_ID=${{ github.run_id }}
+          echo "📌 当前工作流Run ID：$CURRENT_ID"
+          
+          # 核心命令：拉取仓库所有运行中工作流ID，排除自身
+          OTHER_RUNS=$(curl -s -H "Authorization: token $USER_PAT" \
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=200" \
+            | jq -r ".workflow_runs[].run_id | select(. != $CURRENT_ID)")
+          
+          # 无其他运行直接结束
+          [ -z "$OTHER_RUNS" ] && { echo "✅ 无其他运行中工作流"; exit 0; }
+          
+          # 列出所有待关闭ID+批量关闭
+          echo "📌 检出待关闭工作流Run ID："
+          echo "$OTHER_RUNS"
+          for RUN_ID in $OTHER_RUNS; do
+            echo "🔴 关闭Run ID：$RUN_ID"
+            curl -s -X POST -H "Authorization: token $USER_PAT" \
+              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null
           done
-          echo "✅ 其他运行中工作流清理完成，仅保留当前工作流正常运行"
+          echo "✅ 所有其他工作流已关闭，仅保留当前运行"
       - name: 3-官方一键装Docker（含compose）
         run: |
           set -e
@@ -186,83 +179,59 @@ jobs:
             if [ $BACKUP_COUNT -gt $KEEP_BACKUPS ]; then
               DELETE_COUNT=$((BACKUP_COUNT - KEEP_BACKUPS))
               DELETE_LIST=$(echo "$BACKUPS" | tail -n $DELETE_COUNT)
-              echo "⚠️ 发现${BACKUP_COUNT}份备份，需要删除${DELETE_COUNT}份旧备份"
+              echo "⚠️ 发现${BACKUP_COUNT}份备份，需删${DELETE_COUNT}份旧备份"
               for FILE in $DELETE_LIST; do
-                if rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$FILE --config /home/runner/.rclone.conf; then
-                  echo "✅ 已删除旧备份：$FILE"
-                else
-                  echo "⚠️ 删除旧备份$FILE失败，跳过"
-                fi
+                rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$FILE --config /home/runner/.rclone.conf && echo "✅ 已删旧备份：$FILE" || echo "⚠️ 删$FILE失败，跳过"
               done
-              echo "✅ 清理完成，当前保留${KEEP_BACKUPS}份最新备份"
+              echo "✅ 清理完成，保留最新${KEEP_BACKUPS}份"
             else
-              echo "✅ 当前备份数量（${BACKUP_COUNT}）≤${KEEP_BACKUPS}，无需清理"
+              echo "✅ 当前备份数${BACKUP_COUNT}≤${KEEP_BACKUPS}，无需清理"
             fi
           }
           full_backup(){
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
-            echo "📌 开始打包个人数据，排除垃圾文件"
+            echo "📌 打包个人数据（排除垃圾文件）"
             sudo tar -czPf $SNAPSHOT_PATH --exclude=${EXCLUDE_RULES} $PERSONAL_DATA_DIRS || { echo "❌ 打包失败"; return 1; }
-            echo "✅ 本地打包完成，文件大小：$(du -sh $SNAPSHOT_PATH | awk '{print $1}')"
+            echo "✅ 本地打包完成，大小：$(du -sh $SNAPSHOT_PATH | awk '{print $1}')"
             
-            echo "📌 开始上传至远程目录：${WEBDAV_SNAPSHOT_DIR}"
-            rclone copy $SNAPSHOT_PATH mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3 || { echo "❌ 上传失败，重试"; return 1; }
+            echo "📌 上传至WebDAV：${WEBDAV_SNAPSHOT_DIR}"
+            rclone copy $SNAPSHOT_PATH mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3 || { echo "❌ 上传失败"; return 1; }
             
-            echo "📌 校验远程文件是否上传成功"
             if rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR}/$SNAPSHOT_NAME --config /home/runner/.rclone.conf >/dev/null; then
-              echo "✅ 远程校验成功，备份已落地云端"
+              echo "✅ 远程校验成功"
               sudo rm -f $SNAPSHOT_PATH
               cleanup_old_backups
               return 0
             else
-              echo "❌ 远程无备份文件，上传失败"
+              echo "❌ 上传未落地"
               sudo rm -f $SNAPSHOT_PATH
               return 1
             fi
           }
           trigger_renew(){
-            if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-              echo "⚠️ 续跑配置缺失（USER_PAT/REPO未填），跳过续跑（不影响核心功能）"
-              return 0
-            fi
-            if curl -fsSL --fail --connect-timeout 30 -X POST \
-              -H "Authorization: token $USER_PAT" \
-              -H "Accept: application/vnd.github.v3+json" \
-              -H "Content-Type: application/json" \
-              https://api.github.com/repos/$REPO/dispatches \
-              -d '{"event_type":"renew_casaos_snapshot"}'; then
-              echo "✅ 自动续跑已触发"
-              return 0
-            else
-              echo "⚠️ 自动续跑触发失败（PAT权限不足或REPO格式错误），跳过"
-              return 0
-            fi
+            [ -z "$USER_PAT" ] || [ -z "$REPO" ] && { echo "⚠️ 续跑配置缺失，跳过"; return 0; }
+            curl -fsSL --fail --connect-timeout 30 -X POST \
+              -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" \
+              https://api.github.com/repos/$REPO/dispatches -d '{"event_type":"renew_casaos_snapshot"}' \
+              && echo "✅ 自动续跑已触发" || echo "⚠️ 续跑触发失败，跳过"
           }
           while true; do
             run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
             if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰ 运行满2分钟，开始执行备份（仅执行1次）"
+              echo "⏰ 运行满2分钟，执行备份（仅1次）"
               if full_backup; then
                 echo "✅ 备份成功！"
                 trigger_renew
                 RENEW_TRIGGERED=true
               else
-                echo "❌ 备份/上传失败，10分钟后重试（仅重试1次）"
+                echo "❌ 备份失败，10分钟后重试1次"
                 sleep 600
-                if full_backup; then
-                  echo "✅ 重试备份成功！"
-                  RENEW_TRIGGERED=true
-                else
-                  echo "❌ 多次备份失败，跳过备份"
-                  RENEW_TRIGGERED=true
-                fi
+                full_backup && echo "✅ 重试备份成功" || echo "❌ 多次备份失败"
+                RENEW_TRIGGERED=true
               fi
             fi
-            if [ $run_mins -ge 60 ]; then
-              echo "✅ 达到运行上限，流程结束"
-              exit 0
-            fi
+            [ $run_mins -ge 60 ] && { echo "✅ 达运行上限，流程结束"; exit 0; }
             sleep 60
           done
       - name: 11-收尾清理（极速完成）
@@ -273,4 +242,4 @@ jobs:
           sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "🎉 全流程执行完成！"
-          echo "✅ 访问服务器IP（80端口）进入CasaOS初始化，备份已保留最新2份"
+          echo "✅ 访问服务器IP（80端口）初始化CasaOS，备份保留最新2份"
