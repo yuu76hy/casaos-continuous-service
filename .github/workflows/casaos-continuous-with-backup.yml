@@ -22,6 +22,8 @@ jobs:
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
       CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
+      # 已根据图片更新为实际文件名
+      CURRENT_WORKFLOW_FILE: "casaos-continuous-with-backup.yml"
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -32,44 +34,71 @@ jobs:
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "✅ 初始化完成"
 
-      - name: 2-自动关闭其他运行中的工作流（抗异常+容错）
+      - name: 2-强制关闭仓库所有其他工作流（仅保留当前）
         run: |
           set -e
-          echo "===== 关闭其他运行中的工作流 ====="
-          if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-            echo "⚠️ 缺少USER_PAT或REPO配置，跳过关闭其他工作流"
+          echo "===== 强制关闭仓库所有其他工作流 ====="
+          if [ -z "$USER_PAT" ] || [ -z "$REPO" ] || [ -z "$CURRENT_WORKFLOW_FILE" ]; then
+            echo "⚠️ 缺少USER_PAT/REPO/当前工作流文件名配置，跳过关闭其他工作流"
             exit 0
           fi
 
-          CURRENT_RUN_ID="${{ github.run_id }}"
-          echo "📌 当前工作流Run ID：$CURRENT_RUN_ID"
+          echo "📌 当前保留的工作流：文件=$CURRENT_WORKFLOW_FILE | 名称=$CURRENT_WORKFLOW_NAME"
 
-          # 优化：用jq精准提取有效数据（过滤run_id为null、name为空的条目）
-          RUNNING_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \
-            jq -r '.workflow_runs[] | select(.run_id != null and .name != "") | "\(.run_id)|\(.name)"')
+          # 1. 获取仓库内所有工作流（包括启用/禁用状态）
+          ALL_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows" | \
+            jq -r '.workflows[] | select(.path != null) | "\(.id)|\(.name)|\(.path)|\(.state)"')
 
-          echo "📌 过滤后运行中的工作流："
-          echo "$RUNNING_WORKFLOWS"
+          echo "📌 仓库内所有工作流："
+          echo "$ALL_WORKFLOWS"
 
-          # 遍历有效数据（用|分割，避免名称含空格错位）
-          while IFS="|" read -r RUN_ID WORKFLOW_NAME; do
-            # 跳过当前工作流
-            if [ "$RUN_ID" = "$CURRENT_RUN_ID" ] || [ "$WORKFLOW_NAME" = "$CURRENT_WORKFLOW_NAME" ]; then
-              echo "ℹ️ 跳过当前工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)"
+          # 2. 遍历所有工作流，禁用非当前工作流
+          while IFS="|" read -r WORKFLOW_ID WORKFLOW_NAME WORKFLOW_FILE WORKFLOW_STATE; do
+            # 跳过当前工作流（按文件名匹配，精准无错）
+            if [ "$WORKFLOW_FILE" = ".github/workflows/$CURRENT_WORKFLOW_FILE" ]; then
+              # 确保当前工作流是启用状态
+              if [ "$WORKFLOW_STATE" != "active" ]; then
+                echo "ℹ️ 当前工作流已禁用，正在启用：$WORKFLOW_NAME（文件：$WORKFLOW_FILE）"
+                curl -s -X PUT -H "Authorization: token $USER_PAT" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_ID/enable" >/dev/null
+                echo "✅ 已启用当前工作流：$WORKFLOW_NAME"
+              else
+                echo "ℹ️ 跳过当前工作流（已启用）：$WORKFLOW_NAME（文件：$WORKFLOW_FILE）"
+              fi
               continue
             fi
-            # 关闭其他工作流（容错：失败不终止流程）
-            echo "⚠️ 发现其他运行中的工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)，正在关闭..."
-            if curl -s -X POST -H "Authorization: token $USER_PAT" \
-              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null; then
-              echo "✅ 已关闭工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)"
-            else
-              echo "⚠️ 关闭工作流$WORKFLOW_NAME (Run ID: $RUN_ID)失败（可能已结束），跳过"
-            fi
-          done <<< "$RUNNING_WORKFLOWS"
 
-          echo "✅ 其他运行中的工作流处理完成，仅保留当前工作流运行"
+            # 禁用其他所有工作流（无论当前是否启用）
+            echo "⚠️ 发现其他工作流：$WORKFLOW_NAME（文件：$WORKFLOW_FILE | 当前状态：$WORKFLOW_STATE），正在禁用..."
+            if curl -s -X PUT -H "Authorization: token $USER_PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_ID/disable" >/dev/null; then
+              echo "✅ 已禁用工作流：$WORKFLOW_NAME（文件：$WORKFLOW_FILE）"
+            else
+              echo "⚠️ 禁用工作流$WORKFLOW_NAME失败（可能无权限），跳过"
+            fi
+          done <<< "$ALL_WORKFLOWS"
+
+          # 3. 额外保险：终止其他工作流的正在运行实例
+          echo "📌 终止其他工作流的正在运行实例..."
+          RUNNING_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \
+            jq -r '.workflow_runs[] | select(.workflow_name != "'"$CURRENT_WORKFLOW_NAME"'") | "\(.id)|\(.workflow_name)"')
+
+          if [ -n "$RUNNING_WORKFLOWS" ]; then
+            while IFS="|" read -r RUN_ID WORKFLOW_NAME; do
+              echo "⚠️ 终止运行中的其他工作流：$WORKFLOW_NAME（Run ID：$RUN_ID）"
+              curl -s -X POST -H "Authorization: token $USER_PAT" \
+                "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null
+            done <<< "$RUNNING_WORKFLOWS"
+          else
+            echo "✅ 无其他运行中的工作流实例"
+          fi
+
+          echo "✅ 操作完成！仓库内仅保留当前工作流（$CURRENT_WORKFLOW_NAME）可执行，其他工作流已全部禁用"
 
       - name: 3-官方一键装Docker（含compose）
         run: |
@@ -294,3 +323,4 @@ jobs:
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "🎉 全流程执行完成！"
           echo "✅ 访问服务器IP（80端口）进入CasaOS初始化，备份已保留最新2份"
+          echo "✅ 仓库仅当前工作流可执行，其他工作流已全部禁用"
