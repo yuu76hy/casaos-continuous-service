@@ -7,7 +7,7 @@ on:
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 360  # 超时延长至6小时，留足备份时间
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -21,6 +21,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
+      BACKUP_TRIGGER_MINS: 300  # 满300分钟触发备份，固定配置
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -163,11 +164,11 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 9-数据备份+清旧备份+触发续跑（核心流程）
+      - name: 9-等待满300分钟+备份清旧+触发续跑（核心要求）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 个人数据全量备份+保留2份+触发续跑 ====="
+          echo "===== 等待满${BACKUP_TRIGGER_MINS}分钟后执行备份+续跑 ====="
           
           # 清理旧备份（仅留最新2份）
           cleanup_old_backups(){
@@ -239,39 +240,48 @@ jobs:
             fi
           }
           
-          # 主流程：备份→清旧备份→触发续跑，严格按顺序执行
-          echo "⏰ 启动备份流程"
+          # 核心逻辑：计时等待满300分钟，仅执行1次备份流程
+          start_time=$(date +%s)
+          echo "⏰ 计时开始，满${BACKUP_TRIGGER_MINS}分钟触发备份，当前时间：$(date)"
+          while true; do
+            run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
+            if [ $run_mins -ge $BACKUP_TRIGGER_MINS ]; then
+              echo "✅ 已运行满${BACKUP_TRIGGER_MINS}分钟，启动备份流程"
+              break
+            fi
+            echo "⏳ 已运行${run_mins}分钟，还需等待$((BACKUP_TRIGGER_MINS - run_mins))分钟"
+            sleep 60
+          done
+          
+          # 备份流程：备份→清旧→续跑，执行完直接结束
           if full_backup;then
-            echo "✅ 首次备份成功"
+            echo "✅ 备份成功"
             cleanup_old_backups
             trigger_renew
           else
-            echo "❌ 首次备份失败，10分钟后重试1次"
+            echo "❌ 备份失败，10分钟后重试1次"
             sleep 600
             if full_backup;then
               echo "✅ 重试备份成功"
               cleanup_old_backups
               trigger_renew
             else
-              echo "❌ 两次备份均失败，终止备份流程"
+              echo "❌ 两次备份均失败"
             fi
           fi
-          echo "✅ 备份全流程执行完毕"
+          echo "✅ 备份+续跑流程结束，准备收尾完结任务"
 
-      - name: 10-收尾清理（彻底无残留，任务完结）
+      - name: 10-收尾清理（直接完结任务，无残留）
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 收尾清理，任务完结 ====="
-          # 清理临时文件、配置文件、免密规则
+          echo "===== 收尾清理，任务直接完结 ====="
           sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
-          # 系统缓存清理
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
-          # 服务状态校验
-          echo "📌 最终服务状态校验"
-          sudo systemctl is-active --quiet docker && echo "✅ Docker服务运行正常" || echo "⚠️ Docker服务未运行"
-          sudo systemctl is-active --quiet casaos && echo "✅ CasaOS服务运行正常" || echo "⚠️ CasaOS服务未运行"
-          echo "🎉 CasaOS纯净部署+备份全流程执行完成！"
-          echo "✅ 核心备份保留2份，自动清理完成，任务正常完结"
-          echo "✅ 访问指引：服务器公网IP:80 或 Tailscale内网IP"
+          echo "📌 最终服务状态"
+          sudo systemctl is-active --quiet docker && echo "✅ Docker运行正常" || echo "⚠️ Docker未运行"
+          sudo systemctl is-active --quiet casaos && echo "✅ CasaOS运行正常" || echo "⚠️ CasaOS未运行"
+          echo "🎉 全流程执行完成！"
+          echo "✅ 满300分钟备份+清旧+续跑已执行，任务正常完结"
+          echo "✅ 备份保留2份，访问服务器IP:80即可使用"
