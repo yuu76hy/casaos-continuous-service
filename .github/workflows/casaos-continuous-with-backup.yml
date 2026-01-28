@@ -34,28 +34,45 @@ jobs:
         run: |
           set -e
           echo "===== 仅保留当前工作流，关闭其他所有运行中任务 ====="
-          [ -z "$USER_PAT" ] || [ -z "$REPO" ] && { echo "⚠️ 缺失USER_PAT/REPO，跳过"; exit 0; }
+          # 校验核心配置，缺失则跳过
+          if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
+            echo "⚠️ 缺失USER_PAT或REPO配置，无法执行关闭操作"
+            exit 0
+          fi
           
           CURRENT_ID=${{ github.run_id }}
           echo "📌 当前工作流Run ID：$CURRENT_ID"
           
-          # 核心命令：拉取仓库所有运行中工作流ID，排除自身
-          OTHER_RUNS=$(curl -s -H "Authorization: token $USER_PAT" \
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=200" \
-            | jq -r ".workflow_runs[].run_id | select(. != $CURRENT_ID)")
+          # 拉取仓库所有运行中工作流（指定API版本+全分支兼容+200条上限）
+          RUNS_RESPONSE=$(curl -s -H "Authorization: token $USER_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=200")
           
-          # 无其他运行直接结束
-          [ -z "$OTHER_RUNS" ] && { echo "✅ 无其他运行中工作流"; exit 0; }
+          # 精准提取有效Run ID（过滤null、空值和当前ID）
+          OTHER_RUNS=$(echo "$RUNS_RESPONSE" | jq -r '.workflow_runs[]?.run_id | select(. != null and . != '$CURRENT_ID' and . != "")')
           
-          # 列出所有待关闭ID+批量关闭
+          # 无其他运行中工作流直接结束
+          if [ -z "$OTHER_RUNS" ] || [ "$OTHER_RUNS" = "null" ]; then
+            echo "✅ 无其他运行中工作流，无需操作"
+            exit 0
+          fi
+          
+          # 列出待关闭ID并批量执行关闭（带状态码校验）
           echo "📌 检出待关闭工作流Run ID："
           echo "$OTHER_RUNS"
           for RUN_ID in $OTHER_RUNS; do
-            echo "🔴 关闭Run ID：$RUN_ID"
-            curl -s -X POST -H "Authorization: token $USER_PAT" \
-              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null
+            echo "🔴 尝试关闭Run ID：$RUN_ID"
+            RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: token $USER_PAT" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel")
+            if [ "$RESPONSE_CODE" -eq 202 ] || [ "$RESPONSE_CODE" -eq 204 ]; then
+              echo "✅ 成功关闭Run ID：$RUN_ID（状态码：$RESPONSE_CODE）"
+            else
+              echo "⚠️ 关闭Run ID:$RUN_ID失败（状态码：$RESPONSE_CODE），可能已结束"
+            fi
+            sleep 0.3 # 防API限流
           done
-          echo "✅ 所有其他工作流已关闭，仅保留当前运行"
+          echo "✅ 其他运行中工作流处理完成，仅保留当前工作流运行"
       - name: 3-官方一键装Docker（含compose）
         run: |
           set -e
@@ -215,31 +232,3 @@ jobs:
               -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" \
               https://api.github.com/repos/$REPO/dispatches -d '{"event_type":"renew_casaos_snapshot"}' \
               && echo "✅ 自动续跑已触发" || echo "⚠️ 续跑触发失败，跳过"
-          }
-          while true; do
-            run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
-            if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
-              echo "⏰ 运行满2分钟，执行备份（仅1次）"
-              if full_backup; then
-                echo "✅ 备份成功！"
-                trigger_renew
-                RENEW_TRIGGERED=true
-              else
-                echo "❌ 备份失败，10分钟后重试1次"
-                sleep 600
-                full_backup && echo "✅ 重试备份成功" || echo "❌ 多次备份失败"
-                RENEW_TRIGGERED=true
-              fi
-            fi
-            [ $run_mins -ge 60 ] && { echo "✅ 达运行上限，流程结束"; exit 0; }
-            sleep 60
-          done
-      - name: 11-收尾清理（极速完成）
-        if: ${{ always() }}
-        run: |
-          set -e
-          echo "===== 收尾清理 ====="
-          sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          echo "🎉 全流程执行完成！"
-          echo "✅ 访问服务器IP（80端口）初始化CasaOS，备份保留最新2份"
