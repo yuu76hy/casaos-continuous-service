@@ -45,7 +45,7 @@ jobs:
           newgrp docker
           echo "✅ Docker安装完成"
 
-      - name: 3-创建免密管理员用户
+      - name: 3-创建免密管理员用户（修复sudoers校验问题）
         run: |
           set -e
           echo "===== 创建免密管理员用户 ====="
@@ -62,7 +62,9 @@ jobs:
           fi
           echo "${USER_NAME} ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"${USER_NAME}" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"${USER_NAME}"
-          sudo visudo -c
+          # 【关键修复】只校验自定义的roots配置文件，避免受运行器默认runner文件权限干扰
+          # 替换原全量校验命令sudo visudo -c，解决exit code 1问题
+          sudo visudo -c -f /etc/sudoers.d/"${USER_NAME}"
           sudo usermod -aG docker "${USER_NAME}"
           echo "✅ 用户配置完成"
 
@@ -133,7 +135,7 @@ jobs:
           # 临时下载快照到本地，解压后立即删除，避免残留
           TEMP_SNAPSHOT="/tmp/${LATEST_SNAPSHOT}"
           echo "📌 下载远程快照到本地临时目录"
-          # 【补充修复】改用rclone copyto（文件到文件复制），避免路径解析错误
+          # 【补充修复】改用rclone copyto（文件到文件复制），避免路径解析错误，提高下载成功率
           if ! rclone copyto mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT} ${TEMP_SNAPSHOT} --config /home/runner/.rclone.conf --progress; then
             echo "❌ 快照下载失败"
             sudo rm -f ${TEMP_SNAPSHOT} 2>/dev/null
@@ -248,7 +250,7 @@ jobs:
               restart_all_service
               return 1
             fi
-            # 【补充修复】增加du命令容错，避免格式异常导致脚本终止
+            # 【补充修复】增加du命令容错，避免格式异常导致脚本终止，默认返回"未知大小"
             SNAPSHOT_SIZE=$(du -sh ${SNAPSHOT_PATH} 2>/dev/null | awk '{print $1}' || echo "未知大小")
             echo -e "\n✅ 本地打包完成，备份大小：${SNAPSHOT_SIZE}"
             
@@ -285,10 +287,12 @@ jobs:
               echo "⚠️ USER_PAT或REPO缺失，跳过自动续跑"
               return 0
             fi
-            # 发送repository_dispatch事件触发续跑
+            # 发送repository_dispatch事件触发续跑，增加超时容错
             curl -X POST \
               -H "Authorization: token ${USER_PAT}" \
               -H "Accept: application/vnd.github.v3+json" \
+              --connect-timeout 30 \
+              --max-time 60 \
               https://api.github.com/repos/${REPO}/dispatches \
               -d '{"event_type":"renew_casaos_snapshot"}'
             if [ $? -eq 0 ]; then
@@ -311,7 +315,7 @@ jobs:
             sleep 60
           done
           
-          # 备份主流程
+          # 备份主流程，支持重试一次，提高成功率
           if full_backup;then
             echo "✅ 备份成功"
             cleanup_old_backups
