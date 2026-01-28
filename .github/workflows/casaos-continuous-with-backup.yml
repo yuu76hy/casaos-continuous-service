@@ -23,8 +23,9 @@ jobs:
       KEEP_BACKUPS: 2
       CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
       CURRENT_WORKFLOW_FILE: "casaos-continuous-with-backup.yml"
-      # 新增：超时前提前备份的阈值（单位：分钟）
       BACKUP_THRESHOLD_MINS: 5
+      # 修复：提前将超时分钟数存入环境变量，避免Shell中嵌套GitHub表达式
+      JOB_TIMEOUT_MINS: ${{ github.job.timeout-minutes }}
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -106,6 +107,7 @@ jobs:
         run: |
           set -e
           echo "===== WebDAV配置&快照检测&目录预创建 ====="
+          # 修复：变量赋值用双引号包裹，避免特殊字符问题
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "⚠️ WebDAV凭证缺失，跳过备份恢复"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -119,12 +121,17 @@ jobs:
             echo "✅ 远程备份目录创建成功"
           else
             echo "⚠️ 远程目录创建失败，重试一次"
-            rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf || { echo "❌ 远程目录不可达，跳过备份"; echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"; exit 0; }
+            rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf || { 
+              echo "❌ 远程目录不可达，跳过备份"
+              echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+              echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
+              exit 0
+            }
           fi
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 找到最新快照：$REMOTE_SNAPSHOTS"
-            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
+            echo "LATEST_SNAPSHOT=\"$REMOTE_SNAPSHOTS\"" >> "$GITHUB_ENV"
             echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
           else
             echo "✅ 首次部署无快照，纯净启动"
@@ -202,9 +209,8 @@ jobs:
           set -e
           echo "===== 个人数据备份+剩余时间检测 ====="
           start_time=$(date +%s)
-          # 工作流总超时时间（单位：秒）
-          TOTAL_TIMEOUT_SECS=$((60 * ${{ github.job.timeout-minutes }}))
-          # 提前备份的阈值（单位：秒）
+          # 修复：使用提前定义的环境变量JOB_TIMEOUT_MINS，避免嵌套表达式
+          TOTAL_TIMEOUT_SECS=$((60 * $JOB_TIMEOUT_MINS))
           THRESHOLD_SECS=$((60 * $BACKUP_THRESHOLD_MINS))
           RENEW_TRIGGERED=false
           
@@ -261,7 +267,9 @@ jobs:
             run_mins=$((run_seconds / 60))
             remaining_seconds=$((TOTAL_TIMEOUT_SECS - run_seconds))
             
-            echo "ℹ️ 当前运行时长：${run_mins}分钟 | 剩余时长：$((remaining_seconds / 60))分钟"
+            # 修复：剩余时长显示格式化，避免负数
+            remaining_mins=$(( remaining_seconds > 0 ? remaining_seconds / 60 : 0 ))
+            echo "ℹ️ 当前运行时长：${run_mins}分钟 | 剩余时长：${remaining_mins}分钟"
             
             # 条件1：运行满2分钟触发首次备份
             if [ $run_mins -ge 2 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
@@ -283,8 +291,8 @@ jobs:
               fi
             fi
             
-            # 条件2：剩余时间不足阈值时，强制触发备份
-            if [ $remaining_seconds -le $THRESHOLD_SECS ] && [ "$RENEW_TRIGGERED" = "false" ]; then
+            # 条件2：剩余时间不足阈值且大于0时，强制触发备份
+            if [ $remaining_seconds -le $THRESHOLD_SECS ] && [ $remaining_seconds -gt 0 ] && [ "$RENEW_TRIGGERED" = "false" ]; then
               echo "⚠️ 工作流即将超时（剩余${remaining_seconds}秒），强制触发备份"
               if full_backup; then
                 echo "✅ 超时前备份成功！"
