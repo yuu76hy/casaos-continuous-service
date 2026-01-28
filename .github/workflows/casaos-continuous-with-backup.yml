@@ -31,39 +31,38 @@ jobs:
           sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "✅ 初始化完成"
-      - name: 2-自动关闭其他运行中的工作流（抗异常+容错）
+      - name: 2-自动关闭其他运行中的工作流（抗异常+容错，精准关闭）
         run: |
           set -e
-          echo "===== 关闭其他运行中的工作流 ====="
+          echo "===== 关闭其他运行中的工作流，仅保留当前 ====="
           if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
             echo "⚠️ 缺少USER_PAT或REPO配置，跳过关闭其他工作流"
             exit 0
           fi
           CURRENT_RUN_ID="${{ github.run_id }}"
           echo "📌 当前工作流Run ID：$CURRENT_RUN_ID"
-          # 优化：用jq精准提取有效数据（过滤run_id为null、name为空的条目）
-          RUNNING_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \
-            jq -r '.workflow_runs[] | select(.run_id != null and .name != "") | "\(.run_id)|\(.name)"')
-          echo "📌 过滤后运行中的工作流："
-          echo "$RUNNING_WORKFLOWS"
-          # 遍历有效数据（用|分割，避免名称含空格错位）
-          while IFS="|" read -r RUN_ID WORKFLOW_NAME; do
-            # 跳过当前工作流
-            if [ "$RUN_ID" = "$CURRENT_RUN_ID" ] || [ "$WORKFLOW_NAME" = "$CURRENT_WORKFLOW_NAME" ]; then
-              echo "ℹ️ 跳过当前工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)"
-              continue
-            fi
-            # 关闭其他工作流（容错：失败不终止流程）
-            echo "⚠️ 发现其他运行中的工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)，正在关闭..."
-            if curl -s -X POST -H "Authorization: token $USER_PAT" \
-              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null; then
-              echo "✅ 已关闭工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)"
+          # 拉取仓库所有运行中工作流，过滤掉当前ID，直接提取待关闭ID
+          RUNNING_WORKFLOW_IDS=$(curl -s -H "Authorization: token $USER_PAT" \
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=100" | \
+            jq -r '.workflow_runs[] | select(.run_id != null and .run_id != '$CURRENT_RUN_ID') | .run_id')
+          # 无其他运行中工作流直接结束
+          if [ -z "$RUNNING_WORKFLOW_IDS" ] || [ "$RUNNING_WORKFLOW_IDS" = "null" ]; then
+            echo "✅ 无其他运行中工作流，无需处理"
+            exit 0
+          fi
+          echo "📌 检测到待关闭工作流Run ID列表："
+          echo "$RUNNING_WORKFLOW_IDS"
+          # 批量关闭，http202校验成功，容错不中断
+          for RUN_ID in $RUNNING_WORKFLOW_IDS; do
+            echo "⚠️ 正在关闭工作流Run ID：$RUN_ID"
+            if curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: token $USER_PAT" \
+              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" | grep -q "202"; then
+              echo "✅ 成功关闭工作流Run ID：$RUN_ID"
             else
-              echo "⚠️ 关闭工作流$WORKFLOW_NAME (Run ID: $RUN_ID)失败（可能已结束），跳过"
+              echo "⚠️ 关闭Run ID:$RUN_ID失败（可能已结束），跳过"
             fi
-          done <<< "$RUNNING_WORKFLOWS"
-          echo "✅ 其他运行中的工作流处理完成，仅保留当前工作流运行"
+          done
+          echo "✅ 其他运行中工作流清理完成，仅保留当前工作流正常运行"
       - name: 3-官方一键装Docker（含compose）
         run: |
           set -e
