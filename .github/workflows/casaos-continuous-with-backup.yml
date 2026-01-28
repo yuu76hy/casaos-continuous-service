@@ -22,16 +22,18 @@ jobs:
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
       CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
-      # 已根据图片更新为实际文件名
       CURRENT_WORKFLOW_FILE: "casaos-continuous-with-backup.yml"
 
     steps:
-      - name: 1-系统初始化（极简版）
+      - name: 1-系统初始化（海外服务器适配）
         run: |
           set -e
-          echo "===== 系统快速初始化 ====="
+          echo "===== 系统快速初始化（海外源） ====="
+          # 海外服务器使用Ubuntu官方源，不替换为国内镜像
           sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
+          # 关闭man-db自动更新，减少耗时
+          sudo sed -i 's/^man-db\/auto-update.*/man-db\/auto-update boolean false/' /etc/apt/apt.conf.d/00aptitude
           echo "✅ 初始化完成"
 
       - name: 2-强制关闭仓库所有其他工作流（仅保留当前）
@@ -100,16 +102,44 @@ jobs:
 
           echo "✅ 操作完成！仓库内仅保留当前工作流（$CURRENT_WORKFLOW_NAME）可执行，其他工作流已全部禁用"
 
-      - name: 3-官方一键装Docker（含compose）
+      - name: 3-官方一键装Docker（海外服务器优化）
         run: |
           set -e
-          echo "===== 官方一键安装Docker ====="
+          echo "===== 官方一键安装Docker（海外版） ====="
+          # 卸载旧版本（容错）
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
-          curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
+          # 清理残留
+          sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
+          # 海外服务器使用Docker官方源，不使用阿里云镜像
+          install_docker() {
+            curl -fsSL https://get.docker.com | sudo bash -s docker \
+              --install-options "--no-install-recommends --only-upgrade"
+            return $?
+          }
+
+          # 第一次安装
+          if install_docker; then
+            echo "✅ Docker首次安装成功"
+          else
+            echo "⚠️ 第一次安装失败，10秒后重试..."
+            sleep 10
+            # 第二次重试
+            if install_docker; then
+              echo "✅ Docker重试安装成功"
+            else
+              echo "⚠️ 第二次安装失败，使用apt直接安装核心组件"
+              # 兜底方案：手动安装核心组件，跳过非必需包
+              sudo apt update -y
+              sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+                docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            fi
+          fi
+
+          # 验证安装并启动服务
           sudo systemctl enable --now docker containerd && sleep 2
           docker --version && docker compose version
           sudo usermod -aG docker runner
-          echo "✅ Docker安装完成"
+          echo "✅ Docker安装完成（仅核心组件）"
 
       - name: 4-创建免密管理员用户
         run: |
@@ -160,6 +190,7 @@ jobs:
           sudo systemctl stop casaos 2>/dev/null || true && sudo systemctl disable casaos 2>/dev/null || true
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
           sudo systemctl daemon-reload
+          # 海外服务器直接使用CasaOS官方脚本，无需镜像
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS安装完成，待启动"
@@ -209,6 +240,7 @@ jobs:
         run: |
           set -e
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then exit 0; fi
+          # 海外服务器使用Tailscale官方源
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y tailscale -qq
