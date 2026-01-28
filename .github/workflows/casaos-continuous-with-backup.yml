@@ -23,7 +23,6 @@ jobs:
       KEEP_BACKUPS: 2
       CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
       CURRENT_WORKFLOW_FILE: "casaos-continuous-with-backup.yml"
-      # 总运行超时（与job timeout保持一致）
       TOTAL_TIMEOUT_MINS: 60
 
     steps:
@@ -31,10 +30,10 @@ jobs:
         run: |
           set -e
           echo "===== 系统快速初始化（海外源） ====="
-          # 海外服务器使用Ubuntu官方源
+          # 海外服务器使用Ubuntu官方源，加速更新
           sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          # 修复：检查并创建man-db配置文件
+          # 修复man-db配置文件不存在问题
           if [ ! -f /etc/apt/apt.conf.d/00aptitude ]; then
             sudo touch /etc/apt/apt.conf.d/00aptitude
             echo 'man-db/auto-update boolean false' | sudo tee -a /etc/apt/apt.conf.d/00aptitude >/dev/null
@@ -53,7 +52,6 @@ jobs:
           fi
 
           echo "📌 当前保留的工作流：文件=$CURRENT_WORKFLOW_FILE | 名称=$CURRENT_WORKFLOW_NAME"
-
           # 获取仓库内所有工作流
           ALL_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
             -H "Accept: application/vnd.github.v3+json" \
@@ -82,7 +80,7 @@ jobs:
               "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_ID/disable" >/dev/null && echo "✅ 已禁用" || echo "⚠️ 禁用失败"
           done <<< "$ALL_WORKFLOWS"
 
-          # 终止其他运行中实例
+          # 终止其他运行中实例（缩短等待）
           RUNNING_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
             "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \
             jq -r '.workflow_runs[] | select(.workflow_name != "'"$CURRENT_WORKFLOW_NAME"'") | "\(.id)|\(.workflow_name)"')
@@ -98,32 +96,36 @@ jobs:
 
           echo "✅ 仅当前工作流可执行"
 
-      - name: 3-官方一键装Docker（海外版+权限优化）
+      - name: 3-安装Docker（跳过交互等待+海外优化）
         run: |
           set -e
-          echo "===== 安装Docker（海外版） ====="
-          # 卸载旧版本+清理残留
+          echo "===== 安装Docker（海外版+非交互） ====="
+          # 卸载旧版本+清理残留（缩短容错等待）
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
-          # 安装核心组件
+          
+          # 核心修复：跳过Docker脚本的20秒交互等待，使用非交互安装
           install_docker() {
-            curl -fsSL https://get.docker.com | sudo bash -s docker --install-options "--no-install-recommends"
+            # 添加DEBIAN_FRONTEND=noninteractive跳过所有交互，--force跳过确认
+            DEBIAN_FRONTEND=noninteractive curl -fsSL https://get.docker.com | sudo bash -s docker --install-options "--no-install-recommends" --force
             return $?
           }
-          # 重试机制
+          
+          # 重试机制（缩短重试等待：从10秒→5秒）
           if ! install_docker; then
-            echo "⚠️ 首次安装失败，10秒后重试..." && sleep 10
+            echo "⚠️ 首次安装失败，5秒后重试..." && sleep 5
             install_docker || {
-              echo "⚠️ 重试失败，使用apt兜底安装"
+              echo "⚠️ 重试失败，使用apt兜底安装（非交互）"
               sudo apt update -y
-              sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin
+              DEBIAN_FRONTEND=noninteractive sudo apt install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin -qq
             }
           fi
-          # 启动服务+配置权限
-          sudo systemctl enable --now docker containerd && sleep 2
+          
+          # 启动服务+配置权限（缩短启动等待：从2秒→1秒）
+          sudo systemctl enable --now docker containerd && sleep 1
           sudo usermod -aG docker runner
           docker --version && docker compose version
-          echo "✅ Docker安装完成"
+          echo "✅ Docker安装完成（无交互等待）"
 
       - name: 4-创建免密管理员用户（安全优化）
         run: |
@@ -185,8 +187,8 @@ jobs:
           sudo systemctl stop casaos 2>/dev/null || true
           sudo rm -f /etc/systemd/system/casaos.service 2>/dev/null || true
           sudo systemctl daemon-reload
-          # 安装官方版本
-          curl -fsSL https://get.casaos.io | sudo bash
+          # 非交互安装CasaOS
+          DEBIAN_FRONTEND=noninteractive curl -fsSL https://get.casaos.io | sudo bash -s -- --force
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS安装完成"
 
@@ -217,9 +219,9 @@ jobs:
           # 校正权限
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA && sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          # 启动服务
-          sudo systemctl enable --now docker containerd && sleep 3
-          sudo systemctl enable --now casaos && sleep 4
+          # 启动服务（缩短等待：从3秒→2秒，4秒→3秒）
+          sudo systemctl enable --now docker containerd && sleep 2
+          sudo systemctl enable --now casaos && sleep 3
           # 检测端口
           if sudo fuser 80/tcp >/dev/null 2>&1; then
             echo "✅ CasaOS已启动（端口80）"
@@ -233,13 +235,13 @@ jobs:
           set -e
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then exit 0; fi
           echo "===== 配置Tailscale ====="
-          # 安装Tailscale
+          # 安装Tailscale（非交互）
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt update -y -qq && sudo apt install -y tailscale -qq
-          # 启动并组网
-          sudo systemctl enable --now tailscaled && sleep 2
-          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)"
+          sudo apt update -y -qq && DEBIAN_FRONTEND=noninteractive sudo apt install -y tailscale -qq
+          # 启动并组网（缩短等待：从2秒→1秒）
+          sudo systemctl enable --now tailscaled && sleep 1
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           echo "✅ Tailscale IP：$(sudo tailscale ip -4 2>/dev/null || echo '未获取')"
 
       - name: 10-个人数据备份+剩余时间显示（核心优化）
@@ -318,8 +320,8 @@ jobs:
                 trigger_renew
                 RENEW_TRIGGERED=true
               else
-                echo "❌ 备份失败，10分钟后重试"
-                sleep 600
+                echo "❌ 备份失败，5分钟后重试（缩短等待）"
+                sleep 300
                 full_backup && RENEW_TRIGGERED=true || echo "❌ 多次备份失败，跳过"
               fi
             fi
