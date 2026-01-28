@@ -17,7 +17,7 @@ jobs:
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      USER_PAT: ${{ secrets.USER_PAT }}  # 改回USER_PAT，对应仓库Secrets的USER_PAT
+      USER_PAT: ${{ secrets.USER_PAT }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
@@ -32,33 +32,44 @@ jobs:
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "✅ 初始化完成"
 
-      - name: 2-自动关闭其他运行中的工作流
+      - name: 2-自动关闭其他运行中的工作流（抗异常+容错）
         run: |
           set -e
           echo "===== 关闭其他运行中的工作流 ====="
           if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-            echo "⚠️ 缺少USER_PAT或REPO配置，跳过关闭其他工作流"  # 提示文字改回USER_PAT
+            echo "⚠️ 缺少USER_PAT或REPO配置，跳过关闭其他工作流"
             exit 0
           fi
 
           CURRENT_RUN_ID="${{ github.run_id }}"
+          echo "📌 当前工作流Run ID：$CURRENT_RUN_ID"
 
+          # 优化：用jq精准提取有效数据（过滤run_id为null、name为空的条目）
           RUNNING_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | jq -r '.workflow_runs[] | "\(.id) \(.name) \(.run_id)"')
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \
+            jq -r '.workflow_runs[] | select(.run_id != null and .name != "") | "\(.run_id)|\(.name)"')
 
-          echo "📌 当前运行中的工作流："
+          echo "📌 过滤后运行中的工作流："
           echo "$RUNNING_WORKFLOWS"
 
-          while read -r WORKFLOW_ID WORKFLOW_NAME RUN_ID; do
-            if [ "$RUN_ID" != "$CURRENT_RUN_ID" ] && [ "$WORKFLOW_NAME" != "$CURRENT_WORKFLOW_NAME" ]; then
-              echo "⚠️ 发现其他运行中的工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)，正在关闭..."
-              curl -s -X POST -H "Authorization: token $USER_PAT" \
-                "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel"
-              echo "✅ 已关闭工作流：$WORKFLOW_NAME"
+          # 遍历有效数据（用|分割，避免名称含空格错位）
+          while IFS="|" read -r RUN_ID WORKFLOW_NAME; do
+            # 跳过当前工作流
+            if [ "$RUN_ID" = "$CURRENT_RUN_ID" ] || [ "$WORKFLOW_NAME" = "$CURRENT_WORKFLOW_NAME" ]; then
+              echo "ℹ️ 跳过当前工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)"
+              continue
+            fi
+            # 关闭其他工作流（容错：失败不终止流程）
+            echo "⚠️ 发现其他运行中的工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)，正在关闭..."
+            if curl -s -X POST -H "Authorization: token $USER_PAT" \
+              "https://api.github.com/repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null; then
+              echo "✅ 已关闭工作流：$WORKFLOW_NAME (Run ID: $RUN_ID)"
+            else
+              echo "⚠️ 关闭工作流$WORKFLOW_NAME (Run ID: $RUN_ID)失败（可能已结束），跳过"
             fi
           done <<< "$RUNNING_WORKFLOWS"
 
-          echo "✅ 其他运行中的工作流已全部关闭，仅保留当前工作流运行"
+          echo "✅ 其他运行中的工作流处理完成，仅保留当前工作流运行"
 
       - name: 3-官方一键装Docker（含compose）
         run: |
@@ -229,10 +240,9 @@ jobs:
           }
 
           trigger_renew(){
-            # 容错升级：续跑缺失不返回错误码，仅提示跳过
             if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-              echo "⚠️ 续跑配置缺失（USER_PAT/REPO未填），跳过续跑（不影响核心功能）"  # 提示文字改回USER_PAT
-              return 0  # 返回0，避免set -e终止流程
+              echo "⚠️ 续跑配置缺失（USER_PAT/REPO未填），跳过续跑（不影响核心功能）"
+              return 0
             fi
             if curl -fsSL --fail --connect-timeout 30 -X POST \
               -H "Authorization: token $USER_PAT" \
@@ -244,7 +254,7 @@ jobs:
               return 0
             else
               echo "⚠️ 自动续跑触发失败（PAT权限不足或REPO格式错误），跳过"
-              return 0  # 返回0，避免set -e终止流程
+              return 0
             fi
           }
 
@@ -254,7 +264,7 @@ jobs:
               echo "⏰ 运行满2分钟，开始执行备份（仅执行1次）"
               if full_backup; then
                 echo "✅ 备份成功！"
-                trigger_renew  # 续跑失败不影响备份标记
+                trigger_renew
                 RENEW_TRIGGERED=true
               else
                 echo "❌ 备份/上传失败，10分钟后重试（仅重试1次）"
