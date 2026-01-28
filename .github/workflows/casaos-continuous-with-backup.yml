@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（备份保留2份+自动清理 稳定版）
+name: CasaOS纯净部署（备份保留2份+自动清理+进度条+测试模式+停进程备份 极速测试版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -7,7 +7,7 @@ on:
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360  # 超时延长至6小时，留足备份时间
+    timeout-minutes: 360
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -21,7 +21,8 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      BACKUP_TRIGGER_MINS: 300  # 满300分钟触发备份，固定配置
+      BACKUP_TRIGGER_MINS: 10
+      TEST_MODE: false
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -164,11 +165,11 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 9-等待满300分钟+备份清旧+触发续跑（核心要求）
+      - name: 9-计时等待/测试模式+备份清旧+触发续跑（核心）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 等待满${BACKUP_TRIGGER_MINS}分钟后执行备份+续跑 ====="
+          echo "===== 测试模式:${TEST_MODE} | 满${BACKUP_TRIGGER_MINS}分钟触发备份+续跑 ====="
           
           # 清理旧备份（仅留最新2份）
           cleanup_old_backups(){
@@ -192,17 +193,46 @@ jobs:
             fi
           }
           
-          # 全量备份核心数据
+          # 停止所有相关进程（备份专用）
+          stop_all_process(){
+            echo "📌 停止CasaOS+Docker所有相关进程，避免文件占用"
+            sudo systemctl stop casaos docker containerd 2>/dev/null || true
+            sudo pkill -9 casaos docker dockerd containerd containerd-shim 2>/dev/null || true
+            sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
+            sync && sleep 2
+            echo "✅ 所有相关进程已停止，可安全备份"
+          }
+          
+          # 重启所有服务（备份后恢复）
+          restart_all_service(){
+            echo "📌 备份完成，重启所有核心服务"
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now docker containerd && sleep 3
+            sudo systemctl enable --now casaos && sleep 4
+            echo "✅ 所有服务重启完成"
+          }
+          
+          # 全量备份核心数据（带实时进度条+停进程）
           full_backup(){
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
-            echo "📌 开始打包数据，排除冗余文件"
-            if ! sudo tar -czPf $SNAPSHOT_PATH $EXCLUDE_RULES $PERSONAL_DATA_DIRS;then
-              echo "❌ 数据打包失败"
+            
+            # 第一步：先停所有进程，保证备份完整性
+            stop_all_process
+            
+            echo "📌 开始打包数据（实时进度），排除冗余文件"
+            if ! sudo tar -czPf $SNAPSHOT_PATH $EXCLUDE_RULES \
+              --checkpoint=1000 --checkpoint-action=ttyout='\r打包进度：%u/%U 文件  已处理：%b' \
+              $PERSONAL_DATA_DIRS;then
+              echo -e "\n❌ 数据打包失败，尝试重启服务"
+              restart_all_service
               return 1
             fi
             SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
-            echo "✅ 本地打包完成，备份大小：$SNAPSHOT_SIZE"
+            echo -e "\n✅ 本地打包完成，备份大小：$SNAPSHOT_SIZE"
+            
+            # 第二步：打包完成立即重启服务，减少服务中断时间
+            restart_all_service
             
             echo "📌 上传备份至WebDAV远程目录"
             if ! rclone copy $SNAPSHOT_PATH mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3;then
@@ -240,27 +270,31 @@ jobs:
             fi
           }
           
-          # 核心逻辑：计时等待满300分钟，仅执行1次备份流程
-          start_time=$(date +%s)
-          echo "⏰ 计时开始，满${BACKUP_TRIGGER_MINS}分钟触发备份，当前时间：$(date)"
-          while true; do
-            run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
-            if [ $run_mins -ge $BACKUP_TRIGGER_MINS ]; then
-              echo "✅ 已运行满${BACKUP_TRIGGER_MINS}分钟，启动备份流程"
-              break
-            fi
-            echo "⏳ 已运行${run_mins}分钟，还需等待$((BACKUP_TRIGGER_MINS - run_mins))分钟"
-            sleep 60
-          done
+          # 核心逻辑：测试模式直接备份 | 正常模式计时满10分钟备份
+          if [ "${TEST_MODE}" = "true" ];then
+            echo "🚀 测试模式开启，跳过计时等待，直接启动备份流程"
+          else
+            start_time=$(date +%s)
+            echo "⏰ 计时开始，满${BACKUP_TRIGGER_MINS}分钟触发备份，当前时间：$(date)"
+            while true; do
+              run_mins=$(( ( $(date +%s) - start_time ) / 60 ))
+              if [ $run_mins -ge $BACKUP_TRIGGER_MINS ]; then
+                echo "✅ 已运行满${BACKUP_TRIGGER_MINS}分钟，启动备份流程"
+                break
+              fi
+              echo "⏳ 已运行${run_mins}分钟，还需等待$((BACKUP_TRIGGER_MINS - run_mins))分钟"
+              sleep 60
+            done
+          fi
           
-          # 备份流程：备份→清旧→续跑，执行完直接结束
+          # 备份流程：备份→清旧→续跑，失败后1分钟重试
           if full_backup;then
             echo "✅ 备份成功"
             cleanup_old_backups
             trigger_renew
           else
-            echo "❌ 备份失败，10分钟后重试1次"
-            sleep 600
+            echo "❌ 备份失败，1分钟后重试1次"
+            sleep 60
             if full_backup;then
               echo "✅ 重试备份成功"
               cleanup_old_backups
@@ -269,13 +303,13 @@ jobs:
               echo "❌ 两次备份均失败"
             fi
           fi
-          echo "✅ 备份+续跑流程结束，准备收尾完结任务"
+          echo "✅ 备份+续跑流程结束，准备收尾"
 
-      - name: 10-收尾清理（直接完结任务，无残留）
+      - name: 10-收尾清理（无残留）
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 收尾清理，任务直接完结 ====="
+          echo "===== 收尾清理，任务完结 ====="
           sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
@@ -283,5 +317,4 @@ jobs:
           sudo systemctl is-active --quiet docker && echo "✅ Docker运行正常" || echo "⚠️ Docker未运行"
           sudo systemctl is-active --quiet casaos && echo "✅ CasaOS运行正常" || echo "⚠️ CasaOS未运行"
           echo "🎉 全流程执行完成！"
-          echo "✅ 满300分钟备份+清旧+续跑已执行，任务正常完结"
-          echo "✅ 备份保留2份，访问服务器IP:80即可使用"
+          echo "✅ 测试模式:${TEST_MODE} | 备份保留2份，访问服务器IP:80可用"
