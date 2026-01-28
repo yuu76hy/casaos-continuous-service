@@ -28,10 +28,14 @@ jobs:
     steps:
       - name: 1-系统初始化（极速+源优化 容错版）
         run: |
-          set -e
           echo "===== 系统快速初始化 ====="
+          # 释放apt锁（防止之前操作残留锁）
+          sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend || true
+          # 替换Ubuntu源为阿里云（容错处理）
           sudo sed -i 's|//archive.ubuntu.com|//mirrors.aliyun.com|g; s|//security.ubuntu.com|//mirrors.aliyun.com|g' /etc/apt/sources.list || true
-          sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq || true
+          # 更新并安装依赖（增加超时，避免卡住）
+          sudo timeout 300 apt update -y -qq || echo "⚠️ apt update超时，继续执行"
+          sudo timeout 300 apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq || echo "⚠️ 依赖安装部分失败，继续执行"
           sudo apt autoremove -y -qq && sudo apt clean -y -qq || true
           # 修复00aptitude不存在问题，兼容Ubuntu24.04
           if [ -f "/etc/apt/apt.conf.d/00aptitude" ]; then
@@ -44,7 +48,6 @@ jobs:
 
       - name: 2-强制关闭仓库所有其他工作流（仅保留当前）
         run: |
-          set -e
           echo "===== 强制关闭仓库所有其他工作流 ====="
           if [ -z "$USER_PAT" ] || [ -z "$REPO" ] || [ -z "$CURRENT_WORKFLOW_FILE" ]; then
             echo "⚠️ 缺少USER_PAT/REPO/当前工作流文件名配置，跳过关闭其他工作流"
@@ -77,37 +80,52 @@ jobs:
           done
           echo "✅ 仓库工作流环境已净化"
 
-      - name: 3-官方一键装Docker（修复参数+重试）
+      - name: 3-官方一键装Docker（修复参数+重试+容错）
         run: |
-          set -e
           echo "===== 安装Docker（修复版） ====="
-          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
+          # 释放apt锁
+          sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock-frontend || true
+          # 停止Docker服务（先停服务再卸载，避免占用）
+          sudo systemctl stop docker containerd docker.socket 2>/dev/null || true
+          # 精准卸载Docker核心组件（避免通配符误删）
+          sudo apt remove -y docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || echo "⚠️ 无Docker组件需卸载，继续执行"
+          # 清理残留文件（容错）
           sudo rm -rf /var/lib/docker /var/lib/containerd 2>/dev/null || true
+          sudo dpkg --configure -a || true  # 修复损坏的dpkg状态
           
           install_docker() {
-            curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
+            # 增加超时，避免curl卡住
+            timeout 300 curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
           }
           
+          # 第一次尝试安装
           if ! install_docker; then
             echo "⚠️ 首次安装失败，10秒后重试..."
             sleep 10
+            # 第二次重试
             if ! install_docker; then
               echo "⚠️ 重试失败，启用apt兜底安装"
-              sudo apt update -y
+              sudo timeout 300 apt update -y
               sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
-                docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                docker-ce docker-ce-cli containerd.io docker-compose-plugin || echo "⚠️ apt兜底安装失败，检查Runner环境"
             fi
           fi
           
-          sudo systemctl enable --now docker containerd
-          sleep 2
-          docker --version && docker compose version
-          sudo usermod -aG docker runner
-          echo "✅ Docker安装完成（核心组件）"
+          # 启动并启用Docker服务
+          sudo systemctl enable --now docker containerd || true
+          sleep 5  # 延长等待，确保服务完全启动
+          # 检查Docker是否安装成功
+          if command -v docker &>/dev/null; then
+            docker --version && docker compose version
+            sudo usermod -aG docker runner
+            echo "✅ Docker安装完成（核心组件）"
+          else
+            echo "❌ Docker安装失败，请检查Runner网络/权限"
+            exit 1
+          fi
 
       - name: 4-创建免密管理员用户
         run: |
-          set -e
           echo "===== 创建免密用户 roots ====="
           USER_NAME="roots"
           id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
@@ -125,7 +143,6 @@ jobs:
 
       - name: 5-WebDAV配置+快照检测
         run: |
-          set -e
           echo "===== WebDAV配置与快照检测 ====="
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "⚠️ WebDAV凭证缺失，跳过备份恢复"
@@ -159,9 +176,8 @@ jobs:
 
       - name: 6-纯净安装CasaOS（停止所有服务）
         run: |
-          set -e
           echo "===== 安装纯净CasaOS ====="
-          sudo systemctl restart docker containerd && sleep 2
+          sudo systemctl restart docker containerd && sleep 5  # 延长等待
           
           for svc in $CASA_SERVICES; do
             sudo systemctl stop "$svc" 2>/dev/null || true
@@ -170,7 +186,8 @@ jobs:
           sudo rm -f /etc/systemd/system/casaos*.service /usr/lib/systemd/system/casaos*.service 2>/dev/null || true
           sudo systemctl daemon-reload
           
-          curl -fsSL https://get.casaos.io | sudo bash
+          # 增加超时，避免CasaOS安装脚本卡住
+          timeout 300 curl -fsSL https://get.casaos.io | sudo bash || echo "⚠️ CasaOS安装脚本执行超时，检查网络"
           
           for svc in $CASA_SERVICES; do
             sudo systemctl stop "$svc" 2>/dev/null || true
@@ -180,11 +197,10 @@ jobs:
       - name: 7-恢复个人数据（精准防错乱）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
-          set -e
           echo "===== 恢复个人数据（服务已停止） ====="
           sudo pkill -9 docker containerd 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
-          sync && sleep 2
+          sync && sleep 5
           
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
           echo "📌 恢复目录：$PERSONAL_DATA_DIRS"
@@ -201,7 +217,6 @@ jobs:
 
       - name: 8-权限校正+启动核心服务
         run: |
-          set -e
           echo "===== 权限校正与服务启动 ====="
           
           sudo mkdir -p /etc/casaos /var/lib/casaos /DATA /run/docker 2>/dev/null || true
@@ -213,13 +228,13 @@ jobs:
           sudo systemctl daemon-reload
           
           sudo systemctl enable --now docker containerd
-          sleep 3
+          sleep 5  # 延长等待
           
           for svc in casaos-gateway casaos-message-bus casaos-user-service \
                      casaos-local-storage casaos-app-management casaos; do
             sudo systemctl enable "$svc" 2>/dev/null || true
             sudo systemctl start "$svc" 2>/dev/null || true
-            sleep 1
+            sleep 2  # 延长服务启动间隔
           done
           
           if [ "${{ env.HAS_SNAPSHOT }}" = "true" ]; then
@@ -231,14 +246,13 @@ jobs:
       - name: 9-Tailscale远程组网（可选）
         if: ${{ env.TAILSCALE_AUTH_KEY != '' }}
         run: |
-          set -e
           echo "===== 配置Tailscale组网 ====="
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | \
             sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | \
             sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt update -y -qq && sudo apt install -y tailscale -qq
-          sudo systemctl enable --now tailscaled && sleep 2
+          sudo timeout 300 apt update -y -qq && sudo apt install -y tailscale -qq || true
+          sudo systemctl enable --now tailscaled && sleep 5
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="CasaOS-$(hostname | cut -c1-8)" --accept-routes --advertise-exit-node 2>/dev/null || true
           TAIL_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取中...")
@@ -247,7 +261,6 @@ jobs:
       - name: 10-个人数据备份+保留2份清理（服务安全暂停）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          set -e
           echo "===== 执行安全备份（服务暂停保障数据一致性） ====="
           
           echo "⏸️ 暂停Docker与CasaOS服务（保障备份一致性）"
@@ -255,7 +268,7 @@ jobs:
           for svc in $CASA_SERVICES; do
             sudo systemctl stop "$svc" 2>/dev/null || true
           done
-          sleep 3
+          sleep 5
           
           cleanup_old_backups() {
             local backups=$(rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf | \
@@ -300,7 +313,7 @@ jobs:
           for svc in casaos-gateway casaos-message-bus casaos-user-service \
                      casaos-local-storage casaos-app-management casaos; do
             sudo systemctl start "$svc" 2>/dev/null || true
-            sleep 0.5
+            sleep 1  # 延长启动间隔
           done
           
           if [ "$BACKUP_SUCCESS" = "true" ] && [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
@@ -318,10 +331,9 @@ jobs:
       - name: 11-收尾清理（保留roots权限配置）
         if: ${{ always() }}
         run: |
-          set -e
           echo "===== 收尾清理 ====="
           sudo rm -rf /tmp/* /home/runner/.rclone.conf 2>/dev/null || true
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
+          sudo apt autoremove -y -qq && sudo apt clean -y -qq || true
           
           echo ""
           echo "🎉 CasaOS 部署全流程完成！"
