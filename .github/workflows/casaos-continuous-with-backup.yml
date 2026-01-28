@@ -13,59 +13,65 @@ jobs:
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
       EXCLUDE_RULES: >-
         --exclude=*.log --exclude=*.tmp --exclude=*.cache --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/logs
-      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}  # 修复：移除$和{{之间的空格、变量后多余空格
-      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}  # 同上
-      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}  # 同上
-      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}  # 同上
-      USER_PAT: ${{ secrets.USER_PAT }}  # 同上
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}  # 同上
-      REPO: ${{ secrets.REPO }}  # 同上
+      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
       CURRENT_WORKFLOW_NAME: "CasaOS纯净部署（备份保留2份+自动清理 稳定版）"
       CURRENT_WORKFLOW_FILE: "casaos-continuous-with-backup.yml"
       CASA_SERVICES: "casaos-gateway casaos-message-bus casaos-user-service casaos-local-storage casaos-app-management rclone casaos"
 
     steps:
-      - name: 1-系统初始化（极速+源优化）
+      - name: 1-系统初始化（极速+源优化 容错版）
         run: |
           set -e
           echo "===== 系统快速初始化 ====="
-          sudo sed -i 's|//archive.ubuntu.com|//mirrors.aliyun.com|g; s|//security.ubuntu.com|//mirrors.aliyun.com|g' /etc/apt/sources.list
-          sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          sudo sed -i 's/^man-db\/auto-update.*/man-db\/auto-update boolean false/' /etc/apt/apt.conf.d/00aptitude
+          sudo sed -i 's|//archive.ubuntu.com|//mirrors.aliyun.com|g; s|//security.ubuntu.com|//mirrors.aliyun.com|g' /etc/apt/sources.list || true
+          sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq || true
+          sudo apt autoremove -y -qq && sudo apt clean -y -qq || true
+          # 修复00aptitude不存在问题，兼容Ubuntu24.04
+          if [ -f "/etc/apt/apt.conf.d/00aptitude" ]; then
+            sudo sed -i 's/^man-db\/auto-update.*/man-db\/auto-update boolean false/' /etc/apt/apt.conf.d/00aptitude || true
+          else
+            echo 'APT::Get::AutomaticRemove "0";' | sudo tee -a /etc/apt/apt.conf.d/01autoremove >/dev/null
+            echo 'man-db auto-update false' | sudo debconf-set-selections || true
+          fi
           echo "✅ 初始化完成"
 
       - name: 2-强制关闭仓库所有其他工作流（仅保留当前）
         run: |
           set -e
           echo "===== 强制关闭仓库所有其他工作流 ====="
-          if [ -z "$USER_PAT" ] || [ -z "$REPO" ] || [ -z "$CURRENT_WORKFLOW_FILE" ]; then  # 修复：$和变量名无空格
+          if [ -z "$USER_PAT" ] || [ -z "$REPO" ] || [ -z "$CURRENT_WORKFLOW_FILE" ]; then
             echo "⚠️ 缺少USER_PAT/REPO/当前工作流文件名配置，跳过关闭其他工作流"
             exit 0
           fi
-          echo "📌 保留工作流：$CURRENT_WORKFLOW_NAME | 文件：$CURRENT_WORKFLOW_FILE"  # 修复：变量引用空格
+          echo "📌 保留工作流：$CURRENT_WORKFLOW_NAME | 文件：$CURRENT_WORKFLOW_FILE"
           
-          ALL_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \  # 修复：$USER_PAT无空格
-            "https://api.github.com/repos/$REPO/actions/workflows" | \  # 修复：$REPO无空格
+          ALL_WORKFLOWS=$(curl -s -H "Authorization: token $USER_PAT" \
+            "https://api.github.com/repos/$REPO/actions/workflows" | \
             jq -r '.workflows[] | "\(.id)|\(.name)|\(.path)|\(.state)"')
           
           while IFS="|" read -r WORKFLOW_ID WORKFLOW_NAME WORKFLOW_FILE WORKFLOW_STATE; do
-            if [ "$WORKFLOW_FILE" = ".github/workflows/$CURRENT_WORKFLOW_FILE" ]; then  # 修复：变量引用
-              [ "$WORKFLOW_STATE" != "active" ] && curl -s -X PUT -H "Authorization: token $USER_PAT" \  # 修复
+            if [ "$WORKFLOW_FILE" = ".github/workflows/$CURRENT_WORKFLOW_FILE" ]; then
+              [ "$WORKFLOW_STATE" != "active" ] && curl -s -X PUT -H "Authorization: token $USER_PAT" \
                 "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_ID/enable" >/dev/null && echo "✅ 启用当前工作流"
               continue
             fi
-            curl -s -X PUT -H "Authorization: token $USER_PAT" \  # 修复
+            curl -s -X PUT -H "Authorization: token $USER_PAT" \
               "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_ID/disable" >/dev/null && \
               echo "✅ 禁用工作流：$WORKFLOW_NAME"
-          done <<< "$ALL_WORKFLOWS"  # 修复
+          done <<< "$ALL_WORKFLOWS"
           
-          RUNNING=$(curl -s -H "Authorization: token $USER_PAT" \  # 修复
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \  # 修复
-            jq -r ".workflow_runs[] | select(.workflow_name != \"$CURRENT_WORKFLOW_NAME\") | \"\(.id)\"")  # 修复
-          for rid in $RUNNING; do  # 修复
-            curl -s -X POST -H "Authorization: token $USER_PAT" \  # 修复
+          RUNNING=$(curl -s -H "Authorization: token $USER_PAT" \
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress" | \
+            jq -r ".workflow_runs[] | select(.workflow_name != \"$CURRENT_WORKFLOW_NAME\") | \"\(.id)\"")
+          for rid in $RUNNING; do
+            curl -s -X POST -H "Authorization: token $USER_PAT" \
               "https://api.github.com/repos/$REPO/actions/runs/$rid/cancel" >/dev/null && \
               echo "✅ 终止运行实例：$rid"
           done
@@ -104,52 +110,52 @@ jobs:
           set -e
           echo "===== 创建免密用户 roots ====="
           USER_NAME="roots"
-          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"  # 修复
-          if [ -n "$ROOTS_PASSWORD" ]; then  # 修复
-            echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd  # 修复
+          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
+          if [ -n "$ROOTS_PASSWORD" ]; then
+            echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd
           else
-            RANDOM_PASS=$(openssl rand -base64 12)  # 修复
-            echo "$USER_NAME:$RANDOM_PASS" | sudo chpasswd  # 修复
-            echo "⚠️ 未配置ROOTS_PASSWORD，生成随机密码：$RANDOM_PASS（请妥善保存）"  # 修复
+            RANDOM_PASS=$(openssl rand -base64 12)
+            echo "$USER_NAME:$RANDOM_PASS" | sudo chpasswd
+            echo "⚠️ 未配置ROOTS_PASSWORD，生成随机密码：$RANDOM_PASS（请妥善保存）"
           fi
-          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null  # 修复
-          sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"  # 修复
-          sudo usermod -aG docker "$USER_NAME"  # 修复
+          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
+          sudo usermod -aG docker "$USER_NAME"
           echo "✅ 用户 roots 配置完成（sudo免密）"
 
       - name: 5-WebDAV配置+快照检测
         run: |
           set -e
           echo "===== WebDAV配置与快照检测 ====="
-          if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then  # 修复
+          if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "⚠️ WebDAV凭证缺失，跳过备份恢复"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"  # 修复：$GITHUB_ENV无空格
-            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"  # 修复
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
             exit 0
           fi
           
-          echo "$WEBDAV_PASSWORD" | rclone config create mywebdav webdav \  # 修复
-            url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$(cat)" --config /home/runner/.rclone.conf >/dev/null  # 修复
+          echo "$WEBDAV_PASSWORD" | rclone config create mywebdav webdav \
+            url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$(cat)" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
           
-          if ! rclone mkdir "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf 2>/dev/null; then  # 修复
+          if ! rclone mkdir "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf 2>/dev/null; then
             echo "❌ WebDAV连接失败，请检查凭证或网络"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"  # 修复
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 1
           fi
           
-          LATEST=$(rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf | \  # 修复
+          LATEST=$(rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf | \
             grep "casaos-full-snapshot" | awk '{print $2}' | sort -r | head -1)
           
-          if [ -n "$LATEST" ]; then  # 修复
-            echo "✅ 检测到最新快照：$LATEST"  # 修复
-            echo "LATEST_SNAPSHOT=$LATEST" >> "$GITHUB_ENV"  # 修复
-            echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"  # 修复
+          if [ -n "$LATEST" ]; then
+            echo "✅ 检测到最新快照：$LATEST"
+            echo "LATEST_SNAPSHOT=$LATEST" >> "$GITHUB_ENV"
+            echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
           else
             echo "ℹ️ 首次部署：无历史快照"
-            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"  # 修复
+            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
           fi
-          echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"  # 修复
+          echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
 
       - name: 6-纯净安装CasaOS（停止所有服务）
         run: |
@@ -157,22 +163,22 @@ jobs:
           echo "===== 安装纯净CasaOS ====="
           sudo systemctl restart docker containerd && sleep 2
           
-          for svc in $CASA_SERVICES; do  # 修复
-            sudo systemctl stop "$svc" 2>/dev/null || true  # 修复
-            sudo systemctl disable "$svc" 2>/dev/null || true  # 修复
+          for svc in $CASA_SERVICES; do
+            sudo systemctl stop "$svc" 2>/dev/null || true
+            sudo systemctl disable "$svc" 2>/dev/null || true
           done
           sudo rm -f /etc/systemd/system/casaos*.service /usr/lib/systemd/system/casaos*.service 2>/dev/null || true
           sudo systemctl daemon-reload
           
           curl -fsSL https://get.casaos.io | sudo bash
           
-          for svc in $CASA_SERVICES; do  # 修复
-            sudo systemctl stop "$svc" 2>/dev/null || true  # 修复
+          for svc in $CASA_SERVICES; do
+            sudo systemctl stop "$svc" 2>/dev/null || true
           done
           echo "✅ CasaOS安装完成，所有服务已停止"
 
       - name: 7-恢复个人数据（精准防错乱）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}  # 修复：$和{{无空格
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
           echo "===== 恢复个人数据（服务已停止） ====="
@@ -180,17 +186,17 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
           sync && sleep 2
           
-          sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true  # 修复
-          echo "📌 恢复目录：$PERSONAL_DATA_DIRS"  # 修复
+          sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
+          echo "📌 恢复目录：$PERSONAL_DATA_DIRS"
           
-          rclone cat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /home/runner/.rclone.conf | \  # 修复
-            sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS  # 修复
+          rclone cat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /home/runner/.rclone.conf | \
+            sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
           
-          sudo chown -R root:root $PERSONAL_DATA_DIRS  # 修复
+          sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker 2>/dev/null || true
           
-          rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /home/runner/.rclone.conf 2>/dev/null || true  # 修复
+          rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /home/runner/.rclone.conf 2>/dev/null || true
           echo "✅ 数据恢复完成，权限校正完毕"
 
       - name: 8-权限校正+启动核心服务
@@ -211,19 +217,19 @@ jobs:
           
           for svc in casaos-gateway casaos-message-bus casaos-user-service \
                      casaos-local-storage casaos-app-management casaos; do
-            sudo systemctl enable "$svc" 2>/dev/null || true  # 修复
-            sudo systemctl start "$svc" 2>/dev/null || true  # 修复
+            sudo systemctl enable "$svc" 2>/dev/null || true
+            sudo systemctl start "$svc" 2>/dev/null || true
             sleep 1
           done
           
-          if [ "${{ env.HAS_SNAPSHOT }}" = "true" ]; then  # 修复
+          if [ "${{ env.HAS_SNAPSHOT }}" = "true" ]; then
             echo "✅ 服务启动完成（已恢复历史数据）"
           else
             echo "✅ 服务启动完成！首次部署请访问 http://<服务器IP> 初始化"
           fi
 
       - name: 9-Tailscale远程组网（可选）
-        if: ${{ env.TAILSCALE_AUTH_KEY != '' }}  # 修复：$和{{无空格
+        if: ${{ env.TAILSCALE_AUTH_KEY != '' }}
         run: |
           set -e
           echo "===== 配置Tailscale组网 ====="
@@ -233,47 +239,47 @@ jobs:
             sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y tailscale -qq
           sudo systemctl enable --now tailscaled && sleep 2
-          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" \  # 修复
-            --hostname="CasaOS-$(hostname | cut -c1-8)" --accept-routes --advertise-exit-node 2>/dev/null || true  # 修复
-          TAIL_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取中...")  # 修复
-          echo "✅ Tailscale组网完成 | 节点名: CasaOS-$(hostname | cut -c1-8) | IP: $TAIL_IP"  # 修复
+          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="CasaOS-$(hostname | cut -c1-8)" --accept-routes --advertise-exit-node 2>/dev/null || true
+          TAIL_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取中...")
+          echo "✅ Tailscale组网完成 | 节点名: CasaOS-$(hostname | cut -c1-8) | IP: $TAIL_IP"
 
       - name: 10-个人数据备份+保留2份清理（服务安全暂停）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}  # 修复：$和{{无空格
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
           echo "===== 执行安全备份（服务暂停保障数据一致性） ====="
           
           echo "⏸️ 暂停Docker与CasaOS服务（保障备份一致性）"
           sudo systemctl stop docker containerd
-          for svc in $CASA_SERVICES; do  # 修复
-            sudo systemctl stop "$svc" 2>/dev/null || true  # 修复
+          for svc in $CASA_SERVICES; do
+            sudo systemctl stop "$svc" 2>/dev/null || true
           done
           sleep 3
           
           cleanup_old_backups() {
-            local backups=$(rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf | \  # 修复
+            local backups=$(rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /home/runner/.rclone.conf | \
               grep "casaos-full-snapshot" | awk '{print $2}' | sort -r)
-            local count=$(echo "$backups" | wc -l)  # 修复
-            if [ "$count" -gt "$KEEP_BACKUPS" ]; then  # 修复
-              echo "🧹 清理旧备份（保留最新 $KEEP_BACKUPS 份）"  # 修复
-              echo "$backups" | tail -n +$((KEEP_BACKUPS + 1)) | while read file; do  # 修复
-                rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/$file" --config /home/runner/.rclone.conf && \  # 修复
-                  echo "✅ 已删除：$file"  # 修复
+            local count=$(echo "$backups" | wc -l)
+            if [ "$count" -gt "$KEEP_BACKUPS" ]; then
+              echo "🧹 清理旧备份（保留最新 $KEEP_BACKUPS 份）"
+              echo "$backups" | tail -n +$((KEEP_BACKUPS + 1)) | while read file; do
+                rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/$file" --config /home/runner/.rclone.conf && \
+                  echo "✅ 已删除：$file"
               done
             fi
           }
           
-          SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"  # 修复
-          SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"  # 修复
+          SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
+          SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           
-          if sudo tar -czPf "$SNAPSHOT_PATH" --exclude=${EXCLUDE_RULES} $PERSONAL_DATA_DIRS 2>/dev/null; then  # 修复
-            echo "📦 本地打包完成：$(du -h "$SNAPSHOT_PATH" | awk '{print $1}')"  # 修复
-            if rclone copy "$SNAPSHOT_PATH" "mywebdav:${WEBDAV_SNAPSHOT_DIR}/" \  # 修复
+          if sudo tar -czPf "$SNAPSHOT_PATH" --exclude=${EXCLUDE_RULES} $PERSONAL_DATA_DIRS 2>/dev/null; then
+            echo "📦 本地打包完成：$(du -h "$SNAPSHOT_PATH" | awk '{print $1}')"
+            if rclone copy "$SNAPSHOT_PATH" "mywebdav:${WEBDAV_SNAPSHOT_DIR}/" \
               --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3; then
-              if rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null; then  # 修复
-                echo "✅ 备份上传成功：$SNAPSHOT_NAME"  # 修复
-                sudo rm -f "$SNAPSHOT_PATH"  # 修复
+              if rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null; then
+                echo "✅ 备份上传成功：$SNAPSHOT_NAME"
+                sudo rm -f "$SNAPSHOT_PATH"
                 cleanup_old_backups
                 BACKUP_SUCCESS="true"
               else
@@ -293,36 +299,34 @@ jobs:
           sudo systemctl start docker containerd
           for svc in casaos-gateway casaos-message-bus casaos-user-service \
                      casaos-local-storage casaos-app-management casaos; do
-            sudo systemctl start "$svc" 2>/dev/null || true  # 修复
+            sudo systemctl start "$svc" 2>/dev/null || true
             sleep 0.5
           done
           
-          if [ "$BACKUP_SUCCESS" = "true" ] && [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then  # 修复
+          if [ "$BACKUP_SUCCESS" = "true" ] && [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
             echo "🔄 触发自动续跑（保留备份链）"
             curl -fsSL -X POST \
-              -H "Authorization: token $USER_PAT" \  # 修复
+              -H "Authorization: token $USER_PAT" \
               -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/$REPO/dispatches \  # 修复
+              https://api.github.com/repos/$REPO/dispatches \
               -d '{"event_type":"renew_casaos_snapshot"}' 2>/dev/null && \
               echo "✅ 续跑触发成功" || echo "⚠️ 续跑触发失败（不影响本次部署）"
           fi
           
-          [ "$BACKUP_SUCCESS" = "true" ] && echo "✅ 全流程备份完成" || echo "⚠️ 备份流程存在异常（服务已恢复）"  # 修复
+          [ "$BACKUP_SUCCESS" = "true" ] && echo "✅ 全流程备份完成" || echo "⚠️ 备份流程存在异常（服务已恢复）"
 
       - name: 11-收尾清理（保留roots权限配置）
-        if: ${{ always() }}  # 修复：$和{{无空格
+        if: ${{ always() }}
         run: |
           set -e
           echo "===== 收尾清理 ====="
-          # 保留 roots 用户 sudo 权限（关键：避免部署后无法管理）
-          # sudo rm -f /etc/sudoers.d/roots  # 已注释：保留长期管理能力
           sudo rm -rf /tmp/* /home/runner/.rclone.conf 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           
           echo ""
           echo "🎉 CasaOS 部署全流程完成！"
           echo "✅ 访问 http://<服务器IP> 进入初始化（首次部署）"
-          echo "✅ 备份策略：WebDAV 保留最新 $KEEP_BACKUPS 份快照"  # 修复
+          echo "✅ 备份策略：WebDAV 保留最新 $KEEP_BACKUPS 份快照"
           echo "✅ 仓库状态：仅当前工作流可执行，其他工作流已禁用"
           echo "✅ 管理用户：roots（sudo免密，密码见步骤4输出）"
           echo "⚠️ 重要提示：本工作流必须在【自托管Runner】（即目标服务器）上运行！"
