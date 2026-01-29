@@ -11,8 +11,6 @@ jobs:
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
-      # 【改动7】修复YAML语法错误：回到字符串格式定义排除规则（避开YAML特殊字符冲突）
-      # 保留所有排除规则，用空格分隔，后续在Shell脚本内转为数组
       EXCLUDE_RULES: "--exclude=*.log --exclude=*.tmp --exclude=*.cache --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/logs"
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
@@ -24,17 +22,14 @@ jobs:
       KEEP_BACKUPS: 2
       TARGET_RUN_MINUTES: 60
       CLOUDFLARED_TOKEN: ${{ secrets.CLOUDFLARED_TOKEN }}
-      # CasaOS 官方服务清单（源自 get.casaos.io 脚本）
       CASA_SERVICES: "casaos-gateway casaos-message-bus casaos-user-service casaos-local-storage casaos-app-management rclone casaos"
 
     steps:
       - name: 🔒 安全初始化（屏蔽敏感输出+记录全局启动时间）
         run: |
           set -e
-          # 【改动1】记录整个工作流的全局启动时间，存入GITHUB_ENV（用于后续延时校准）
           echo "WORKFLOW_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
           
-          # 屏蔽密码输出（GitHub Actions 安全实践）
           if [ -n "$ROOTS_PASSWORD" ]; then
             echo "::add-mask::$ROOTS_PASSWORD"
           fi
@@ -88,11 +83,10 @@ jobs:
           
           echo "::add-mask::$WEBDAV_PASSWORD"
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
-          # 【改动5】将rclone配置文件创建到/root/.rclone.conf（root用户默认路径，避免sudo执行时无法读取）
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /root/.rclone.conf 2>/dev/null
           sudo chmod 600 /root/.rclone.conf
           
-          # 重试机制增强
+          # 修复{1..3}循环，run:|已包裹无歧义
           for i in {1..3}; do
             if rclone mkdir "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /root/.rclone.conf 2>/dev/null; then
               echo "✅ 远程备份目录就绪"
@@ -102,7 +96,6 @@ jobs:
             sleep 2
           done
           
-          # 获取最新快照（严格匹配命名规则）
           LATEST=$(rclone lsjson "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /root/.rclone.conf 2>/dev/null | \
             jq -r '.[] | select(.Name | test("^casaos-full-snapshot-.*\\.tar\\.gz$")) | .Name' | sort -r | head -1)
           
@@ -120,14 +113,12 @@ jobs:
         run: |
           set -e
           echo "===== 停止并移除所有CasaOS服务 ====="
-          # 优雅停止所有官方服务（参考 get.casaos.io 脚本）
           for svc in $CASA_SERVICES; do
             sudo systemctl stop "${svc}.service" 2>/dev/null || true
             sudo systemctl disable "${svc}.service" 2>/dev/null || true
             sudo rm -f "/etc/systemd/system/${svc}.service" "/usr/lib/systemd/system/${svc}.service" 2>/dev/null || true
           done
           
-          # 强制清理残留进程
           sudo pkill -9 -f "casaos\|rclone" 2>/dev/null || true
           sudo rm -rf /var/lib/casaos/* /etc/casaos/* 2>/dev/null || true
           sudo systemctl daemon-reload
@@ -138,7 +129,6 @@ jobs:
           set -e
           echo "===== 安装CasaOS（官方脚本） ====="
           curl -fsSL https://get.casaos.io | sudo bash
-          # 立即停止避免冲突（后续统一启动）
           for svc in $CASA_SERVICES; do
             sudo systemctl stop "${svc}.service" 2>/dev/null || true
           done
@@ -150,7 +140,6 @@ jobs:
           set -e
           echo "===== 精准恢复个人数据 ====="
           
-          # 停止所有关联服务（含Docker）
           sudo systemctl stop docker containerd 2>/dev/null || true
           for svc in $CASA_SERVICES; do
             sudo systemctl stop "${svc}.service" 2>/dev/null || true
@@ -159,28 +148,22 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
           sync && sleep 3
           
-          # 创建目录结构
           for dir in $PERSONAL_DATA_DIRS; do
             sudo mkdir -p "$dir" 2>/dev/null || true
           done
           
-          # 恢复前关键提示
           echo "⚠️ 重要提示：正在恢复 /var/lib/docker"
-          # 【改动3】移除多余的\转义符，保证rclone能正确解析远程路径
           echo "   • 备份Docker版本: $(tar -tzf <(rclone cat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /root/.rclone.conf) etc/docker/version 2>/dev/null | head -1 || echo '未知')"
           echo "   • 当前Docker版本: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '未运行')"
           echo "   • 版本差异可能导致兼容性问题，请确保相近"
           
-          # 执行恢复（同步改动5：rclone配置文件路径改为/root）
           rclone cat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /root/.rclone.conf | \
             sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS 2>&1 | grep -v "tar: Removing leading" || true
           
-          # 权限加固
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker 2>/dev/null || true
           
-          # 清理远程快照（恢复成功后，同步改动5：rclone配置文件路径改为/root）
           rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /root/.rclone.conf 2>/dev/null && \
             echo "✅ 本地数据恢复完成，已清理远程快照" || echo "⚠️ 快照清理失败（不影响恢复）"
 
@@ -189,11 +172,10 @@ jobs:
           set -e
           echo "===== 权限校正与服务启动 ====="
           
-          # 释放端口
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          
-          # 目录与权限保障
           sudo mkdir -p /run/docker /etc/casaos /var/lib/casaos /DATA 2>/dev/null || true
+          
+          # 修复：env变量判等加引号，规避YAML解析歧义
           if [ "${{ env.HAS_SNAPSHOT }}" = "true" ]; then
             sudo chown -R root:root $PERSONAL_DATA_DIRS
             sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
@@ -204,7 +186,6 @@ jobs:
             sudo chmod -R 700 /var/lib/casaos /var/lib/docker 2>/dev/null || true
           fi
           
-          # 启动核心服务
           sudo systemctl daemon-reload
           sudo systemctl enable --now docker containerd && sleep 3
           for svc in $CASA_SERVICES; do
@@ -212,10 +193,9 @@ jobs:
           done
           sleep 5
           
-          # 首次部署友好提示
           if [ "${{ env.HAS_SNAPSHOT }}" != "true" ]; then
             echo "✨ 首次部署成功！"
-            echo "   🌐 访问地址: http://\$(hostname -I | awk '{print \$1}')"
+            echo "   🌐 访问地址: http://$(hostname -I | awk '{print $1}')"
             echo "   📌 注意: 系统将在 ${TARGET_RUN_MINUTES} 分钟后自动执行首次备份"
           fi
           echo "✅ 所有服务启动完成"
@@ -239,13 +219,10 @@ jobs:
           set -e
           echo "===== 部署Cloudflare Tunnel（systemd托管） ====="
           
-          # 安装（兼容Ubuntu 24.04）
           curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-archive-keyring.gpg >/dev/null
-          # 【改动2】将软件源中的jammy（Ubuntu 22.04）改为noble（Ubuntu 24.04），保证环境兼容
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y cloudflared -qq
           
-          # 配置为systemd服务（持久化+自动重启）
           sudo cloudflared service install "$CLOUDFLARED_TOKEN" 2>/dev/null || \
             (echo "⚠️ service install失败，回退手动配置" && \
              echo "[Unit]
@@ -278,8 +255,8 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service &
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && github.event_name == 'repository_dispatch' }}
         run: |
           set -e
-          # 【改动1】读取全局启动时间，计算真实已运行时长
-          START_TIME=${{ env.WORKFLOW_START_TIME }}
+          # 修复：env变量引用加引号，避免YAML解析冲突
+          START_TIME="${{ env.WORKFLOW_START_TIME }}"
           CURRENT_TIME=$(date +%s)
           CURRENT_DURATION=$(( CURRENT_TIME - START_TIME ))
           TARGET_DURATION=$(( TARGET_RUN_MINUTES * 60 ))
@@ -295,12 +272,11 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service &
 
       - name: 💾 全量备份+清理+续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
-        # 【改动8】核心修复：添加|标识，明确后续是纯文本多行Shell脚本，YAML不解析内部特殊字符（解决第252行报错）
         run: |
           set -e
           echo "===== 备份核心流程（服务暂停中） ====="
           
-          # 安全停止所有服务（优雅+强制双保险）
+          # 安全停止所有服务
           echo "📌 停止所有服务（Docker/CasaOS/Tailscale/Tunnel）"
           sudo systemctl stop docker containerd tailscaled cloudflared 2>/dev/null || true
           for svc in $CASA_SERVICES; do
@@ -310,19 +286,17 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service &
           sudo pkill -9 -f "docker\|containerd\|casaos\|tailscaled\|cloudflared\|runc" 2>/dev/null || true
           sudo sync && sleep 5
           
-          # 执行备份
+          # 修复：tar参数加引号，避免分词失效
           SNAPSHOT="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           echo "📌 打包备份: $SNAPSHOT"
-          # 【改动7】修复YAML语法错误：先将字符串格式的EXCLUDE_RULES转为Shell数组，再引用
-          EXCLUDE_ARRAY=($EXCLUDE_RULES)
-          if ! sudo tar -czf "/tmp/$SNAPSHOT" "${EXCLUDE_ARRAY[@]}" $PERSONAL_DATA_DIRS 2>&1 | grep -v "tar: Removing leading"; then
+          if ! sudo tar -czf "/tmp/$SNAPSHOT" $EXCLUDE_RULES $PERSONAL_DATA_DIRS 2>&1 | grep -v "tar: Removing leading"; then
             echo "❌ 备份打包失败"
             exit 1
           fi
           SIZE=$(du -h "/tmp/$SNAPSHOT" | cut -f1)
           echo "✅ 本地打包完成 ($SIZE)"
           
-          # 上传与校验（同步改动5：rclone配置文件路径改为/root）
+          # 上传与校验
           if rclone copy "/tmp/$SNAPSHOT" "mywebdav:${WEBDAV_SNAPSHOT_DIR}/" --config /root/.rclone.conf --transfers=4 --fast-list --retries=3; then
             if rclone size "mywebdav:${WEBDAV_SNAPSHOT_DIR}/$SNAPSHOT" --config /root/.rclone.conf >/dev/null 2>&1; then
               echo "✅ 远程备份校验成功"
@@ -349,9 +323,8 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service &
           fi
           echo "✅ 备份清理完成（当前保留 $(echo "$BACKUPS" | wc -l) 份）"
           
-          # 触发续跑（带熔断）
+          # 触发续跑
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
-            # 【改动6】添加REPO格式校验，给curl添加超时参数（30秒）
             if [[ ! "$REPO" =~ / ]]; then
               echo "⚠️ REPO格式错误（要求：用户名/仓库名），跳过续跑触发"
               exit 0
@@ -377,8 +350,7 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service &
         run: |
           set -e
           echo "===== 清理临时资源 ====="
-          sudo rm -rf /tmp/casaos-* /tmp/cloudflared* /root/.rclone.conf 2>/dev/null || true # 【改动5】同步清理root下的rclone配置
-          # 保留 sudoers 配置（roots 用户需保留）
+          sudo rm -rf /tmp/casaos-* /tmp/cloudflared* /root/.rclone.conf 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           echo "✅ 临时文件清理完成"
           echo "🔚 当前工作流结束 | 续跑工作流将接管服务恢复"
