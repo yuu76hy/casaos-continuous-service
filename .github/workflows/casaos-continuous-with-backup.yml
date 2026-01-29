@@ -181,24 +181,30 @@ jobs:
         if: ${{ env.CLOUDFLARED_TOKEN != '' }}
         run: |
           set -e
+          # 安装Cloudflared
           curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y cloudflared -qq
-          sudo cloudflared service install "$CLOUDFLARED_TOKEN" 2>/dev/null
-          if [ $? -ne 0 ]; then
-            echo "[Unit]
+          
+          # 配置systemd服务（避免YAML换行解析错误）
+          sudo bash -c 'cat > /etc/systemd/system/cloudflared.service << EOF
+[Unit]
 Description=Cloudflare Tunnel
 After=network.target
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/cloudflared tunnel run --token $CLOUDFLARED_TOKEN
 Restart=always
 RestartSec=10
+
 [Install]
-WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service >/dev/null
-            sudo systemctl daemon-reload
-            sudo systemctl enable --now cloudflared
-          fi
+WantedBy=multi-user.target
+EOF'
+          
+          # 启动服务
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now cloudflared
           sleep 8
           if sudo systemctl is-active --quiet cloudflared; then
             echo "✅ Tunnel运行中"
