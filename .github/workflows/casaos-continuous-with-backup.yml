@@ -23,7 +23,7 @@ jobs:
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
       TARGET_RUN_MINUTES: 60
-      CLOUDFLARED_TOKEN: ${{ secrets.CLOUDFLARED_TUNNEL_TOKEN }}
+      CLOUDFLARED_TOKEN: ${{ secrets.CLOUDFLARED_TOKEN }}
       # CasaOS 官方服务清单（源自 get.casaos.io 脚本）
       CASA_SERVICES: "casaos-gateway casaos-message-bus casaos-user-service casaos-local-storage casaos-app-management rclone casaos"
 
@@ -295,6 +295,7 @@ WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service &
 
       - name: 💾 全量备份+清理+续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
+        # 【改动8】核心修复：添加|标识，明确后续是纯文本多行Shell脚本，YAML不解析内部特殊字符（解决第252行报错）
         run: |
           set -e
           echo "===== 备份核心流程（服务暂停中） ====="
