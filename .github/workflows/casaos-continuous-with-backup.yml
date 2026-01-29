@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（300分钟备份+先续跑再关流+停进程保完整）
+name: CasaOS纯净部署（无优化+部署恢复分离+10分钟备份续跑关流）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -7,7 +7,7 @@ on:
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360  # 360分钟冗余，防流程中途中断
+    timeout-minutes: 360  # 360分钟冗余防中断
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -21,8 +21,9 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      DELAY_TOTAL_MIN: 300  # 固定300分钟延时，直观好改
-      CORE_SERVICES: "docker containerd casaos" # 核心进程统一管控
+      DELAY_TOTAL_MIN: 10  # 已修改：300分钟 → 10分钟
+      CORE_SERVICES: "docker containerd casaos" # 核心进程管控
+      REQUIRED_PERMISSIONS: "755 644" # 权限校验模板
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -102,96 +103,111 @@ jobs:
           sleep 3
           echo "✅ Tailscale组网成功，IP：$(tailscale ip -4)"
 
-      - name: 6-CasaOS部署+快照恢复（不删备份）
+      - name: 6-CasaOS基础部署（仅系统，不恢复数据）
         run: |
           set -e
-          echo "===== CasaOS部署&快照恢复 ====="
+          echo "===== CasaOS基础部署（仅系统，不恢复数据） ====="
           if [ "$HAS_SNAPSHOT" = "false" ]; then
             curl -fsSL https://get.casaos.io | sudo bash
             sudo systemctl enable --now casaos && sleep 5
-            echo "✅ CasaOS全新部署完成"
-            exit 0
+            echo "✅ CasaOS全新部署完成（无数据恢复）"
+          else
+            curl -fsSL https://get.casaos.io | sudo bash
+            sudo systemctl stop casaos 2>/dev/null
+            echo "✅ CasaOS基础部署完成，等待数据恢复"
           fi
-          LATEST_SNAPSHOT=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep .tar.gz | sort -r | head -n1 | awk '{print $2}')
-          rclone copy mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" /tmp/ --config /home/runner/.rclone.conf
-          sudo tar -zxf /tmp/"$LATEST_SNAPSHOT" -C / --preserve-permissions --exclude=proc --exclude=sys --exclude=dev --exclude=tmp
-          sudo rm -f /tmp/"$LATEST_SNAPSHOT"
-          sudo systemctl restart $CORE_SERVICES && sleep 5
-          echo "✅ CasaOS快照恢复完成，备份保留完整"
 
-      - name: 7-系统基础优化
+      - name: 7-个人数据恢复+完整权限校验（独立步骤，不删备份）
         run: |
           set -e
-          echo "===== 系统基础优化 ====="
-          sudo apt update -y -qq && sudo apt upgrade -y -qq
-          sudo systemctl disable --now apt-daily.service apt-daily-upgrade.service
-          sudo timedatectl set-timezone Asia/Shanghai
-          echo "✅ 系统优化完成"
+          echo "===== 个人数据恢复+权限完整性校验 ====="
+          if [ "$HAS_SNAPSHOT" = "false" ] || [ "$WEBDAV_AVAILABLE" = "false" ]; then
+            echo "ℹ️ 无备份或WebDAV不可用，跳过数据恢复"
+            exit 0
+          fi
+          # 下载最新备份
+          LATEST_SNAPSHOT=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep .tar.gz | sort -r | head -n1 | awk '{print $2}')
+          echo "📥 下载最新备份：${LATEST_SNAPSHOT}"
+          rclone copy mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" /tmp/ --config /home/runner/.rclone.conf
+          # 恢复个人数据（保留原始权限）
+          echo "🔄 恢复个人核心数据目录"
+          sudo tar -zxf /tmp/"$LATEST_SNAPSHOT" -C / --preserve-permissions --exclude=proc --exclude=sys --exclude=dev --exclude=tmp
+          sudo rm -f /tmp/"$LATEST_SNAPSHOT" # 仅删本地临时包，不删WebDAV备份
+          # 权限完整性校验+自动修复
+          echo "🔍 权限校验与修复"
+          PERMISSION_ERROR=0
+          for dir in $PERSONAL_DATA_DIRS; do
+            CURRENT_PERM=$(stat -c "%a" "$dir")
+            if [[ ! " $REQUIRED_PERMISSIONS " =~ " $CURRENT_PERM " ]]; then
+              echo "⚠️ 权限异常：${dir} 当前${CURRENT_PERM}，修复为755"
+              sudo chmod 755 "$dir"
+              PERMISSION_ERROR=1
+            fi
+          done
+          # Docker socket权限专项校验
+          [ -S /var/run/docker.sock ] && [ $(stat -c "%a" /var/run/docker.sock) -ne 660 ] && sudo chmod 660 /var/run/docker.sock && echo "✅ Docker socket权限修复完成"
+          # 重启生效
+          sudo systemctl restart $CORE_SERVICES && sleep 5
+          [ $PERMISSION_ERROR -eq 0 ] && echo "✅ 数据恢复+权限校验全完成" || echo "✅ 数据恢复完成，权限异常已修复"
 
-      - name: 8-300分钟倒计时+停进程备份+先续跑再关当前流
+      - name: 8-10分钟倒计时+停进程备份+先续跑再关流
         run: |
           set -e
           echo "⏳ 开始${DELAY_TOTAL_MIN}分钟倒计时，每分钟更新剩余时间"
-          # 实时倒计时可视化，进度清晰
           for ((i=${DELAY_TOTAL_MIN};i>0;i--)); do
             echo "⌛ 剩余延时：${i}分钟（总计${DELAY_TOTAL_MIN}分钟）"
             sleep 60
           done
-          echo "🎉 300分钟倒计时结束，启动备份（先停进程保数据完整）"
+          echo "🎉 倒计时结束，停进程开始备份"
           
-          # 1 关停所有进程，杜绝读写，保障备份纯净
-          echo "🛑 关停所有核心进程及残留进程"
+          # 停所有进程保备份纯净
+          echo "🛑 关停核心进程"
           sudo systemctl stop $CORE_SERVICES 2>/dev/null
           sudo pkill -f docker 2>/dev/null && sudo pkill -f casaos 2>/dev/null
-          echo "✅ 所有进程已关停，可安全备份"
+          echo "✅ 进程已关停，开始备份"
           
-          # 2 完整备份流程，分步进度可视化
+          # 完整备份流程（带进度）
           SNAPSHOT_NAME="casaos-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           echo "📥 【备份1/4】创建本地备份包：${SNAPSHOT_NAME}"
           sudo tar -zcvf /tmp/"$SNAPSHOT_NAME" $EXCLUDE_RULES $PERSONAL_DATA_DIRS --preserve-permissions
-          echo "✅ 【备份2/4】本地备份完成：/tmp/${SNAPSHOT_NAME}"
-          
-          echo "📤 【备份3/4】上传WebDAV（实时进度条）"
+          echo "✅ 【备份2/4】本地备份完成"
+          echo "📤 【备份3/4】上传WebDAV（实时进度）"
           rclone copy -P /tmp/"$SNAPSHOT_NAME" mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf
-          echo "✅ 【备份4/4】上传完成，存储路径：${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}"
+          echo "✅ 【备份4/4】上传完成"
           
-          # 3 清理旧备份，保留最新2份
+          # 清理旧备份（保留2份）
           echo "🧹 清理旧备份，保留最新${KEEP_BACKUPS}份"
           BACKUPS_LIST=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep .tar.gz | sort -r | awk '{print $2}')
           BACKUPS_COUNT=$(echo "$BACKUPS_LIST" | wc -l)
           if [ "$BACKUPS_COUNT" -gt "$KEEP_BACKUPS" ]; then
             DELETE_LIST=$(echo "$BACKUPS_LIST" | tail -n $((BACKUPS_COUNT - KEEP_BACKUPS)))
-            echo "🗑️ 待删旧备份：${DELETE_LIST}"
             for backup in $DELETE_LIST; do rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$backup" --config /home/runner/.rclone.conf; done
             echo "✅ 旧备份清理完成"
           else
-            echo "ℹ️ 当前备份${BACKUPS_COUNT}份，无需清理"
+            echo "ℹ️ 无需清理"
           fi
           sudo rm -f /tmp/"$SNAPSHOT_NAME"
           
-          # 4 重启进程，恢复服务正常运行
-          echo "🔄 重启核心进程，恢复CasaOS服务"
+          # 重启进程恢复服务
+          echo "🔄 重启核心进程恢复服务"
           sudo systemctl restart $CORE_SERVICES && sleep 8
-          sudo systemctl is-active --quiet $CORE_SERVICES && echo "✅ 所有进程重启成功，服务正常" || echo "⚠️ 进程重启异常，请核查"
+          sudo systemctl is-active --quiet $CORE_SERVICES && echo "✅ 服务恢复正常" || echo "⚠️ 进程重启异常"
           
-          # 核心顺序：备份完成 ✔️→ 先触发续跑 ✔️→ 再关闭当前工作流 ✔️ 顺序绝不颠倒
+          # 核心顺序：备份完成→先续跑→再关当前流
           echo "====================================="
-          echo "📌 备份全流程完成，开始执行续跑+关流"
-          # 第一步：触发续跑工作流，确保新实例启动
-          echo "🔄 第一步：触发备份续跑工作流"
+          echo "📌 备份完成，执行续跑+关流"
+          echo "🔄 第一步：触发续跑工作流"
           curl -X POST https://api.github.com/repos/${REPO}/dispatches \
           -H "Authorization: token ${USER_PAT}" \
           -H "Accept: application/vnd.github+json" \
           -d '{"event_type":"renew_casaos_snapshot"}'
-          echo "✅ 续跑工作流触发成功，新实例已启动"
-          
-          # 第二步：续跑触发成功后，关闭当前运行的旧工作流
-          echo "🔚 第二步：关闭当前工作流实例"
+          echo "✅ 续跑触发成功"
+          echo "🔚 第二步：关闭当前工作流"
           gh auth login --with-token <<< "${USER_PAT}"
           RUN_ID=$(jq -r ".run_id" "$GITHUB_EVENT_PATH")
           gh api -X POST repos/${REPO}/actions/runs/${RUN_ID}/cancel
-          echo "✅ 当前工作流（ID:${RUN_ID}）已成功关闭"
-          echo "📌 全流程结束：续跑已触发，当前流已关闭"
+          echo "✅ 当前工作流（ID:${RUN_ID}）已关闭"
+          echo "📌 全流程结束"
           echo "====================================="
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
