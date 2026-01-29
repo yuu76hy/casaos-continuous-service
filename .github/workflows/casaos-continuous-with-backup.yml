@@ -185,23 +185,19 @@ jobs:
           curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y cloudflared -qq
-          
-          # 配置systemd服务（彻底规避YAML换行解析错误）
+          # 配置systemd服务（无复杂嵌套，规避YAML解析错误）
           sudo bash -c 'cat > /etc/systemd/system/cloudflared.service << EOF
 [Unit]
 Description=Cloudflare Tunnel
 After=network.target
-
 [Service]
 Type=simple
 ExecStart=/usr/bin/cloudflared tunnel run --token $CLOUDFLARED_TOKEN
 Restart=always
 RestartSec=10
-
 [Install]
 WantedBy=multi-user.target
 EOF'
-          
           # 启动服务
           sudo systemctl daemon-reload
           sudo systemctl enable --now cloudflared
