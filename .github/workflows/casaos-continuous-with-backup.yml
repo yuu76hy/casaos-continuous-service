@@ -76,12 +76,16 @@ jobs:
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /root/.rclone.conf 2>/dev/null
           sudo chmod 600 /root/.rclone.conf
-          for i in {1..3}; do
+          for i in 1 2 3; do
             if rclone mkdir "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /root/.rclone.conf 2>/dev/null; then
               echo "✅ 远程目录就绪"
               break
             fi
-            [ $i -eq 3 ] && { echo "❌ 远程目录不可达"; echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"; exit 0; }
+            if [ $i -eq 3 ]; then
+              echo "❌ 远程目录不可达"
+              echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+              exit 0
+            fi
             sleep 2
           done
           LATEST=$(rclone lsjson "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /root/.rclone.conf 2>/dev/null | jq -r '.[] | select(.Name | test("^casaos-full-snapshot-.*\\.tar\\.gz$")) | .Name' | sort -r | head -1)
@@ -180,7 +184,9 @@ jobs:
           curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/cloudflared noble main" | sudo tee /etc/apt/sources.list.d/cloudflared.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y cloudflared -qq
-          sudo cloudflared service install "$CLOUDFLARED_TOKEN" 2>/dev/null || (echo "⚠️ 回退手动配置" && echo "[Unit]
+          sudo cloudflared service install "$CLOUDFLARED_TOKEN" 2>/dev/null
+          if [ $? -ne 0 ]; then
+            echo "[Unit]
 Description=Cloudflare Tunnel
 After=network.target
 [Service]
@@ -189,7 +195,10 @@ ExecStart=/usr/bin/cloudflared tunnel run --token $CLOUDFLARED_TOKEN
 Restart=always
 RestartSec=10
 [Install]
-WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service && sudo systemctl daemon-reload && sudo systemctl enable --now cloudflared)
+WantedBy=multi-user.target" | sudo tee /etc/systemd/system/cloudflared.service >/dev/null
+            sudo systemctl daemon-reload
+            sudo systemctl enable --now cloudflared
+          fi
           sleep 8
           if sudo systemctl is-active --quiet cloudflared; then
             echo "✅ Tunnel运行中"
