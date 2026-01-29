@@ -116,8 +116,8 @@ jobs:
           done
           
           LATEST=$(rclone lsjson "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /root/.rclone.conf 2>/dev/null | \
-            jq -r '.[] | select(.Name | test("^casaos-full-snapshot-.*\\.tar\\.gz$")) | .Name' | sort -r | head -1)
-          if [ -n "$LATEST" ]; then
+            jq -r '.[] | select(.Name | test("^casaos-full-snapshot-.*\\.tar\\.gz$")) | .Name' | sort -r | head -1 || true)
+          if [ -n "$LATEST" ] && [ "$LATEST" != "null" ]; then
             echo "✅ 检测到最新快照：$LATEST"
             echo "LATEST_SNAPSHOT=$LATEST" >> $GITHUB_ENV
             echo "HAS_SNAPSHOT=true" >> $GITHUB_ENV
@@ -135,7 +135,7 @@ jobs:
             sudo systemctl disable "${svc}.service" 2>/dev/null || true
             sudo rm -f "/etc/systemd/system/${svc}.service" "/usr/lib/systemd/system/${svc}.service" 2>/dev/null || true
           done
-          sudo pkill -9 -f "casaos\|rclone" 2>/dev/null || true
+          sudo pkill -9 -f "casaos|rclone" 2>/dev/null || true
           sudo rm -rf /var/lib/casaos/* /etc/casaos/* 2>/dev/null || true
           sudo systemctl daemon-reload
 
@@ -168,7 +168,7 @@ jobs:
           
           echo "🔄 恢复快照：$LATEST_SNAPSHOT"
           rclone cat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT}" --config /root/.rclone.conf | \
-            sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS 2>&1 | grep -v "Removing leading" || true
+            sudo tar -xzf - -C / --preserve-permissions --overwrite $PERSONAL_DATA_DIRS 2>&1 | grep -v "Removing leading" || true
           
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
@@ -266,12 +266,7 @@ EOF
           
           echo "📦 生成快照：$SNAPSHOT_NAME"
           sudo tar -czf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS 2>/dev/null | \
-            rclone rcat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}" --config /root/.rclone.conf
-          
-          if ! rclone ls "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}" --config /root/.rclone.conf; then
-            echo "❌ 快照上传失败"
-            exit 1
-          fi
+            rclone rcat "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}" --config /root/.rclone.conf || { echo "❌ 快照上传失败"; exit 1; }
           
           sudo systemctl enable --now docker containerd
           for svc in $CASA_SERVICES; do
@@ -284,12 +279,12 @@ EOF
         run: |
           set -euo pipefail
           OLD_SNAPSHOTS=$(rclone lsjson "mywebdav:${WEBDAV_SNAPSHOT_DIR}" --config /root/.rclone.conf 2>/dev/null | \
-            jq -r '.[] | select(.Name | test("^casaos-full-snapshot-.*\\.tar\\.gz$")) | .Name' | sort -r | tail -n +$((KEEP_BACKUPS+1)))
+            jq -r '.[] | select(.Name | test("^casaos-full-snapshot-.*\\.tar\\.gz$")) | .Name' | sort -r | tail -n +$(( ${KEEP_BACKUPS:-2} + 1 )) || true)
           
-          if [ -n "$OLD_SNAPSHOTS" ]; then
+          if [ -n "$OLD_SNAPSHOTS" ] && [ "$OLD_SNAPSHOTS" != "null" ]; then
             for snap in $OLD_SNAPSHOTS; do
               echo "删除旧快照：$snap"
-              rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${snap}" --config /root/.rclone.conf 2>/dev/null
+              rclone delete "mywebdav:${WEBDAV_SNAPSHOT_DIR}/${snap}" --config /root/.rclone.conf 2>/dev/null || true
             done
             echo "✅ 已保留最新${KEEP_BACKUPS}份快照"
           else
@@ -309,6 +304,8 @@ EOF
           if [ $WAIT_TIME -gt 0 ]; then
             echo "⏳ 等待$((WAIT_TIME / 60))分钟以满足运行时长要求"
             sleep $WAIT_TIME
+          else
+            echo "ℹ️ 运行时长已达标，无需等待"
           fi
 
       - name: 📊 部署完成报告
