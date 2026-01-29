@@ -7,7 +7,7 @@ on:
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 360  # 核心修改1：超时时间改为360分钟
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -21,6 +21,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
+      TARGET_RUN_MINUTES: 60  # 新增：目标等待时长60分钟
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -155,6 +156,26 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale组网成功，内网IP：${TAILSCALE_IP:-未获取}"
+      - name: 8.5-延时校准，确保满60分钟再执行备份  # 核心修改2：新增延时步骤
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
+        run: |
+          set -e
+          echo "===== 延时校准，等待至工作流运行满${TARGET_RUN_MINUTES}分钟 ====="
+          # 记录当前已运行时长，计算剩余等待时间
+          START_TIME=$(date +%s)
+          export START_TIME
+          sleep 5
+          CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
+          TARGET_DURATION=$(( TARGET_RUN_MINUTES * 60 ))
+          WAIT_TIME=$(( TARGET_DURATION - CURRENT_DURATION ))
+          
+          if [ $WAIT_TIME -gt 0 ]; then
+            echo "当前已运行$((CURRENT_DURATION/60))分$((CURRENT_DURATION%60))秒，还需等待$((WAIT_TIME/60))分$((WAIT_TIME%60))秒"
+            sleep $WAIT_TIME
+          else
+            echo "已运行满${TARGET_RUN_MINUTES}分钟，直接执行后续备份流程"
+          fi
+          echo "✅ 延时校准完成，开始执行备份续跑"
       - name: 9-数据备份+清旧备份+触发续跑（核心流程）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -266,3 +287,4 @@ jobs:
           echo "🎉 CasaOS纯净部署+备份全流程执行完成！"
           echo "✅ 核心备份保留2份，自动清理完成，任务正常完结"
           echo "✅ 访问指引：服务器公网IP:80 或 Tailscale内网IP"
+          echo "🔚 工作流执行完毕，自动关闭"
