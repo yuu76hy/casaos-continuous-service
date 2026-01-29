@@ -21,9 +21,8 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      DELAY_TOTAL_MIN: 10  # 已修改：300分钟 → 10分钟
+      DELAY_TOTAL_MIN: 10  # 10分钟延时
       CORE_SERVICES: "docker containerd casaos" # 核心进程管控
-      REQUIRED_PERMISSIONS: "755 644" # 权限校验模板
 
     steps:
       - name: 1-系统初始化（极简版）
@@ -63,7 +62,7 @@ jobs:
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 用户配置完成"
 
-      - name: 4-WebDAV配置+快照检测+目录预创建
+      - name: 4-WebDAV配置+快照检测+目录预创建+变量赋值
         run: |
           set -e
           echo "===== WebDAV配置&快照检测&目录预创建 ====="
@@ -83,6 +82,9 @@ jobs:
             echo "✅ 检测到WebDAV备份快照"
             echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
             echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
+            # 提前赋值最新快照名，供后续恢复使用
+            LATEST_SNAPSHOT=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep .tar.gz | sort -r | head -n1 | awk '{print $2}')
+            echo "LATEST_SNAPSHOT=${LATEST_SNAPSHOT}" >> "$GITHUB_ENV"
           else
             echo "ℹ️ 无备份快照，全新部署"
             echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
@@ -107,50 +109,56 @@ jobs:
         run: |
           set -e
           echo "===== CasaOS基础部署（仅系统，不恢复数据） ====="
+          curl -fsSL https://get.casaos.io | sudo bash
           if [ "$HAS_SNAPSHOT" = "false" ]; then
-            curl -fsSL https://get.casaos.io | sudo bash
             sudo systemctl enable --now casaos && sleep 5
             echo "✅ CasaOS全新部署完成（无数据恢复）"
           else
-            curl -fsSL https://get.casaos.io | sudo bash
             sudo systemctl stop casaos 2>/dev/null
+            sudo systemctl stop docker containerd 2>/dev/null
             echo "✅ CasaOS基础部署完成，等待数据恢复"
           fi
 
-      - name: 7-个人数据恢复+完整权限校验（独立步骤，不删备份）
+      - name: 7-恢复个人数据（无快照自动跳过，恢复不删快照）
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 个人数据恢复+权限完整性校验 ====="
-          if [ "$HAS_SNAPSHOT" = "false" ] || [ "$WEBDAV_AVAILABLE" = "false" ]; then
-            echo "ℹ️ 无备份或WebDAV不可用，跳过数据恢复"
-            exit 0
-          fi
-          # 下载最新备份
-          LATEST_SNAPSHOT=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep .tar.gz | sort -r | head -n1 | awk '{print $2}')
-          echo "📥 下载最新备份：${LATEST_SNAPSHOT}"
-          rclone copy mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" /tmp/ --config /home/runner/.rclone.conf
-          # 恢复个人数据（保留原始权限）
-          echo "🔄 恢复个人核心数据目录"
-          sudo tar -zxf /tmp/"$LATEST_SNAPSHOT" -C / --preserve-permissions --exclude=proc --exclude=sys --exclude=dev --exclude=tmp
-          sudo rm -f /tmp/"$LATEST_SNAPSHOT" # 仅删本地临时包，不删WebDAV备份
-          # 权限完整性校验+自动修复
-          echo "🔍 权限校验与修复"
-          PERMISSION_ERROR=0
-          for dir in $PERSONAL_DATA_DIRS; do
-            CURRENT_PERM=$(stat -c "%a" "$dir")
-            if [[ ! " $REQUIRED_PERMISSIONS " =~ " $CURRENT_PERM " ]]; then
-              echo "⚠️ 权限异常：${dir} 当前${CURRENT_PERM}，修复为755"
-              sudo chmod 755 "$dir"
-              PERMISSION_ERROR=1
-            fi
-          done
-          # Docker socket权限专项校验
-          [ -S /var/run/docker.sock ] && [ $(stat -c "%a" /var/run/docker.sock) -ne 660 ] && sudo chmod 660 /var/run/docker.sock && echo "✅ Docker socket权限修复完成"
-          # 重启生效
-          sudo systemctl restart $CORE_SERVICES && sleep 5
-          [ $PERMISSION_ERROR -eq 0 ] && echo "✅ 数据恢复+权限校验全完成" || echo "✅ 数据恢复完成，权限异常已修复"
+          echo "===== 精准恢复个人数据 ====="
+          sudo systemctl stop docker containerd casaos 2>/dev/null || true
+          sudo pkill -9 docker containerd casaos 2>/dev/null || true
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
+          sync && sleep 2
+          sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
+          echo "📌 恢复目录清单：$PERSONAL_DATA_DIRS"
+          rclone cat mywebdav:${WEBDAV_SNAPSHOT_DIR}/${LATEST_SNAPSHOT} --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
+          sudo chown -R root:root $PERSONAL_DATA_DIRS
+          sudo chmod -R 755 /etc/casaos /DATA /root/.config
+          sudo chmod -R 700 /var/lib/casaos /var/lib/docker
+          echo "✅ 数据恢复完成，权限校正完毕【恢复不删快照】"
 
-      - name: 8-10分钟倒计时+停进程备份+先续跑再关流
+      - name: 8-权限校正+极速启动所有服务
+        run: |
+          set -e
+          echo "===== 权限校正+启动服务 ====="
+          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
+          sudo mkdir -p /run/docker 2>/dev/null || true
+          if [ "${{ env.HAS_SNAPSHOT }}" = "true" ]; then
+            sudo chown -R root:root $PERSONAL_DATA_DIRS
+            sudo chmod -R 755 /etc/casaos /DATA /root/.config
+            sudo chmod -R 700 /var/lib/casaos /var/lib/docker
+          else
+            sudo mkdir -p /etc/casaos /var/lib/casaos /DATA 2>/dev/null || true
+            sudo chown -R root:root /etc/casaos /var/lib/casaos /var/lib/docker
+            sudo chmod -R 755 /etc/casaos
+            sudo chmod -R 700 /var/lib/casaos /var/lib/docker
+          fi
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now docker containerd && sleep 3
+          sudo systemctl enable --now casaos && sleep 4
+          echo "✅ 所有服务启动完成"
+          echo "📌 访问地址：服务器IP（80端口）"
+
+      - name: 9-10分钟倒计时+停进程备份+保留2份删旧+先续跑再关流
         run: |
           set -e
           echo "⏳ 开始${DELAY_TOTAL_MIN}分钟倒计时，每分钟更新剩余时间"
@@ -175,16 +183,19 @@ jobs:
           rclone copy -P /tmp/"$SNAPSHOT_NAME" mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf
           echo "✅ 【备份4/4】上传完成"
           
-          # 清理旧备份（保留2份）
-          echo "🧹 清理旧备份，保留最新${KEEP_BACKUPS}份"
+          # 仅保留最新2份备份，其余全部删除（唯一清理逻辑）
+          echo "🧹 清理旧备份，仅保留最新${KEEP_BACKUPS}份"
           BACKUPS_LIST=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep .tar.gz | sort -r | awk '{print $2}')
           BACKUPS_COUNT=$(echo "$BACKUPS_LIST" | wc -l)
           if [ "$BACKUPS_COUNT" -gt "$KEEP_BACKUPS" ]; then
             DELETE_LIST=$(echo "$BACKUPS_LIST" | tail -n $((BACKUPS_COUNT - KEEP_BACKUPS)))
-            for backup in $DELETE_LIST; do rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$backup" --config /home/runner/.rclone.conf; done
-            echo "✅ 旧备份清理完成"
+            for backup in $DELETE_LIST; do
+              rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$backup" --config /home/runner/.rclone.conf
+              echo "🗑️ 删除旧备份：$backup"
+            done
+            echo "✅ 旧备份清理完成，保留最新${KEEP_BACKUPS}份"
           else
-            echo "ℹ️ 无需清理"
+            echo "ℹ️ 当前备份≤${KEEP_BACKUPS}份，无需清理"
           fi
           sudo rm -f /tmp/"$SNAPSHOT_NAME"
           
