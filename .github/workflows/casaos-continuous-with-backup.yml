@@ -226,57 +226,65 @@ jobs:
           echo "TAILSCALE_IP=${TAILSCALE_IP:-未获取}" >> "$GITHUB_ENV"
           echo "✅ Tailscale组网完成，内网IP：${TAILSCALE_IP:-未获取}"
 
-      # 10. 系统与备份清理（100%容错版）
-      - name: 10-系统垃圾与旧备份清理
+      # 10. 替换为你指定的「大类6：纯系统垃圾清理」（已修复错误）
+      - name: 6-纯系统垃圾清理（释放20+G｜仅删除无优化）
         if: ${{ always() }}
         run: |
-          set +e
-          # 系统清理（全容错，失败不影响流程）
-          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n /opt/hostedtoolcache /opt/runner-cache 2>/dev/null || true
+          set -e
+          echo "===== 大类6：纯系统垃圾清理（仅删除无优化） ====="
+          # 核心：删除19G无用第三方工具（Haskell/Julia/AWS+配套依赖）
+          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
+          # 删除GitHub Runner残留大缓存（/opt下所有无用缓存）
+          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
+          # 系统通用冗余清理：旧内核+apt缓存+过期日志（修复apt警告+容错）
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt autoclean -y 2>/dev/null || true
           sudo journalctl --vacuum-size=100M --vacuum-time=7d 2>/dev/null || true
+          # 清理所有临时文件+用户/系统缓存
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
+          # 刷新系统缓存，确保删除的文件彻底释放空间（修复权限问题）
           sudo sync
           sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
-          set -e
+          echo "✅ 大类6完成：纯垃圾清理完毕，释放20+G空间（19G工具+日志+缓存）"
 
-          # 旧备份清理（修复空值错误）
-          if [ "${WEBDAV_AVAILABLE}" = true ]; then
-            # 挂载模式清理
-            if [ "${USE_MOUNT}" = true ]; then
-              REMOTE_DIR="${LOCAL_MOUNT_POINT}${WEBDAV_SNAPSHOT_DIR}"
-              BACKUPS=$(ls -t "${REMOTE_DIR}"/casaos-full-snapshot*.tar.zst 2>/dev/null)
-              COUNT=$(printf "%s" "$BACKUPS" | wc -l)
-              if [ $COUNT -gt $KEEP_BACKUPS ]; then
-                echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | while read f; do
-                  if [ -n "$f" ]; then
-                    rm -f "$f" "${f}${SNAPSHOT_MD5_SUFFIX}"
-                    echo "🗑️ 挂载模式删除旧备份：$(basename "$f")"
-                  fi
-                done
-              fi
-            fi
-            # Rclone模式清理
-            if [ "${USE_RCLONE}" = true ]; then
-              BACKUPS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf | grep casaos-full-snapshot | grep tar.zst | sort -r | awk '{print $2}')
-              COUNT=$(printf "%s" "$BACKUPS" | wc -l)
-              if [ $COUNT -gt $KEEP_BACKUPS ]; then
-                echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | while read f; do
-                  if [ -n "$f" ]; then
-                    rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$f --config /home/runner/.rclone.conf
-                    rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/${f}${SNAPSHOT_MD5_SUFFIX} --config /home/runner/.rclone.conf
-                    echo "🗑️ Rclone模式删除旧备份：$f"
-                  fi
-                done
-              fi
+      # 11. 旧备份清理（保留原有逻辑，确保备份不堆积）
+      - name: 11-旧备份清理（双模式｜保留指定数量）
+        if: ${{ always() && env.WEBDAV_AVAILABLE == 'true' }}
+        run: |
+          set -e
+          # 挂载模式清理
+          if [ "${USE_MOUNT}" = true ]; then
+            REMOTE_DIR="${LOCAL_MOUNT_POINT}${WEBDAV_SNAPSHOT_DIR}"
+            BACKUPS=$(ls -t "${REMOTE_DIR}"/casaos-full-snapshot*.tar.zst 2>/dev/null)
+            COUNT=$(printf "%s" "$BACKUPS" | wc -l)
+            if [ $COUNT -gt $KEEP_BACKUPS ]; then
+              echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | while read f; do
+                if [ -n "$f" ]; then
+                  rm -f "$f" "${f}${SNAPSHOT_MD5_SUFFIX}"
+                  echo "🗑️ 挂载模式删除旧备份：$(basename "$f")"
+                fi
+              done
             fi
           fi
-          echo "✅ 系统与备份清理完成"
+          # Rclone模式清理
+          if [ "${USE_RCLONE}" = true ]; then
+            BACKUPS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf | grep casaos-full-snapshot | grep tar.zst | sort -r | awk '{print $2}')
+            COUNT=$(printf "%s" "$BACKUPS" | wc -l)
+            if [ $COUNT -gt $KEEP_BACKUPS ]; then
+              echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | while read f; do
+                if [ -n "$f" ]; then
+                  rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$f --config /home/runner/.rclone.conf
+                  rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/${f}${SNAPSHOT_MD5_SUFFIX} --config /home/runner/.rclone.conf
+                  echo "🗑️ Rclone模式删除旧备份：$f"
+                fi
+              done
+            fi
+          fi
+          echo "✅ 旧备份清理完成，保留最新${KEEP_BACKUPS}份备份"
 
-      # 11. 延时校准+重要信息汇总
-      - name: 11-延时校准与关键信息汇总
+      # 12. 延时校准+重要信息汇总
+      - name: 12-延时校准与关键信息汇总
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -308,8 +316,8 @@ jobs:
           echo "=================================================="
           echo "✅ 延时校准完成"
 
-      # 12. 打包备份（双模式自动切换）
-      - name: 12-数据打包与远程备份
+      # 13. 打包备份（双模式自动切换）
+      - name: 13-数据打包与远程备份
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -347,8 +355,8 @@ jobs:
           [ -n "$USER_PAT" ] && [ -n "$REPO" ] && curl -fsSL --fail -X POST -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" https://api.github.com/repos/$REPO/dispatches -d '{"event_type":"renew_casaos_snapshot"}'
           echo "✅ 全量备份完成，服务已重启"
 
-      # 13. 收尾清理与挂载卸载
-      - name: 13-收尾清理与环境还原
+      # 14. 收尾清理与挂载卸载
+      - name: 14-收尾清理与环境还原
         if: ${{ always() }}
         run: |
           set +e
