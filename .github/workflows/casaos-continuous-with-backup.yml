@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜全修复版）
+name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜最终完善版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -31,9 +31,11 @@ jobs:
         run: |
           set -e
           echo "WORKFLOW_START_TIMESTAMP=$(date +%s)" >> "$GITHUB_ENV"
-          sudo apt update -y -qq && sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg zstd davfs2 -qq
+          # 添加非交互参数，避免apt警告
+          sudo DEBIAN_FRONTEND=noninteractive apt update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg zstd davfs2 -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove -y -qq && sudo apt clean -y -qq
           INSTALL_RETRY=3
           while [ $INSTALL_RETRY -gt 0 ]; do
             curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun && break
@@ -218,25 +220,34 @@ jobs:
           set -e
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list
-          sudo apt update -y -qq && sudo apt install -y tailscale -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt update -y -qq && sudo DEBIAN_FRONTEND=noninteractive apt install -y tailscale -qq
           sudo systemctl enable --now tailscaled
           sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || true)
           echo "TAILSCALE_IP=${TAILSCALE_IP:-未获取}" >> "$GITHUB_ENV"
           echo "✅ Tailscale组网完成，内网IP：${TAILSCALE_IP:-未获取}"
 
-      # 10. 系统与备份清理（全容错修复版）
+      # 10. 系统与备份清理（终极容错版）
       - name: 10-系统垃圾与旧备份清理
         if: ${{ always() }}
         run: |
-          set -e
-          # 系统清理（全容错，失败不退出）
-          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n /opt/hostedtoolcache /opt/runner-cache 2>/dev/null || true
-          sudo apt autoremove --purge -y 2>/dev/null || true
-          sudo apt clean 2>/dev/null || true
+          set +e  # 临时关闭严格模式，避免清理命令失败导致退出
+          # 核心：删除19G无用第三方工具（Haskell/Julia/AWS+配套依赖）
+          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
+          # 删除GitHub Runner残留大缓存（/opt下所有无用缓存）
+          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
+          # 系统通用冗余清理：旧内核+apt缓存+过期日志（添加非交互参数与容错）
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt autoclean -y 2>/dev/null || true
           sudo journalctl --vacuum-size=100M --vacuum-time=7d 2>/dev/null || true
+          # 清理所有临时文件+用户/系统缓存
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
-          sudo sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+          # 刷新系统缓存（修复权限问题）
+          sudo sync
+          sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+          set -e  # 恢复严格模式
+
           # 旧备份清理（修复空值错误）
           if [ "${WEBDAV_AVAILABLE}" = true ]; then
             # 挂载模式清理
@@ -346,10 +357,11 @@ jobs:
       - name: 13-收尾清理与环境还原
         if: ${{ always() }}
         run: |
-          set -e
+          set +e  # 临时关闭严格模式
           # 卸载WebDAV挂载
           mount | grep -q "${LOCAL_MOUNT_POINT}" && sudo umount "${LOCAL_MOUNT_POINT}" 2>/dev/null || true
           # 清理敏感凭证与临时文件
           sudo rm -rf /tmp/* /var/tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots /etc/davfs2/secrets 2>/dev/null || true
-          sudo apt autoremove -y && sudo apt clean 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove -y && sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
+          set -e  # 恢复严格模式
           echo "🎉 全流程执行完毕，环境已还原"
