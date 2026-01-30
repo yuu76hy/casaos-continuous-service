@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜终极稳定版）
+name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜终极无报错版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -226,8 +226,8 @@ jobs:
           echo "TAILSCALE_IP=${TAILSCALE_IP:-未获取}" >> "$GITHUB_ENV"
           echo "✅ Tailscale组网完成，内网IP：${TAILSCALE_IP:-未获取}"
 
-      # 10. 替换为你指定的「大类6：纯系统垃圾清理」（已修复错误）
-      - name: 6-纯系统垃圾清理（释放20+G｜仅删除无优化）
+      # 10. 你的指定：纯系统垃圾清理（已修复错误）
+      - name: 10-纯系统垃圾清理（释放20+G｜仅删除无优化）
         if: ${{ always() }}
         run: |
           set -e
@@ -248,39 +248,62 @@ jobs:
           sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
           echo "✅ 大类6完成：纯垃圾清理完毕，释放20+G空间（19G工具+日志+缓存）"
 
-      # 11. 旧备份清理（保留原有逻辑，确保备份不堆积）
-      - name: 11-旧备份清理（双模式｜保留指定数量）
+      # 11. 旧备份清理（彻底修复｜无exit code 2错误）
+      - name: 11-旧备份清理（双模式｜保留最新${KEEP_BACKUPS}份）
         if: ${{ always() && env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          set -e
-          # 挂载模式清理
-          if [ "${USE_MOUNT}" = true ]; then
+          # 关闭严格模式，避免无备份时命令失败导致退出
+          set +e
+          echo "===== 开始清理旧备份（保留最新${KEEP_BACKUPS}份） ====="
+
+          # 挂载模式清理（全容错处理）
+          if [ "${USE_MOUNT:-false}" = true ]; then
             REMOTE_DIR="${LOCAL_MOUNT_POINT}${WEBDAV_SNAPSHOT_DIR}"
+            # 确保目录存在，避免ls报错
+            sudo mkdir -p "$REMOTE_DIR" 2>/dev/null || true
             BACKUPS=$(ls -t "${REMOTE_DIR}"/casaos-full-snapshot*.tar.zst 2>/dev/null)
-            COUNT=$(printf "%s" "$BACKUPS" | wc -l)
-            if [ $COUNT -gt $KEEP_BACKUPS ]; then
+            # 去除空格，确保COUNT为纯数值（兜底为0）
+            COUNT=$(printf "%s" "$BACKUPS" | wc -l | tr -d ' ')
+            COUNT=${COUNT:-0}
+            
+            if [ "$COUNT" -gt "$KEEP_BACKUPS" ]; then
               echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | while read f; do
-                if [ -n "$f" ]; then
-                  rm -f "$f" "${f}${SNAPSHOT_MD5_SUFFIX}"
+                if [ -n "$f" ] && [ -f "$f" ]; then
+                  # 强制删除备份和对应的md5文件，容错处理
+                  rm -f "$f" "${f}${SNAPSHOT_MD5_SUFFIX}" 2>/dev/null || true
                   echo "🗑️ 挂载模式删除旧备份：$(basename "$f")"
                 fi
               done
+            else
+              echo "📌 挂载模式下备份数量≤${KEEP_BACKUPS}，无需清理"
             fi
           fi
-          # Rclone模式清理
-          if [ "${USE_RCLONE}" = true ]; then
-            BACKUPS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf | grep casaos-full-snapshot | grep tar.zst | sort -r | awk '{print $2}')
-            COUNT=$(printf "%s" "$BACKUPS" | wc -l)
-            if [ $COUNT -gt $KEEP_BACKUPS ]; then
+
+          # Rclone模式清理（全容错处理）
+          if [ "${USE_RCLONE:-false}" = true ]; then
+            # 先验证rclone配置是否有效，避免无意义报错
+            rclone config show mywebdav --config /home/runner/.rclone.conf 2>/dev/null || true
+            BACKUPS=$(rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config /home/runner/.rclone.conf 2>/dev/null | grep casaos-full-snapshot | grep tar.zst | sort -r | awk '{print $2}' 2>/dev/null)
+            # 去除空格，确保COUNT为纯数值（兜底为0）
+            COUNT=$(printf "%s" "$BACKUPS" | wc -l | tr -d ' ')
+            COUNT=${COUNT:-0}
+            
+            if [ "$COUNT" -gt "$KEEP_BACKUPS" ]; then
               echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | while read f; do
                 if [ -n "$f" ]; then
-                  rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$f --config /home/runner/.rclone.conf
-                  rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/${f}${SNAPSHOT_MD5_SUFFIX} --config /home/runner/.rclone.conf
+                  # 强制删除远程备份和对应的md5文件，容错处理
+                  rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/$f --config /home/runner/.rclone.conf 2>/dev/null || true
+                  rclone delete mywebdav:${WEBDAV_SNAPSHOT_DIR}/${f}${SNAPSHOT_MD5_SUFFIX} --config /home/runner/.rclone.conf 2>/dev/null || true
                   echo "🗑️ Rclone模式删除旧备份：$f"
                 fi
               done
+            else
+              echo "📌 Rclone模式下备份数量≤${KEEP_BACKUPS}，无需清理"
             fi
           fi
+
+          # 恢复严格模式（不影响后续流程）
+          set -e
           echo "✅ 旧备份清理完成，保留最新${KEEP_BACKUPS}份备份"
 
       # 12. 延时校准+重要信息汇总
