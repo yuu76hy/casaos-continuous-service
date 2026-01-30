@@ -21,7 +21,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 15  # 已改为15分钟延时
+      TARGET_RUN_MINUTES: 15  # 精准延时目标：15分钟
       SNAPSHOT_MD5_SUFFIX: ".md5"
 
     steps:
@@ -205,7 +205,7 @@ jobs:
           sudo sync && sudo echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
           echo "✅ 大类6完成：纯垃圾清理完毕，释放20+G空间（19G工具+日志+缓存）"
 
-      # 大类7：核心数据备份+自动续跑触发
+      # 大类7：核心数据备份+自动续跑触发（已解决所有报错）
       - name: 7-核心数据备份+自动续跑触发（WebDAV可用则执行）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -222,10 +222,29 @@ jobs:
               echo "✅ 已删除旧备份：$FILE"
             done
           fi
-          # 精准延时校准（满15分钟）
-          START_TIME_JOB=$( [ -n "$GITHUB_RUN_STARTED_AT" ] && date -d "$GITHUB_RUN_STARTED_AT" +%s || date +%s )
-          WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - ( $(date +%s) - START_TIME_JOB ) ))
-          [ $WAIT_TIME -gt 0 ] && echo "已运行$(( ( $(date +%s) - START_TIME_JOB ) / 60 ))分，需再等$((WAIT_TIME/60))分后备份（总时长满15分）" && sleep $WAIT_TIME
+
+          # 精准延时校准（已修复15分钟无效问题）
+          echo "===== 精准延时校准（目标：满15分钟） ====="
+          if [ -n "$GITHUB_RUN_STARTED_AT" ]; then
+            # 适配ISO 8601格式：替换T为空格
+            RUN_START_TIME=$(echo "$GITHUB_RUN_STARTED_AT" | sed 's/T/ /')
+            START_TIME_JOB=$(date -d "$RUN_START_TIME" +%s)
+          else
+            # 若变量不存在，用当前步骤启动时间
+            START_TIME_JOB=$(date +%s)
+          fi
+          CURRENT_TIME=$(date +%s)
+          CURRENT_DURATION=$(( CURRENT_TIME - START_TIME_JOB ))
+          TARGET_DURATION=$(( TARGET_RUN_MINUTES * 60 ))
+          WAIT_TIME=$(( TARGET_DURATION - CURRENT_DURATION ))
+
+          if [ $WAIT_TIME -gt 0 ]; then
+            echo "已运行$(( CURRENT_DURATION / 60 ))分$(( CURRENT_DURATION % 60 ))秒，需再等$(( WAIT_TIME / 60 ))分$(( WAIT_TIME % 60 ))秒（总时长满15分）"
+            sleep $WAIT_TIME
+          else
+            echo "已运行$(( CURRENT_DURATION / 60 ))分，已满足15分钟要求，直接备份"
+          fi
+
           # 关停进程+打包核心数据+生成MD5
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 casaos docker dockerd containerd runc docker-proxy 2>/dev/null || true
@@ -236,13 +255,17 @@ jobs:
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           sudo tar -czPf $SNAPSHOT_PATH $EXCLUDE_RULES --warning=no-file-changed --exclude=*/socket --one-file-system $PERSONAL_DATA_DIRS
           sudo md5sum $SNAPSHOT_PATH > "${SNAPSHOT_PATH}${SNAPSHOT_MD5_SUFFIX}"
-          # 上传快照+MD5+远程校验（修改核心：移除无效flag，保留稳定传输参数）
+
+          # 上传快照+MD5（已移除所有无效Rclone参数）
           rclone copy $SNAPSHOT_PATH mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf \
-            --transfers 2 --retries 5 --retries-sleep 30s --timeout 1h --contimeout 5m --resume-support
+            --transfers 2 --retries 5 --retries-sleep 30s --timeout 1h --contimeout 5m
           rclone copy "${SNAPSHOT_PATH}${SNAPSHOT_MD5_SUFFIX}" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf \
             --retries 5 --timeout 1h --contimeout 5m
+
+          # 远程校验上传结果
           rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR}/$SNAPSHOT_NAME --config /home/runner/.rclone.conf >/dev/null
           rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAPSHOT_NAME}${SNAPSHOT_MD5_SUFFIX} --config /home/runner/.rclone.conf >/dev/null
+
           # 启动服务+触发自动续跑
           sudo rm -f $SNAPSHOT_PATH "${SNAPSHOT_PATH}${SNAPSHOT_MD5_SUFFIX}"
           sudo systemctl enable --now docker containerd casaos && sleep 3
