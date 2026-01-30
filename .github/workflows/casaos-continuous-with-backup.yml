@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜终极完美版）
+name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜最终完善版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -21,10 +21,11 @@ jobs:
       KEEP_BACKUPS: 2
       SNAPSHOT_MD5_SUFFIX: ".md5"
       ZSTD_LEVEL: "-2"  # -2最快，-5最高压缩
-      # 性能与网络
+      # 性能与网络（加固抗超时）
       RCLONE_TRANSFERS: 4
       RCLONE_RETRIES: 5
-      RCLONE_TIMEOUT: "2h"
+      RCLONE_TIMEOUT: "1h30m"
+      RCLONE_STATS: "30s"  # 每30秒输出一次状态，防空闲断开
       # 工作流时长（自动触发才延时）
       TARGET_RUN_MINUTES: 15
       # ====================== 密钥配置（从secrets取，不暴露） ======================
@@ -75,7 +76,7 @@ jobs:
           id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
           [ -n "$ROOTS_PASSWORD" ] && echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd
           
-          echo "ℹ️ [信息] 配置免密sudo"
+          echo "ℹ️ [信息] 配置临时免密sudo（用完即删）"
           echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
@@ -85,7 +86,7 @@ jobs:
           [ "$TMP_FREE" -lt 5 ] && { echo "❌ [错误] /tmp空间不足5G" && exit 1; }
           
           echo "✅ [成功] 管理员配置与空间校验通过"
-          # 用完即删sudo配置，安全收紧
+          # 用完即删sudo配置，安全加固
           sudo rm -f /etc/sudoers.d/"$USER_NAME" 2>/dev/null || true
 
       - name: 3-【备份模式】双模式初始化（挂载+Rclone）
@@ -113,7 +114,7 @@ jobs:
               sudo mkdir -p "${LOCAL_MOUNT_POINT}${WEBDAV_SNAPSHOT_DIR}" && sudo chmod 700 "${LOCAL_MOUNT_POINT}${WEBDAV_SNAPSHOT_DIR}"
             }
           fi
-          # 用完即删davfs密码，安全收紧
+          # 用完即删davfs密码，安全加固
           sudo rm -f /etc/davfs2/secrets 2>/dev/null || true
           
           echo "ℹ️ [信息] 初始化Rclone模式"
@@ -180,7 +181,7 @@ jobs:
           sudo systemctl stop casaos
           echo "✅ [成功] CasaOS安装完成，已停止服务（准备打包/恢复）"
 
-      - name: 6-【恢复】快照恢复（双模式自动切换）
+      - name: 6-【恢复】快照恢复（双模式+强校验，杜绝静默失败）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
@@ -200,31 +201,48 @@ jobs:
             MD5_PATH="${REMOTE_DIR}/${MD5}"
             if [ -f "$SNAP_PATH" ] && [ -f "$MD5_PATH" ]; then
               cd /tmp && cp "$MD5_PATH" .
-              md5sum -c "$(basename "$MD5_PATH")" < "$SNAP_PATH" --quiet && {
-                sudo mkdir -p $PERSONAL_DATA_DIRS
-                sudo tar -I zstd -xf "$SNAP_PATH" -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS --quiet
-                RESTORE_OK=true
-              }
+              if [ -f "/tmp/$(basename "$MD5_PATH")" ]; then
+                md5sum -c "$(basename "$MD5_PATH")" < "$SNAP_PATH" -q && {
+                  sudo mkdir -p $PERSONAL_DATA_DIRS
+                  # 修复tar选项：--quiet → -q
+                  sudo tar -I zstd -xf "$SNAP_PATH" -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS -q
+                  RESTORE_OK=true
+                }
+              fi
             fi
           fi
           
           if [ "$RESTORE_OK" = false ] && [ "${USE_RCLONE:-false}" = true ]; then
             echo "ℹ️ [信息] 挂载模式失败，切换Rclone模式恢复"
             rclone copy mywebdav:${WEBDAV_SNAPSHOT_DIR}/${MD5} /tmp --config /home/runner/.rclone.conf --quiet
-            rclone cat mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAP} --config /home/runner/.rclone.conf 2>/dev/null | tee >(md5sum -c /tmp/${MD5} --quiet) >/dev/null && {
-              sudo mkdir -p $PERSONAL_DATA_DIRS
-              rclone cat mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAP} --config /home/runner/.rclone.conf 2>/dev/null | sudo tar -I zstd -xf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS --quiet
-              RESTORE_OK=true
-            }
+            if [ -f "/tmp/${MD5}" ]; then
+              rclone cat mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAP} --config /home/runner/.rclone.conf 2>/dev/null | tee >(md5sum -c /tmp/${MD5} -q) >/dev/null && {
+                sudo mkdir -p $PERSONAL_DATA_DIRS
+                # 修复tar选项：--quiet → -q
+                rclone cat mywebdav:${WEBDAV_SNAPSHOT_DIR}/${SNAP} --config /home/runner/.rclone.conf 2>/dev/null | sudo tar -I zstd -xf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS -q
+                RESTORE_OK=true
+              }
+            fi
           fi
           
           [ "$RESTORE_OK" = false ] && { echo "❌ [错误] 快照恢复失败" && exit 1; }
+          
+          echo "ℹ️ [信息] 恢复后强校验（检查关键文件）"
+          if [ ! -f "/var/lib/docker/version" ] || [ ! -d "/etc/casaos" ]; then
+            echo "❌ [错误] 恢复后关键文件缺失，系统为「空壳」，强制终止"
+            exit 1
+          fi
+          
+          echo "ℹ️ [信息] 清理Docker/containerd残留锁文件"
+          sudo rm -f /var/lib/docker/*.lock 2>/dev/null || true
+          sudo rm -f /var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db.lock 2>/dev/null || true
+          sudo rm -f /run/docker/*.pid /run/containerd/*.pid 2>/dev/null || true
           
           echo "ℹ️ [信息] 校准恢复后权限"
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          echo "✅ [成功] 快照恢复完成"
+          echo "✅ [成功] 快照恢复完成（强校验通过+锁文件清理）"
 
       - name: 7-【初始化】无快照时创建基础目录
         if: ${{ env.WEBDAV_AVAILABLE != 'true' || env.HAS_SNAPSHOT != 'true' }}
@@ -388,7 +406,7 @@ jobs:
           fi
           echo "✅ [成功] 延时校准完成"
 
-      - name: 12-【备份】数据打包与远程备份（核心步骤，全优化）
+      - name: 12-【备份】数据打包与远程备份（核心步骤，全加固）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -407,7 +425,8 @@ jobs:
           LOCAL_SNAP="/tmp/${SNAP_NAME}"
           LOCAL_MD5="/tmp/${MD5_NAME}"
           
-          sudo tar -I "zstd -T0 ${ZSTD_LEVEL}" -cPf "$LOCAL_SNAP" $EXCLUDE_RULES --warning=no-file-changed --one-file-system $PERSONAL_DATA_DIRS --quiet
+          # 修复tar选项：--quiet → -q
+          sudo tar -I "zstd -T0 ${ZSTD_LEVEL}" -cPf "$LOCAL_SNAP" $EXCLUDE_RULES --warning=no-file-changed --one-file-system $PERSONAL_DATA_DIRS -q
           sudo md5sum "$LOCAL_SNAP" > "$LOCAL_MD5"
           
           BACKUP_OK=false
@@ -419,9 +438,9 @@ jobs:
           fi
           
           if [ "$BACKUP_OK" = false ] && [ "${USE_RCLONE:-false}" = true ]; then
-            echo "ℹ️ [信息] 挂载模式失败，切换Rclone上传（${RCLONE_TRANSFERS}并发）"
-            rclone copy "$LOCAL_SNAP" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --transfers ${RCLONE_TRANSFERS} --retries ${RCLONE_RETRIES} --timeout ${RCLONE_TIMEOUT} --quiet
-            rclone copy "$LOCAL_MD5" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --retries ${RCLONE_RETRIES} --quiet
+            echo "ℹ️ [信息] 挂载模式失败，切换Rclone上传（${RCLONE_TRANSFERS}并发，防空闲断开）"
+            rclone copy "$LOCAL_SNAP" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --transfers ${RCLONE_TRANSFERS} --retries ${RCLONE_RETRIES} --timeout ${RCLONE_TIMEOUT} --stats ${RCLONE_STATS} --stats-log-level NOTICE
+            rclone copy "$LOCAL_MD5" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config /home/runner/.rclone.conf --retries ${RCLONE_RETRIES} --stats ${RCLONE_STATS} --stats-log-level NOTICE
             BACKUP_OK=true
             echo "✅ [成功] Rclone模式上传完成"
           fi
@@ -430,7 +449,7 @@ jobs:
           
           echo "ℹ️ [信息] 清理本地临时文件"
           sudo rm -f "$LOCAL_SNAP" "$LOCAL_MD5"
-          # 用完即删rclone配置，安全收紧
+          # 用完即删rclone配置，安全加固
           sudo rm -f /home/runner/.rclone.conf 2>/dev/null || true
           
           echo "ℹ️ [信息] 重启所有核心服务"
