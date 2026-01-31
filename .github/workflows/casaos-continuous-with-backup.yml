@@ -174,23 +174,18 @@ jobs:
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
 
-      # ========== 优化点：改用pigz多线程压缩（适配你的4核CPU） ==========
       - name: 11-1 全量备份-打包压缩（4核多线程）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
         run: |
           set -e
           echo "===== 11-1 打包压缩核心数据（4核多线程） ====="
-          # 安装多线程压缩工具pigz（适配你的4核CPU）
           sudo apt install -y pigz -qq
-
-          # 定义快照名称
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
 
-          # 多线程打包压缩（-p 4 指定用4个核心，和你的CPU匹配）
           pack_data() {
             echo "开始多线程打包（使用4核CPU）：$PERSONAL_DATA_DIRS"
             sudo tar -cPf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS | sudo pigz -p 4 > $SNAPSHOT_PATH || return 1
@@ -198,7 +193,6 @@ jobs:
             return 0
           }
 
-          # 打包重试逻辑
           PACK_SUCCESS="false"
           if pack_data; then
             PACK_SUCCESS="true"
@@ -214,15 +208,32 @@ jobs:
           fi
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
 
-      - name: 11-2 全量备份-上传WebDAV
+      # ========== 优化上传：添加速率显示+优化上传参数 ==========
+      - name: 11-2 全量备份-上传WebDAV（显示速率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         run: |
           set -e
-          echo "===== 11-2 上传快照到WebDAV ====="
+          echo "===== 11-2 上传快照到WebDAV（实时显示上传速率） ====="
           upload_data() {
             echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
-            rclone copy $SNAPSHOT_PATH mywebdav:$WEBDAV_SNAPSHOT_DIR/ --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3 || return 1
+            # 核心优化参数：
+            # --progress：实时显示上传速率、已传大小、剩余时间
+            # --transfers 8：并发上传数（从4提升到8，适配大文件）
+            # --buffer-size 64M：上传缓存（提升大文件上传效率）
+            # --low-level-retries 5：底层重试次数（增强稳定性）
+            sudo rclone copy \
+              $SNAPSHOT_PATH \
+              mywebdav:$WEBDAV_SNAPSHOT_DIR/ \
+              --config /home/runner/.rclone.conf \
+              --transfers 8 \
+              --buffer-size 64M \
+              --fast-list \
+              --retries 3 \
+              --low-level-retries 5 \
+              --progress || return 1
+
+            # 验证上传成功
             rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME --config /home/runner/.rclone.conf >/dev/null || return 1
             sudo rm -f $SNAPSHOT_PATH
             echo "✅ 上传完成，快照已保存到WebDAV"
@@ -249,7 +260,6 @@ jobs:
         run: |
           set -e
           echo "===== 11-3 备份后处理 ====="
-          # 清理旧备份（保留最新2份）
           BACKUPS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
           if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
             echo "清理旧备份（保留最新$KEEP_BACKUPS份）："
@@ -260,7 +270,6 @@ jobs:
             echo "✅ 当前备份数≤$KEEP_BACKUPS，无需清理"
           fi
 
-          # 触发自动续跑
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
             echo "📌 触发下一轮自动续跑..."
             curl -s -f -X POST \
