@@ -25,7 +25,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 15
+      TARGET_RUN_MINUTES: 300  # 仅修改此处：15 → 300
 
     steps:
       - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾｜释放20+G）
@@ -151,17 +151,17 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 9-延时校准（满15分钟再备份）
+      - name: 9-延时校准（满300分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（15分钟） ====="
+          echo "===== 9-延时校准（300分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满15分钟，准备备份"
+          echo "✅ 已运行满300分钟，准备备份"
 
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
