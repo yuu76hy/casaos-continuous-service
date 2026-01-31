@@ -21,36 +21,29 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 15  # 核心修改：从60改为15
+      TARGET_RUN_MINUTES: 15
 
     steps:
-      # ========== 步骤1：系统初始化+全域深度清理（整合所有清理，释放20+G） ==========
       - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾｜释放20+G）
         if: ${{ always() }}
         run: |
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
-          # 1. 更新源+安装基础依赖
           sudo apt update -y -qq
           sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
-          # 2. 卸载旧版 Docker/containerd
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
-          # 3. 清理旧 CasaOS 残留
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
           sudo systemctl daemon-reload
-          # 4. 删除 GitHub Runner 大垃圾（约19G）
           sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
           sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          # 5. 系统冗余清理
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo "✅ 系统初始化+全域清理完成，释放20+G空间"
 
-      # ========== 步骤2：安装最新版 Docker ==========
       - name: 2-官方纯净安装 Docker（含 compose）
         run: |
           set -e
@@ -61,7 +54,6 @@ jobs:
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
 
-      # ========== 步骤3：安装最新版 CasaOS ==========
       - name: 3-官方纯净安装 CasaOS
         run: |
           set -e
@@ -70,7 +62,6 @@ jobs:
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
 
-      # ========== 步骤4：创建并配置管理员用户（roots） ==========
       - name: 4-创建 roots 管理员+免密&Docker 权限
         run: |
           set -e
@@ -87,7 +78,6 @@ jobs:
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
 
-      # ========== 步骤5：WebDAV 备份环境初始化 ==========
       - name: 5-WebDAV 配置+快照检测
         run: |
           set -e
@@ -105,7 +95,7 @@ jobs:
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 检测到快照：$REMOTE_SNAPSHOTS"
-            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
+            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOT" >> "$GITHUB_ENV"
             echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
           else
             echo "✅ 无快照，纯净启动"
@@ -114,7 +104,6 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
 
-      # ========== 步骤6：从 WebDAV 恢复历史数据（有快照才执行） ==========
       - name: 6-恢复历史快照+权限校正
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -122,7 +111,7 @@ jobs:
           echo "===== 6-恢复历史数据 ====="
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
-          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
           rclone cat mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
@@ -132,7 +121,6 @@ jobs:
           rclone delete mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf 2>/dev/null || true
           echo "✅ 数据恢复完成"
 
-      # ========== 步骤7：启动 Docker & CasaOS 服务 ==========
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
           set -e
@@ -144,7 +132,6 @@ jobs:
           sudo systemctl enable --now casaos && sleep 4
           echo "✅ 服务启动完成，CasaOS 可访问"
 
-      # ========== 步骤8：Tailscale 组网（可选） ==========
       - name: 8-Tailscale 组网（可选）
         run: |
           set -e
@@ -161,7 +148,6 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      # ========== 步骤9：延时校准，确保满15分钟再备份（核心修改） ==========
       - name: 9-延时校准（满15分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -174,7 +160,6 @@ jobs:
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
           echo "✅ 已运行满15分钟，准备备份"
 
-      # ========== 步骤10：备份前强制停止所有服务（保证备份安全） ==========
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -186,13 +171,11 @@ jobs:
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
 
-      # ========== 步骤11：全量备份+保留2份+触发续跑 ==========
-      - name: 11-全量备份+清旧备份+触发自动续跑
+      - name: 11-全量备份+清旧备份+触发自动续跑（仅一次）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
           echo "===== 11-核心备份流程 ====="
-          # 备份函数
           full_backup() {
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
             SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
@@ -203,23 +186,41 @@ jobs:
             echo "✅ 备份成功：$SNAPSHOT_NAME"
             return 0
           }
-          # 执行备份+重试
-          full_backup || { echo "⚠️ 首次失败，10分钟后重试"; sleep 600; full_backup; }
-          # 清理旧备份，保留最新2份
-          BACKUPS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
-          [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ] && echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:$WEBDAV_SNAPSHOT_DIR/{} --config /home/runner/.rclone.conf 2>/dev/null
-          echo "✅ 旧备份清理完成，保留最新${KEEP_BACKUPS}份"
-          # 触发续跑
-          [ -n "$USER_PAT" ] && [ -n "$REPO" ] && curl -fsSL --fail -X POST -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" https://api.github.com/repos/$REPO/dispatches -d '{"event_type":"renew_casaos_snapshot"}' 2>/dev/null && echo "✅ 自动续跑已触发"
+          BACKUP_SUCCESS="false"
+          if full_backup; then
+            BACKUP_SUCCESS="true"
+          else
+            echo "⚠️ 首次备份失败，10分钟后重试..."
+            sleep 600
+            full_backup && BACKUP_SUCCESS="true"
+          fi
+          if [ "$BACKUP_SUCCESS" = "true" ]; then
+            BACKUPS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
+            [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ] && echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:$WEBDAV_SNAPSHOT_DIR/{} --config /home/runner/.rclone.conf 2>/dev/null
+            echo "✅ 旧备份清理完成，保留最新${KEEP_BACKUPS}份"
+            if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
+              echo "📌 触发下一轮自动续跑..."
+              curl -s -f -X POST \
+                -H "Authorization: token $USER_PAT" \
+                -H "Content-Type: application/json" \
+                https://api.github.com/repos/$REPO/dispatches \
+                -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
+              if [ $? -eq 0 ]; then
+                echo "✅ 自动续跑触发成功（仅一次）"
+              else
+                echo "⚠️ 自动续跑触发失败"
+              fi
+            fi
+          else
+            echo "❌ 备份最终失败，不清理、不触发续跑"
+          fi
           echo "✅ 备份全流程完成"
 
-      # ========== 步骤12：敏感信息清理+流程完结（不重启服务） ==========
       - name: 12-敏感清理+流程完结（不重启服务）
         if: ${{ always() }}
         run: |
           set -e
           echo "===== 12-清理+完结 ====="
-          # 清理敏感配置
           sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
