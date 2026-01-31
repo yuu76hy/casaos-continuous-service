@@ -23,7 +23,7 @@ jobs:
       RCLONE_RETRIES: 10
       RCLONE_TIMEOUT: "2h"
       RCLONE_STATS: "30s"
-      TARGET_RUN_MINUTES: 5
+      TARGET_RUN_MINUTES: 30  # 关键修改：将5改为30（半小时）
       MAX_SNAPSHOT_SIZE_GB: 50
       # 密钥配置（从GitHub Secrets读取）
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
@@ -154,7 +154,7 @@ jobs:
           if [ "$RCLONE_OK" = true ] || [ "$MOUNT_OK" = true ]; then
             echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           else
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUBUB_ENV"
           fi
           echo "USE_RCLONE=$RCLONE_OK" >> "$GITHUB_ENV"
           echo "USE_MOUNT=$MOUNT_OK" >> "$GITHUB_ENV"
