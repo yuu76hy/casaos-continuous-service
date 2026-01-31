@@ -184,33 +184,73 @@ jobs:
             echo "⚠️ 未找到历史快照，将执行全新部署"
           fi
 
-      - name: 5-【部署】CasaOS纯净安装（彻底清理+状态验证）
+      - name: 5-【部署】CasaOS纯净安装（修复验证失败+日志增强）
         run: |
           set -e
+          # 彻底清理旧CasaOS残留
           echo "ℹ️ 清理旧CasaOS残留文件"
-          sudo systemctl stop casaos docker containerd 2>/dev/null || true
+          sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
-          sudo rm -rf /etc/casaos /var/lib/casaos /usr/local/casaos /etc/systemd/system/casaos* /usr/lib/systemd/system/casaos*
+          sudo rm -rf /etc/casaos /var/lib/casaos /usr/local/casaos /etc/systemd/system/casaos* /usr/lib/systemd/system/casaos* /usr/bin/casaos /usr/sbin/casaos
           sudo systemctl daemon-reload
           
-          echo "ℹ️ 安装CasaOS（最多3次重试）"
+          # 补装CasaOS依赖（官网推荐基础依赖）
+          echo "ℹ️ 补装CasaOS必需依赖"
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y wget curl smartmontools parted ntfs-3g net-tools udevil samba cifs-utils mergerfs unzip -qq
+          
+          # CasaOS安装（非静默模式，输出详细日志，3次重试）
+          echo "ℹ️ 安装CasaOS（非静默模式，最多3次重试）"
           CASAOS_RETRY=3
+          INSTALL_LOG="/tmp/casaos_install.log"
           while [ $CASAOS_RETRY -gt 0 ]; do
-            if curl -fsSL https://get.casaos.io | sudo bash; then
+            # 执行安装并保存日志，非静默输出
+            if curl -fsSL https://get.casaos.io | sudo bash -x > "$INSTALL_LOG" 2>&1; then
+              echo "✅ 第$((4 - CASAOS_RETRY))次安装成功"
               break
             fi
             CASAOS_RETRY=$((CASAOS_RETRY-1))
-            echo "⚠️ CasaOS安装失败，剩余重试次数：$CASAOS_RETRY"
-            sleep 20
+            echo "⚠️ CasaOS安装失败，剩余重试次数：$CASAOS_RETRY，日志已保存到$INSTALL_LOG"
+            cat "$INSTALL_LOG" | tail -20  # 输出最后20行日志帮助排查
+            sleep 30
           done
-          [ $CASAOS_RETRY -eq 0 ] && { echo "❌ CasaOS安装失败" && exit 1; }
+          [ $CASAOS_RETRY -eq 0 ] && { echo "❌ CasaOS安装失败，完整日志：$(cat "$INSTALL_LOG")" && exit 1; }
           
-          sudo systemctl stop casaos
-          if [ -f "/usr/local/casaos/casaos" ]; then
-            echo "✅ CasaOS纯净安装完成，已停止服务"
-          else
-            echo "❌ CasaOS安装文件验证失败" && exit 1
+          # 安装后停止服务
+          sudo systemctl stop casaos 2>/dev/null || true
+          
+          # 多路径验证（解决安装路径不统一问题）
+          echo "ℹ️ 验证CasaOS安装文件（多路径检测）"
+          CASAOS_PATHS=(
+            "/usr/local/casaos/casaos"
+            "/usr/bin/casaos"
+            "/usr/sbin/casaos"
+            "/opt/casaos/casaos"
+          )
+          INSTALL_PATH=""
+          for path in "${CASAOS_PATHS[@]}"; do
+            if [ -f "$path" ] && [ -x "$path" ]; then
+              INSTALL_PATH="$path"
+              break
+            fi
+          done
+          
+          # 验证失败时输出系统信息和安装日志
+          if [ -z "$INSTALL_PATH" ]; then
+            echo "❌ CasaOS安装文件未找到，开始排查系统信息"
+            echo "=== 系统架构 ==="
+            uname -a
+            echo "=== 系统版本 ==="
+            cat /etc/os-release
+            echo "=== 安装日志最后50行 ==="
+            cat "$INSTALL_LOG" | tail -50
+            echo "=== 系统服务状态 ==="
+            sudo systemctl status casaos 2>&1
+            echo "=== 目录列表 ==="
+            ls -la /usr/local/casaos/ 2>&1 || ls -la /usr/bin/ | grep casaos 2>&1
+            exit 1
           fi
+          
+          echo "✅ CasaOS纯净安装完成，安装路径：$INSTALL_PATH，已停止服务"
 
       - name: 6-【恢复】快照强恢复（Rclone优先+全校验+安全权限）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
