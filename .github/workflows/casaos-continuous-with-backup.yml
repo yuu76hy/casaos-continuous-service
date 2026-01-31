@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜最终稳定版）
+name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜5分钟延时版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 720
     env:
-      # ====================== 可配置参数（全放这里，不用改脚本） ======================
+      # ====================== 可配置参数（已修改：15分→5分） ======================
       LOCAL_MOUNT_POINT: "/op"
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -22,7 +22,7 @@ jobs:
       RCLONE_RETRIES: 5
       RCLONE_TIMEOUT: "1h30m"
       RCLONE_STATS: "30s"
-      TARGET_RUN_MINUTES: 15
+      TARGET_RUN_MINUTES: 5  # 核心修改：从15改为5
       # ====================== 密钥配置（从secrets取，不暴露） ======================
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
@@ -71,8 +71,12 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           
-          TMP_FREE=$(df -P /tmp | grep /tmp | awk '{print $4}')
-          [ "$TMP_FREE" -lt 5242880 ] && { echo "❌ [错误] /tmp空间不足5G" && exit 1; }
+          # 提前优化空间获取逻辑，避免后续问题
+          TMP_FREE=$(df -P /tmp | awk 'NR>1 {print $4}' | tail -1)
+          if [ -z "$TMP_FREE" ] || ! [[ "$TMP_FREE" =~ ^[0-9]+$ ]]; then
+            TMP_FREE=0
+          fi
+          [ "$TMP_FREE" -lt 5242880 ] && [ "$TMP_FREE" -ne 0 ] && { echo "❌ [错误] /tmp空间不足5G" && exit 1; }
           
           sudo rm -f /etc/sudoers.d/"$USER_NAME" 2>/dev/null || true
           echo "✅ [成功] 管理员配置与空间校验通过"
@@ -340,7 +344,7 @@ jobs:
       # ==============================================================================
       # 阶段5：延时与备份（步骤11-12）
       # ==============================================================================
-      - name: 11-【校准】延时校准与关键信息汇总（手动/自动都延时）
+      - name: 11-【校准】延时校准与关键信息汇总（手动/自动都延时，5分钟版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -359,7 +363,7 @@ jobs:
           echo "🌐 Tailscale IP：${TAILSCALE_IP:-未配置}"
           echo "⏱️ 已运行：$((DUR/60))分$((DUR%60))秒"
           if [ $WAIT -gt 0 ]; then
-            echo "⏳ 需等待：$((WAIT/60))分$((WAIT%60))秒（总时长满${TARGET_RUN_MINUTES}分钟）"
+            echo "⏳ 需等待：$((WAIT/60))分$((WAIT%60))秒（总时长满5分钟）"  # 同步修改提示文字
             sleep $WAIT
           else
             echo "✅ 已满足时长要求，直接进入备份"
@@ -367,7 +371,7 @@ jobs:
           echo "=================================================="
           echo "✅ [成功] 延时校准完成"
 
-      - name: 12-【备份】数据打包与远程备份（核心步骤，全加固）
+      - name: 12-【备份】数据打包与远程备份（核心修复：TMP_FREE 空值问题）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -375,8 +379,22 @@ jobs:
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sync && sleep 3
           
-          TMP_FREE=$(df -P /tmp | grep /tmp | awk '{print $4}')
-          [ "$TMP_FREE" -lt 10485760 ] && { echo "❌ [错误] /tmp空间不足10G" && exit 1; }
+          # 核心修复：优化TMP_FREE获取逻辑，避免空值导致整数比较错误
+          echo "ℹ️ [信息] 校验/tmp磁盘空间（≥10G）"
+          TMP_FREE=$(df -P /tmp | awk 'NR>1 {print $4}' | tail -1)
+          # 容错：空值或非数字赋值为0
+          if [ -z "$TMP_FREE" ] || ! [[ "$TMP_FREE" =~ ^[0-9]+$ ]]; then
+            TMP_FREE=0
+            echo "⚠️ [警告] 无法正常获取/tmp空间，默认赋值为0，跳过严格校验"
+          fi
+          
+          # 安全比较：仅对有效非零数值报错
+          if [ "$TMP_FREE" -lt 10485760 ] && [ "$TMP_FREE" -ne 0 ]; then
+            echo "❌ [错误] /tmp空间不足10G，当前可用：$((TMP_FREE/1024))M（需要10240M）"
+            exit 1
+          elif [ "$TMP_FREE" -ne 0 ]; then
+            echo "✅ [信息] /tmp空间校验通过，可用：$((TMP_FREE/1024))M"
+          fi
           
           SNAP_NAME="casaos-full-snapshot-v1-$(date +%Y%m%d-%H%M%S).tar.zst"
           MD5_NAME="${SNAP_NAME}${SNAPSHOT_MD5_SUFFIX}"
@@ -389,11 +407,18 @@ jobs:
           BACKUP_OK=false
           if [ "${USE_MOUNT:-false}" = true ]; then
             REMOTE_DIR="${LOCAL_MOUNT_POINT}${WEBDAV_SNAPSHOT_DIR}"
+            # 容错：确保目标目录存在
+            sudo mkdir -p "$REMOTE_DIR" 2>/dev/null || true
             sudo cp "$LOCAL_SNAP" "$REMOTE_DIR/" && sudo cp "$LOCAL_MD5" "$REMOTE_DIR/" && BACKUP_OK=true
             echo "✅ [成功] 挂载模式上传完成"
           fi
           
           if [ "$BACKUP_OK" = false ] && [ "${USE_RCLONE:-false}" = true ]; then
+            # 容错：校验Rclone配置文件存在性
+            if [ ! -f "${RCLONE_CONFIG}" ]; then
+              echo "❌ [错误] Rclone配置文件不存在：${RCLONE_CONFIG}"
+              exit 1
+            fi
             rclone copy "$LOCAL_SNAP" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config "${RCLONE_CONFIG}" --transfers ${RCLONE_TRANSFERS} --retries ${RCLONE_RETRIES} --timeout ${RCLONE_TIMEOUT} --stats ${RCLONE_STATS} --stats-log-level NOTICE
             rclone copy "$LOCAL_MD5" mywebdav:${WEBDAV_SNAPSHOT_DIR}/ --config "${RCLONE_CONFIG}" --retries ${RCLONE_RETRIES} --stats ${RCLONE_STATS} --stats-log-level NOTICE
             BACKUP_OK=true
