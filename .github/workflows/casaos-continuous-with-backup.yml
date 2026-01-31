@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜零风险生产级）
+name: CasaOS纯净部署（双模式｜挂载+Rclone自动切换｜最终稳定版）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 720
     env:
+      # ====================== 可配置参数（全放这里，不用改脚本） ======================
       LOCAL_MOUNT_POINT: "/op"
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -22,6 +23,7 @@ jobs:
       RCLONE_TIMEOUT: "1h30m"
       RCLONE_STATS: "30s"
       TARGET_RUN_MINUTES: 15
+      # ====================== 密钥配置（从secrets取，不暴露） ======================
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -31,6 +33,9 @@ jobs:
       REPO: ${{ secrets.REPO }}
 
     steps:
+      # ==============================================================================
+      # 阶段1：初始化与基础配置（步骤1-3）
+      # ==============================================================================
       - name: 1-【初始化】系统与Docker部署
         run: |
           set -e
@@ -72,7 +77,7 @@ jobs:
           sudo rm -f /etc/sudoers.d/"$USER_NAME" 2>/dev/null || true
           echo "✅ [成功] 管理员配置与空间校验通过"
 
-      - name: 3-【备份模式】双模式初始化
+      - name: 3-【备份模式】双模式初始化（Rclone配置稳定加固）
         run: |
           set -e
           sudo mkdir -p "${LOCAL_MOUNT_POINT}" && sudo chmod 700 "${LOCAL_MOUNT_POINT}"
@@ -85,6 +90,7 @@ jobs:
             exit 0
           fi
           
+          # 初始化WebDAV挂载模式
           MOUNT_OK=false
           echo "${WEBDAV_URL} ${WEBDAV_USER} ${WEBDAV_PASSWORD}" | sudo tee /etc/davfs2/secrets >/dev/null
           sudo chmod 600 /etc/davfs2/secrets
@@ -97,12 +103,18 @@ jobs:
           fi
           sudo rm -f /etc/davfs2/secrets 2>/dev/null || true
           
-          RCLONE_CONFIG=$(mktemp)
+          # 初始化Rclone模式（使用用户目录配置文件，避免临时文件丢失）
           RCLONE_OK=false
+          RCLONE_CONFIG="$HOME/.rclone.conf"
+          rm -f "$RCLONE_CONFIG" 2>/dev/null || true
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config "$RCLONE_CONFIG" --quiet >/dev/null
           sudo chmod 600 "$RCLONE_CONFIG"
-          rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config "$RCLONE_CONFIG" --quiet && RCLONE_OK=true
+          
+          # Rclone连接预校验，提前发现错误
+          if rclone mkdir mywebdav:${WEBDAV_SNAPSHOT_DIR} --config "$RCLONE_CONFIG" --quiet; then
+            rclone ls mywebdav:${WEBDAV_SNAPSHOT_DIR} --config "$RCLONE_CONFIG" --quiet >/dev/null && RCLONE_OK=true
+          fi
           
           echo "USE_MOUNT=$MOUNT_OK" >> "$GITHUB_ENV"
           echo "USE_RCLONE=$RCLONE_OK" >> "$GITHUB_ENV"
@@ -110,6 +122,9 @@ jobs:
           [ "$MOUNT_OK" = true ] || [ "$RCLONE_OK" = true ] && echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV" || echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
           echo "✅ [成功] 双模式初始化完成"
 
+      # ==============================================================================
+      # 阶段2：部署与恢复（步骤4-7）
+      # ==============================================================================
       - name: 4-【快照】历史快照检测
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -218,6 +233,9 @@ jobs:
           sudo mkdir -p /etc/casaos /var/lib/casaos /DATA
           echo "✅ [成功] 基础目录创建完成"
 
+      # ==============================================================================
+      # 阶段3：服务启动与组网（步骤8-9）
+      # ==============================================================================
       - name: 8-【服务】Docker与CasaOS启动校验
         run: |
           set -e
@@ -245,7 +263,7 @@ jobs:
           
           echo "✅ [成功] Docker与CasaOS启动完成"
 
-      - name: 9-【组网】Tailscale内网组网
+      - name: 9-【组网】Tailscale内网组网（容错增强）
         if: ${{ env.TAILSCALE_AUTH_KEY != '' }}
         run: |
           set +e
@@ -265,6 +283,9 @@ jobs:
           echo "ℹ️ [信息] Tailscale 组网尝试完成，IP：${TAILSCALE_IP:-组网失败}"
           set -e
 
+      # ==============================================================================
+      # 阶段4：清理（步骤10）
+      # ==============================================================================
       - name: 10-【清理】系统垃圾+旧备份统一清理
         if: ${{ always() }}
         run: |
@@ -316,7 +337,10 @@ jobs:
           set -e
           echo "✅ [成功] 系统垃圾+旧备份统一清理完成"
 
-      - name: 11-【校准】延时校准与关键信息汇总
+      # ==============================================================================
+      # 阶段5：延时与备份（步骤11-12）
+      # ==============================================================================
+      - name: 11-【校准】延时校准与关键信息汇总（手动/自动都延时）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -343,7 +367,7 @@ jobs:
           echo "=================================================="
           echo "✅ [成功] 延时校准完成"
 
-      - name: 12-【备份】数据打包与远程备份
+      - name: 12-【备份】数据打包与远程备份（核心步骤，全加固）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -379,7 +403,6 @@ jobs:
           [ "$BACKUP_OK" = false ] && { echo "❌ [错误] 备份上传失败" && exit 1; }
           
           sudo rm -f "$LOCAL_SNAP" "$LOCAL_MD5"
-          rm -f "${RCLONE_CONFIG}" 2>/dev/null || true
           
           sudo systemctl enable --now docker containerd casaos && sleep 3
           
@@ -389,11 +412,16 @@ jobs:
           
           echo "✅ [成功] 全量备份完成，服务已重启"
 
+      # ==============================================================================
+      # 阶段6：收尾（步骤13）
+      # ==============================================================================
       - name: 13-【收尾】环境还原与敏感文件清理
         if: ${{ always() }}
         run: |
           set +e
+          # 强制卸载挂载
           mount | grep -q "${LOCAL_MOUNT_POINT}" && sudo umount -l -f "${LOCAL_MOUNT_POINT}" --quiet 2>/dev/null || true
+          # 清理所有敏感文件
           sudo rm -rf /tmp/* /var/tmp/* "${RCLONE_CONFIG}" /etc/davfs2/secrets 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove -y --quiet && sudo DEBIAN_FRONTEND=noninteractive apt clean --quiet 2>/dev/null || true
           set -e
