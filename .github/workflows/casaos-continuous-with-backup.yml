@@ -15,8 +15,8 @@ jobs:
     timeout-minutes: 480  # 单次最大8小时，避免GitHub强制Kill
     defaults:
       run:
-        shell: bash
-        user: root  # 全程最高权限，无任何文件读取/写入限制
+        shell: sudo bash  # 【修正核心】全局配置sudo bash，实现全程root权限（符合GA语法）
+        # 移除非法的 user: root 字段，解决语法报错
     env:
       # ==================== 【固定版本】杜绝上游漂移，1~2年不变 ====================
       DOCKER_VERSION: "27.0.3"
