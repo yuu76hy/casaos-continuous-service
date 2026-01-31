@@ -43,7 +43,6 @@ jobs:
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo "✅ 系统初始化+全域清理完成，释放20+G空间"
-
       - name: 2-官方纯净安装 Docker（含 compose）
         run: |
           set -e
@@ -53,7 +52,6 @@ jobs:
           docker --version && docker compose version
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
-
       - name: 3-官方纯净安装 CasaOS
         run: |
           set -e
@@ -61,7 +59,6 @@ jobs:
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
-
       - name: 4-创建 roots 管理员+免密&Docker 权限
         run: |
           set -e
@@ -77,7 +74,6 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
-
       - name: 5-WebDAV 配置+快照检测
         run: |
           set -e
@@ -103,7 +99,6 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
-
       - name: 6-恢复历史快照+权限校正
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -118,9 +113,9 @@ jobs:
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          rclone delete mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf 2>/dev/null || true
+          # ========== 改动点：已删除下面这行「恢复后立即删除远程快照」的命令 ==========
+          # rclone delete mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf 2>/dev/null || true
           echo "✅ 数据恢复完成"
-
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
           set -e
@@ -131,7 +126,6 @@ jobs:
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 4
           echo "✅ 服务启动完成，CasaOS 可访问"
-
       - name: 8-Tailscale 组网（可选）
         run: |
           set -e
@@ -147,7 +141,6 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
-
       - name: 9-延时校准（满15分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -159,7 +152,6 @@ jobs:
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
           echo "✅ 已运行满15分钟，准备备份"
-
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -170,7 +162,6 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
-
       - name: 11-全量备份+清旧备份+触发自动续跑（仅一次）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -215,7 +206,6 @@ jobs:
             echo "❌ 备份最终失败，不清理、不触发续跑"
           fi
           echo "✅ 备份全流程完成"
-
       - name: 12-敏感清理+流程完结（不重启服务）
         if: ${{ always() }}
         run: |
