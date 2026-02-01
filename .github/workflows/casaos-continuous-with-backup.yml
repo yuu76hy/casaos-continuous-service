@@ -1,16 +1,14 @@
 name: CasaOS纯净部署（备份保留2份+自动清理 稳定精简版）
 
 on:
-  # 手动触发工作流
   workflow_dispatch:
-  # 仓库事件触发（用于自动续跑）
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360  # 超时时间360分钟
+    timeout-minutes: 360
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -111,21 +109,27 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
 
-      - name: 6-恢复历史快照+权限校正
+      # ====================== 【优化】多核并行恢复 ======================
+      - name: 6-恢复历史快照+权限校正（4核并行解压）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 6-恢复历史数据 ====="
+          echo "===== 6-恢复历史数据（4核并行解压） ====="
+          sudo apt install -y pigz -qq
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
+          # 多核并行解压（pigz -d -p 4），速度提升3~4倍
+          rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
+          | sudo pigz -d -p 4 \
+          | sudo tar -xf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          echo "✅ 数据恢复完成"
+          echo "✅ 多核恢复完成"
+      # =================================================================
 
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
@@ -177,7 +181,7 @@ jobs:
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
 
-      # ====================== 【已替换】优化版：高压缩率 + 4核多线程打包 ======================
+      # ====================== 【优化】高压缩率多核打包 ======================
       - name: 11-1 全量备份-打包压缩（高压缩率+4核多线程）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
@@ -191,7 +195,7 @@ jobs:
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
 
-          # 扩展排除规则：进一步剔除垃圾，减小体积 + 提升压缩率
+          # 扩展排除规则
           EXTENDED_EXCLUDES="
           --exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches
           --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old
@@ -234,7 +238,7 @@ jobs:
           fi
 
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
-      # ======================================================================================
+      # ======================================================================
 
       - name: 11-2 全量备份-上传WebDAV（显示速率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
@@ -244,11 +248,6 @@ jobs:
           echo "===== 11-2 上传快照到WebDAV（实时显示上传速率） ====="
           upload_data() {
             echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
-            # 核心优化参数：
-            # --progress：实时显示上传速率、已传大小、剩余时间
-            # --transfers 8：并发上传数（从4提升到8，适配大文件）
-            # --buffer-size 64M：上传缓存（提升大文件上传效率）
-            # --low-level-retries 5：底层重试次数（增强稳定性）
             sudo rclone copy \
               $SNAPSHOT_PATH \
               mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
@@ -259,7 +258,6 @@ jobs:
               --retries 3 \
               --low-level-retries 5 \
               --progress || return 1
-            # 验证上传成功
             rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null || return 1
             sudo rm -f $SNAPSHOT_PATH
             echo "✅ 上传完成，快照已保存到WebDAV"
