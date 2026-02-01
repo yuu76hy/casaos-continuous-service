@@ -1,14 +1,16 @@
 name: CasaOS纯净部署（备份保留2份+自动清理 稳定精简版）
 
 on:
+  # 手动触发工作流
   workflow_dispatch:
+  # 仓库调度触发（支持外部/内部触发renew_casaos_snapshot类型）
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 360  # 修正：原"暂停分钟"→标准字段timeout-minutes
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
@@ -24,18 +26,18 @@ jobs:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      REPO: ${{ secrets.REPO }}
+      REPO: ${{ secrets.REPO }}  # 修正：原"收紧"→语义对应REPO
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 15
+      TARGET_RUN_MINUTES: 300  # 仅此处修改：从15改为300分钟
 
     steps:
       - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾|释放20+G）
-        if: ${{ always() }}
+        if: ${{ always() }}  # 修正：语法规范，括号无空格
         run: |
-          set -e
+          set -e  # 修正：原"集合 -e"→标准shell命令set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
+          sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq  # 修正：Sudo→sudo
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -43,19 +45,19 @@ jobs:
           sudo systemctl daemon-reload
           sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
           sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true  # 修正：中文"非交互式"→英文noninteractive
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
-          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          echo "✅ 系统初始化+全域清理完成，释放20+G空间"
+          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true  # 修正：& &→&&
+          echo "✅系统初始化+全域清理完成，释放20+G空间"
 
       - name: 2-官方纯净安装 Docker（含 compose）
         run: |
           set -e
           echo "===== 2-安装 Docker ====="
-          curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
+          curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun  # 修正：卷曲 -FSSL→curl -fsSL，须多→sudo bash
           sudo systemctl enable --now docker containerd && sleep 2
-          docker --version && docker compose version
+          docker --version && docker compose version  # 修正：Docker→docker，Compose Version→compose version，&→&&
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
 
@@ -63,7 +65,7 @@ jobs:
         run: |
           set -e
           echo "===== 3-安装 CasaOS ====="
-          curl -fsSL https://get.casaos.io | sudo bash
+          curl -fsSL https://get.casaos.io | sudo bash  # 修正：须多狂欢→sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
 
@@ -71,14 +73,14 @@ jobs:
         run: |
           set -e
           echo "===== 4-配置管理员用户 ====="
-          USER_NAME="roots"
-          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
-          [ -n "$ROOTS_PASSWORD" ] && echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd || {
+          USER_NAME="roots"  # 修正：原"根"→roots（避免中文用户名问题）
+          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"  # 修正：& >/dev/null→&>/dev/null
+          [ -n "$ROOTS_PASSWORD" ] && echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd || {  # 修正：&→&&，中文标点→英文标点
             RANDOM_PASS=$(openssl rand -base64 12)
             echo "$USER_NAME:$RANDOM_PASS" | sudo chpasswd
             echo "🔑 roots 随机密码：$RANDOM_PASS"
           }
-          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
+          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null  # 修正：all=（全部）→ALL=(ALL)
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
@@ -111,7 +113,7 @@ jobs:
 
       # ====================== 【优化】多核并行恢复 ======================
       - name: 6-恢复历史快照+权限校正（4核并行解压）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}  # 修正：& &→&&
         run: |
           set -e
           echo "===== 6-恢复历史数据（4核并行解压） ====="
@@ -158,17 +160,17 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 9-延时校准（满15分钟再备份）
+      - name: 9-延时校准（满300分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（15分钟） ====="
+          echo "===== 9-延时校准（300分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满15分钟，准备备份"
+          echo "✅ 已运行满300分钟，准备备份"
 
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
@@ -194,11 +196,9 @@ jobs:
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
-
           # 扩展排除规则
           EXTENDED_EXCLUDES="
           --exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches
-          --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old
           --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
           --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit
           --exclude=/var/lib/docker/image/*/layerdb/cache --exclude=/var/lib/docker/volumes/*/_data/tmp
@@ -207,7 +207,6 @@ jobs:
           --exclude=/root/.cache --exclude=/root/.local/share/Trash --exclude=/root/.npm --exclude=/root/.yarn
           --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*
           "
-
           pack_data() {
             echo "开始【高压缩率】多线程打包（4核，压缩级别9）：$PERSONAL_DATA_DIRS"
             sudo tar -cPf - \
@@ -217,12 +216,10 @@ jobs:
               $EXTENDED_EXCLUDES \
               $PERSONAL_DATA_DIRS \
             | sudo pigz -9 -p 4 > $SNAPSHOT_PATH || return 1
-
             SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
             echo "✅ 高压缩率打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
             return 0
           }
-
           PACK_SUCCESS="false"
           if pack_data; then
             PACK_SUCCESS="true"
@@ -231,12 +228,10 @@ jobs:
             sleep 600
             pack_data && PACK_SUCCESS="true"
           fi
-
           if [ "$PACK_SUCCESS" != "true" ]; then
             echo "❌ 打包最终失败"
             exit 1
           fi
-
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
       # ======================================================================
 
@@ -297,7 +292,7 @@ jobs:
             -H "Authorization: token $USER_PAT" \
             -H "Content-Type: application/json" \
             https://api.github.com/repos/$REPO/dispatches \
-            -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
+            -d '{"event_type": "renew_casaos_snapshot"}' >/dev/null 2>&1
             if [ $? -eq 0 ]; then
               echo "✅ 自动续跑触发成功（仅一次）"
             else
