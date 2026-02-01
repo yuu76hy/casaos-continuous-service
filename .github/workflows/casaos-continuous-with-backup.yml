@@ -28,7 +28,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 5  # 延时改为 5 分钟
+      TARGET_RUN_MINUTES: 10  # 已从 5 改为 10 分钟
 
     steps:
       - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾）
@@ -99,7 +99,7 @@ jobs:
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 检测到快照：$REMOTE_SNAPSHOTS"
             echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
-            echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
+            echo "HAS_SNAPSHOT=true" >> "$GITH=true" >> "$GITHUB_ENV"
           else
             echo "✅ 无快照，纯净启动"
             echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
@@ -165,17 +165,17 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
-      - name: 9-延时校准（满5分钟再备份）
+      - name: 9-延时校准（满10分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（5分钟） ====="
+          echo "===== 9-延时校准（10分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满5分钟，准备备份"
+          echo "✅ 已运行满10分钟，准备备份"
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
