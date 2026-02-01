@@ -1,43 +1,44 @@
 name: CasaOS纯净部署（备份保留2份+自动清理 稳定精简版）
 
 on:
-  # 手动触发工作流
   workflow_dispatch:
-  # 仓库调度触发（支持外部/内部触发renew_casaos_snapshot类型）
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360  # 修正：原"暂停分钟"→标准字段timeout-minutes
+    timeout-minutes: 360
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
-      PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
+      # ====================== 【已修正】完整打包目录（无遗漏） ======================
+      PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /var/app /DATA /root/.config"
+      # ====================== 【已修正】安全基础排除（无错误、不删核心） ======================
       EXCLUDE_RULES: >-
         --exclude=*.log --exclude=*.tmp --exclude=*.cache
         --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
         --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit
         --exclude=/var/lib/docker/image/*/layerdb/cache
         --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志
+      # ==================================================================================
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      REPO: ${{ secrets.REPO }}  # 修正：原"收紧"→语义对应REPO
+      REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 300  # 仅此处修改：从15改为300分钟
+      TARGET_RUN_MINUTES: 30  # 这里从 300 改成 30
 
     steps:
       - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾|释放20+G）
-        if: ${{ always() }}  # 修正：语法规范，括号无空格
+        if: ${{ always() }}
         run: |
-          set -e  # 修正：原"集合 -e"→标准shell命令set -e
+          set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq  # 修正：Sudo→sudo
+          sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -45,19 +46,19 @@ jobs:
           sudo systemctl daemon-reload
           sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
           sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true  # 修正：中文"非交互式"→英文noninteractive
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
-          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true  # 修正：& &→&&
+          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo "✅系统初始化+全域清理完成，释放20+G空间"
 
       - name: 2-官方纯净安装 Docker（含 compose）
         run: |
           set -e
           echo "===== 2-安装 Docker ====="
-          curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun  # 修正：卷曲 -FSSL→curl -fsSL，须多→sudo bash
+          curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
           sudo systemctl enable --now docker containerd && sleep 2
-          docker --version && docker compose version  # 修正：Docker→docker，Compose Version→compose version，&→&&
+          docker --version && docker compose version
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
 
@@ -65,7 +66,7 @@ jobs:
         run: |
           set -e
           echo "===== 3-安装 CasaOS ====="
-          curl -fsSL https://get.casaos.io | sudo bash  # 修正：须多狂欢→sudo bash
+          curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
 
@@ -73,14 +74,14 @@ jobs:
         run: |
           set -e
           echo "===== 4-配置管理员用户 ====="
-          USER_NAME="roots"  # 修正：原"根"→roots（避免中文用户名问题）
-          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"  # 修正：& >/dev/null→&>/dev/null
-          [ -n "$ROOTS_PASSWORD" ] && echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd || {  # 修正：&→&&，中文标点→英文标点
+          USER_NAME="roots"
+          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
+          [ -n "$ROOTS_PASSWORD" ] && echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd || {
             RANDOM_PASS=$(openssl rand -base64 12)
             echo "$USER_NAME:$RANDOM_PASS" | sudo chpasswd
             echo "🔑 roots 随机密码：$RANDOM_PASS"
           }
-          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null  # 修正：all=（全部）→ALL=(ALL)
+          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
@@ -111,9 +112,9 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
 
-      # ====================== 【优化】多核并行恢复 ======================
+      # ====================== 多核并行恢复（已恢复原版，无多余修复） ======================
       - name: 6-恢复历史快照+权限校正（4核并行解压）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}  # 修正：& &→&&
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
           echo "===== 6-恢复历史数据（4核并行解压） ====="
@@ -131,8 +132,9 @@ jobs:
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
           echo "✅ 多核恢复完成"
-      # =================================================================
+      # ====================================================================================
 
+      # ====================== 启动服务（已恢复原版，无多余修复） ======================
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
           set -e
@@ -143,6 +145,7 @@ jobs:
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 4
           echo "✅ 服务启动完成，CasaOS 可访问"
+      # ==================================================================================
 
       - name: 8-Tailscale 组网（可选）
         run: |
@@ -160,17 +163,17 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 9-延时校准（满300分钟再备份）
+      - name: 9-延时校准（满30分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（300分钟） ====="
+          echo "===== 9-延时校准（30分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满300分钟，准备备份"
+          echo "✅ 已运行满30分钟，准备备份"
 
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
@@ -183,7 +186,7 @@ jobs:
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
 
-      # ====================== 【优化】高压缩率多核打包 ======================
+      # ====================== 高压缩率多核打包（排除规则已修正，无错误） ======================
       - name: 11-1 全量备份-打包压缩（高压缩率+4核多线程）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
@@ -196,17 +199,19 @@ jobs:
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
-          # 扩展排除规则
+          # ====================== 【已修正】完整安全排除（无 local-kv.db 错误排除） ======================
           EXTENDED_EXCLUDES="
           --exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches
+          --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old
           --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
           --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit
           --exclude=/var/lib/docker/image/*/layerdb/cache --exclude=/var/lib/docker/volumes/*/_data/tmp
-          --exclude=/var/lib/docker/volumes/*/_data/cache --exclude=/var/lib/docker/network/files/local-kv.db
+          --exclude=/var/lib/docker/volumes/*/_data/cache
           --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志 --exclude=/DATA/.DS_Store
           --exclude=/root/.cache --exclude=/root/.local/share/Trash --exclude=/root/.npm --exclude=/root/.yarn
           --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*
           "
+          # ==============================================================================================
           pack_data() {
             echo "开始【高压缩率】多线程打包（4核，压缩级别9）：$PERSONAL_DATA_DIRS"
             sudo tar -cPf - \
@@ -233,7 +238,7 @@ jobs:
             exit 1
           fi
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
-      # ======================================================================
+      # ==============================================================================================
 
       - name: 11-2 全量备份-上传WebDAV（显示速率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
