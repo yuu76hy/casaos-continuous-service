@@ -1,15 +1,15 @@
-name: CasaOS + Docker 双全集（全新初始化·恢复不丢·完美版）
+name: CasaOS + Docker 双系统（全新初始化·恢复不丢·终极稳定版）
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [renew_casaos_snapshot]
+  types: [renew_casaos_snapshot]
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      # ====================== 【双全集】CasaOS 官方 + Docker 完整目录 ======================
+      # ====================== 【双系统全集】官方标准目录 ======================
       PERSONAL_DATA_DIRS: |
         /etc/casaos
         /var/lib/casaos
@@ -22,7 +22,7 @@ jobs:
         /var/run/docker
         /var/run/containerd
         /var/lib/containerd
-      # ====================================================================================
+      # ======================================================================
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       EXCLUDE_RULES: >-
         --exclude='*.log' --exclude='*.tmp' --exclude='*.cache'
@@ -38,15 +38,17 @@ jobs:
       TARGET_RUN_MINUTES: 15
 
     steps:
-      - name: 1-系统深度清理
+      - name: 1-系统深度清理（无残留）
         if: ${{ always() }}
         run: |
           set -e
           echo "===== 1-系统深度清理 ====="
           sudo apt update -y -qq
-          sudo apt install -y curl wget tar gzip pigz rclone ca-certificates gnupg -qq
+          sudo apt install -y curl wget tar pigz rclone ca-certificates gnupg -qq
+          # 停止所有服务
           sudo systemctl stop casaos* docker* containerd* 2>/dev/null || true
           sudo systemctl disable casaos* docker* containerd* 2>/dev/null || true
+          # 清理所有目录
           sudo rm -rf /etc/casaos /var/lib/casaos /var/log/casaos /var/run/casaos /DATA 2>/dev/null || true
           sudo rm -rf /var/lib/docker /etc/docker /var/run/docker /var/run/containerd /var/lib/containerd 2>/dev/null || true
           sudo apt autoremove -y --purge docker* containerd* 2>/dev/null || true
@@ -54,18 +56,22 @@ jobs:
           sync && sleep 3
           echo "✅ 系统清理完成"
 
-      - name: 2-安装 Docker（仅二进制，不加载旧数据）
+      # ====================== 【全新模式】Docker 正常安装、正常初始化 ======================
+      - name: 2-全新安装 Docker（正常初始化，生成默认目录）
         run: |
           set -e
-          echo "===== 2-安装 Docker ====="
+          echo "===== 2-全新安装 Docker（正常初始化） ====="
+          # 全新安装 Docker，正常启动、正常初始化
           curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
           sudo systemctl daemon-reload
           sudo systemctl enable --now docker containerd
           sleep 5
           docker --version
-          echo "✅ Docker 安装完成"
+          docker info
+          echo "✅ Docker 全新安装完成（正常初始化，可直接使用）"
 
-      - name: 3-安装 CasaOS 二进制（不启动、不初始化）
+      # ====================== 【全新模式】CasaOS 只装二进制，不启动，等快照判断 ======================
+      - name: 3-安装 CasaOS 二进制（不启动）
         run: |
           set -e
           echo "===== 3-安装 CasaOS 二进制 ====="
@@ -88,7 +94,7 @@ jobs:
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf
           sudo chmod 600 /home/runner/.rclone.conf
           rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf
-          # 查找最新快照
+          # 检测最新快照
           LATEST_SNAPSHOT=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep -o 'casaos-full-snapshot.*\.tar\.gz' | sort -r | head -1)
           if [ -n "$LATEST_SNAPSHOT" ]; then
             echo "✅ 检测到快照：$LATEST_SNAPSHOT"
@@ -100,12 +106,13 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
 
-      # ====================== 【关键】只有恢复快照时，才执行恢复 + 锁初始化 ======================
-      - name: 5-恢复快照（仅当有快照时执行）
+      # ====================== 【恢复模式 ONLY】恢复快照 + 锁初始化 ======================
+      - name: 5-恢复双系统数据（仅恢复模式执行）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 5-恢复快照（有快照模式） ====="
+          echo "===== 5-恢复双系统数据（恢复模式） ====="
+          # 停止服务，防止覆盖
           sudo systemctl stop docker containerd casaos* 2>/dev/null || true
           sudo pkill -9 'docker*|casaos*' 2>/dev/null || true
           sync && sleep 3
@@ -113,51 +120,59 @@ jobs:
           # 提前创建目录
           sudo mkdir -p $PERSONAL_DATA_DIRS
           sudo chown -R root:root $PERSONAL_DATA_DIRS
-          sudo chmod -R 755 $PERSONAL_DATA_DIRS
 
-          # 恢复
+          # 恢复全集
           rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
           | sudo pigz -d -p 4 \
           | sudo tar -xf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
 
-          echo "✅ 快照恢复完成"
+          echo "✅ 双系统数据恢复完成"
 
-      # ====================== 【核心】只有恢复快照时，才锁初始化；全新环境不锁 ======================
-      - name: 6-锁定 CasaOS 初始化（仅恢复模式执行，全新模式跳过）
+      - name: 6-锁定 CasaOS 初始化（仅恢复模式执行）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 6-锁定 CasaOS 初始化（仅恢复模式） ====="
+          echo "===== 6-锁定 CasaOS 初始化（恢复模式） ====="
           sudo mkdir -p /var/lib/casaos
           sudo touch /var/lib/casaos/init.lock
           sudo chmod 644 /var/lib/casaos/init.lock
           sudo chown root:root /var/lib/casaos/init.lock
           echo "initialized" | sudo tee /var/lib/casaos/.initialized >/dev/null
           sudo chmod 644 /var/lib/casaos/.initialized
-          echo "✅ CasaOS 已锁定，不会重置"
+          echo "✅ CasaOS 已锁定，不重置"
 
-      - name: 7-修复权限（恢复模式执行，全新模式跳过）
+      - name: 7-修复双系统权限（仅恢复模式执行）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 7-修复权限（仅恢复模式） ====="
+          echo "===== 7-修复双系统权限（恢复模式） ====="
+          # CasaOS
           sudo chown -R root:root /etc/casaos /var/lib/casaos /var/log/casaos /var/run/casaos
           sudo chmod -R 755 /etc/casaos /var/log/casaos /var/run/casaos
           sudo chmod -R 700 /var/lib/casaos
           sudo chown -R root:root /DATA /DATA/AppData
           sudo chmod -R 755 /DATA /DATA/AppData
+          # Docker
           sudo chown -R root:docker /var/lib/docker /etc/docker /var/run/docker /var/run/containerd
           sudo chmod -R 700 /var/lib/docker /var/lib/containerd
           sudo chmod -R 750 /etc/docker /var/run/docker
-          echo "✅ 权限修复完成"
+          echo "✅ 双系统权限修复完成"
 
-      - name: 8-启动服务（全新/恢复通用）
+      # ====================== 【通用】启动服务（全新/恢复都走这里） ======================
+      - name: 8-启动 Docker + CasaOS（通用）
         run: |
           set -e
           echo "===== 8-启动服务 ====="
           sudo systemctl daemon-reload
+          # 1. 启动 Docker
+          # 全新模式：Docker 已初始化，直接用
+          # 恢复模式：Docker 加载旧数据，直接用
           sudo systemctl enable --now docker containerd
-          sleep 10
+          sleep 15
+          docker ps -a
+          # 2. 启动 CasaOS
+          # 全新模式：正常初始化
+          # 恢复模式：已锁定，不重置
           sudo systemctl enable --now casaos
           sleep 10
           echo "✅ Docker + CasaOS 启动完成"
@@ -175,7 +190,7 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           echo "✅ Tailscale 组网成功"
 
-      - name: 10-延时 15 分钟（全新/恢复通用）
+      - name: 10-延时 15 分钟（通用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -197,12 +212,12 @@ jobs:
           sync && sleep 3
           echo "✅ 服务已停止"
 
-      - name: 12-1 双全集打包
+      - name: 12-1 双系统全集打包
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
         run: |
           set -e
-          echo "===== 12-1 打包双全集 ====="
+          echo "===== 12-1 打包双系统全集 ====="
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
@@ -210,7 +225,7 @@ jobs:
 
           sudo tar -cPf - \
             --one-file-system \
-            --ignore-failed-read \
+            --ignore-failed-read            --ignore-failed-read \
             $EXCLUDE_RULES \
             $PERSONAL_DATA_DIRS \
           | sudo pigz -9 -p 4 > $SNAPSHOT_PATH
