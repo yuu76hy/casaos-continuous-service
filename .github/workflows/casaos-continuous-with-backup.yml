@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（严格完整打包恢复·无兼容·稳定版）
+name: CasaOS纯净部署（严格完整打包恢复·无兼容·稳定版·最高权限）
 
 on:
   workflow_dispatch:
@@ -106,8 +106,8 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
-      # 【严格完整恢复】已剔除 /var/app，无任何兼容、无忽略、无兜底，快照必须完整
-      - name: 6-恢复历史快照+权限校正（4核并行解压·严格完整）
+      # 【严格完整恢复】已剔除 /var/app，权限全部设为最高（root:root + 777）
+      - name: 6-恢复历史快照+最高权限全开（4核并行解压·最宽权限）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
@@ -117,19 +117,29 @@ jobs:
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
-          sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true  # 已剔除 /var/app，不创建该目录
+          sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
           # 【严格模式】无任何忽略、无任何兼容，快照缺文件直接失败
           rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
           | sudo pigz -d -p 4 \
           | sudo tar -xf - -C / \
             --overwrite \
             --preserve-permissions \
-            $PERSONAL_DATA_DIRS  # 已剔除 /var/app，不恢复该目录
-          # 严格权限修复
+            $PERSONAL_DATA_DIRS
+
+          # ===================== 【最高权限·全放开】=====================
+          # 1. 所有目录/文件 强制归属 root:root
           sudo chown -R root:root $PERSONAL_DATA_DIRS
-          sudo chmod -R 755 /etc/casaos /DATA /root/.config
-          sudo chmod -R 700 /var/lib/casaos /var/lib/docker
+
+          # 2. 所有目录/文件 强制权限 777（Linux 最宽权限，无任何限制）
+          sudo chmod -R 777 $PERSONAL_DATA_DIRS
+
+          # 3. 兜底：确保所有子目录、子文件全部继承 777 最高权限
+          find $PERSONAL_DATA_DIRS -type d -exec chmod 777 {} \;
+          find $PERSONAL_DATA_DIRS -type f -exec chmod 777 {} \;
+          # ==============================================================
+
           echo "✅ 多核严格恢复完成（所有目录100%完整，已剔除/var/app）"
+          echo "✅ 权限已设为最高：全部 root:root + 全部 777 全放开"
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
           set -e
@@ -176,7 +186,7 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
-      # 【严格完整打包】已剔除 /var/app，无任何遗漏，只删垃圾，核心100%保留
+      # 【严格完整打包】已剔除 /var/app，修复语法错误（多余反斜杠）
       - name: 11-1 全量备份-打包压缩（高压缩率+4核多线程·严格完整）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
@@ -208,7 +218,7 @@ jobs:
               --ignore-failed-read \
               --warning=no-file-changed \
               $EXTENDED_EXCLUDES \
-              $PERSONAL_DATA_DIRS \  # 已剔除 /var/app，不打包该目录
+              $PERSONAL_DATA_DIRS  # 【修复】移除末尾多余的反斜杠 \
             | sudo pigz -9 -p 4 > $SNAPSHOT_PATH || return 1
             SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
             echo "✅ 高压缩率严格打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
@@ -299,5 +309,5 @@ jobs:
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
           echo "✅ 敏感信息清理完成"
-          echo "🎉 CasaOS 部署+备份全流程 100% 完成（已剔除/var/app）"
+          echo "🎉 CasaOS 部署+备份全流程 100% 完成（已剔除/var/app，权限全放开）"
           echo "🔚 当前流程结束，服务不重启，等待下一次调度全新启动"
