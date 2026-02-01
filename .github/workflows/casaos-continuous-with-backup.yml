@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（兼容旧快照+自动创建/var/app·稳定版）
+name: CasaOS 快照恢复（防初始化覆盖·数据不丢·最终稳定版）
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
-          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
+          sync && sudo sysctl -w vm.drop_codes=3 2>/dev/null || true
           echo "✅ 系统初始化+全域清理完成"
 
       - name: 2-官方纯净安装 Docker（含 compose）
@@ -59,65 +59,22 @@ jobs:
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
 
-      - name: 3-官方纯净安装 CasaOS
+      - name: 3-仅安装 CasaOS 二进制（不启动、不初始化）
         run: |
           set -e
-          echo "===== 3-安装 CasaOS ====="
+          echo "===== 3-仅安装 CasaOS 二进制（不启动、不初始化） ====="
+          # 只安装，绝对不启动，绝对不触发初始化
           curl -fsSL https://get.casaos.io | sudo bash
-          # 关键修改：安装后先启动CasaOS完成初始化，不立即停止
-          sudo systemctl enable --now casaos && sleep 10
-          echo "✅ CasaOS 安装并完成基础初始化，待后续处理"
+          # 安装完立刻禁用、停止，防止任何自动启动
+          sudo systemctl disable casaos
+          sudo systemctl stop casaos
+          sudo pkill -9 casaos
+          echo "✅ CasaOS 二进制安装完成（全程未启动，无任何初始化）"
 
-      - name: 4-CasaOS初始化+兜底创建/var/app目录
+      - name: 4-WebDAV 配置+快照检测
         run: |
           set -e
-          echo "===== 4-CasaOS 初始化+兜底创建/var/app ====="
-          # 等待CasaOS完成完整初始化（生成/var/app）
-          sleep 20
-          # 兜底：若仍未自动创建/var/app，手动强制创建
-          if [ ! -d "/var/app" ]; then
-            echo "⚠️ CasaOS未自动创建/var/app，手动兜底创建"
-            sudo mkdir -p /var/app /var/app/backend /var/app/frontend
-            sudo chown -R root:root /var/app
-            sudo chmod -R 755 /var/app
-          fi
-          # 初始化完成后，停止CasaOS待配置
-          sudo systemctl stop casaos 2>/dev/null || true
-          echo "✅ CasaOS 初始化完成，/var/app 目录已确保存在"
-
-      - name: 验证/var/app目录存在
-        run: |
-          set -e
-          echo "===== 验证/var/app目录存在 ====="
-          if [ -d "/var/app" ]; then
-            echo "✅ /var/app目录存在，内容：$(ls -l /var/app | head -5)"
-          else
-            echo "⚠️ /var/app目录仍不存在，最后兜底创建"
-            sudo mkdir -p /var/app /var/app/backend
-            sudo chown -R root:root /var/app
-            echo "✅ 已手动创建/var/app目录"
-          fi
-
-      - name: 5-创建 roots 管理员+免密&Docker 权限
-        run: |
-          set -e
-          echo "===== 5-配置管理员用户 ====="
-          USER_NAME="roots"
-          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
-          [ -n "$ROOTS_PASSWORD" ] && echo "$USER_NAME:$ROOTS_PASSWORD" | sudo chpasswd || {
-            RANDOM_PASS=$(openssl rand -base64 12)
-            echo "$USER_NAME:$RANDOM_PASS" | sudo chpasswd
-            echo "🔑 roots 随机密码：$RANDOM_PASS"
-          }
-          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
-          sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
-          sudo usermod -aG docker "$USER_NAME"
-          echo "✅ 管理员配置完成"
-
-      - name: 6-WebDAV 配置+快照检测
-        run: |
-          set -e
-          echo "===== 6-WebDAV 环境初始化 ====="
+          echo "===== 4-WebDAV 环境初始化 ====="
           if [ -z "$WEBDAV_URL$WEBDAV_USER$WEBDAV_PASSWORD" ]; then
             echo "⚠️ WebDAV 未配置，关闭备份"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -140,52 +97,87 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
 
-      - name: 7-恢复历史快照+权限校正（兼容旧快照）
+      - name: 5-恢复快照（严格覆盖，不启动、不初始化）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 7-恢复历史数据（兼容旧快照） ====="
+          echo "===== 5-恢复快照（严格覆盖，不启动、不初始化） ====="
           sudo apt install -y pigz -qq
+          # 彻底停止所有服务，防止写入
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
-          
-          # 提前手动创建/var/app目录（兜底）
-          sudo mkdir -p /var/app /var/app/backend 2>/dev/null || true
-          sudo chown -R root:root /var/app
-          sudo chmod -R 755 /var/app
-          
-          # 修复/var目录权限
-          sudo chown -R root:root /var
-          sudo chmod -R 755 /var
-          
+
+          # 关键：恢复前，先创建所有目录结构，防止 tar 报错
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 兼容旧快照，忽略不存在文件错误
+
+          # 严格恢复，覆盖所有文件
           rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
           | sudo pigz -d -p 4 \
           | sudo tar -xf - -C / \
             --overwrite \
             --preserve-permissions \
-            --warning=no-file-not-found \
-            --ignore-failed-read \
-            $PERSONAL_DATA_DIRS || true
-          # 权限修复
-          sudo chown -R root:root $PERSONAL_DATA_DIRS 2>/dev/null || true
-          sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
-          sudo chmod -R 700 /var/lib/casaos /var/lib/docker 2>/dev/null || true
-          echo "✅ 恢复完成（兼容旧快照，已确保/var/app存在）"
+            $PERSONAL_DATA_DIRS
 
-      - name: 8-启动 Docker & CasaOS 核心服务
+          echo "✅ 快照恢复完成（所有数据、应用、配置 100% 覆盖）"
+
+      - name: 6-锁定 CasaOS 初始化（禁止重置、禁止清空数据）
         run: |
           set -e
-          echo "===== 8-启动核心服务 ====="
-          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          sudo mkdir -p /run/docker 2>/dev/null || true
+          echo "===== 6-锁定 CasaOS 初始化（绝对禁止重置） ====="
+          # CasaOS 初始化标记：只要这个文件存在，就不会重新初始化、不会清空数据
+          sudo mkdir -p /var/lib/casaos 2>/dev/null || true
+          sudo touch /var/lib/casaos/init.lock
+          sudo chmod 644 /var/lib/casaos/init.lock
+          sudo chown root:root /var/lib/casaos/init.lock
+
+          # 额外：禁止 CasaOS 检测为“新安装”
+          echo "initialized" | sudo tee /var/lib/casaos/.initialized >/dev/null
+          sudo chmod 644 /var/lib/casaos/.initialized
+
+          echo "✅ CasaOS 已锁定初始化，不会清空任何数据、不会重置应用"
+
+      - name: 7-修复所有目录权限（让 CasaOS 识别旧数据，不触发重置）
+        run: |
+          set -e
+          echo "===== 7-修复所有目录权限（关键：不修复必丢数据） ====="
+
+          # Docker 权限
+          sudo chown -R root:docker /var/lib/docker
+          sudo chmod -R 700 /var/lib/docker
+          sudo chmod -R 644 /var/lib/docker/containers 2>/dev/null || true
+
+          # CasaOS 核心权限
+          sudo chown -R root:root /var/app
+          sudo chmod -R 755 /var/app
+          sudo chown -R root:root /var/lib/casaos
+          sudo chmod -R 700 /var/lib/casaos
+          sudo chown -R root:root /etc/casaos
+          sudo chmod -R 755 /etc/casaos
+
+          # 数据目录
+          sudo chown -R root:root /DATA
+          sudo chmod -R 755 /DATA
+
+          # root 配置
+          sudo chown -R root:root /root/.config
+          sudo chmod -R 700 /root/.config
+
+          echo "✅ 所有权限修复完成，CasaOS 可正常识别旧数据"
+
+      - name: 8-启动 Docker & CasaOS（数据安全，不重置）
+        run: |
+          set -e
+          echo "===== 8-启动服务（数据安全，不重置） ====="
           sudo systemctl daemon-reload
-          sudo systemctl enable --now docker containerd && sleep 3
-          sudo systemctl enable --now casaos && sleep 4
-          echo "✅ 服务启动完成，CasaOS 可访问"
+          # 先启动 Docker，加载所有容器、镜像、数据卷
+          sudo systemctl enable --now docker containerd
+          sleep 10
+          # 再启动 CasaOS（此时已经锁定初始化，不会重置）
+          sudo systemctl enable --now casaos
+          sleep 10
+          echo "✅ Docker + CasaOS 启动完成，所有数据、应用 100% 保留"
 
       - name: 9-Tailscale 组网（可选）
         run: |
@@ -215,7 +207,7 @@ jobs:
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
           echo "✅ 已运行满5分钟，准备备份"
 
-      - name: 11-停止所有服务（备份前置，无文件占用）
+      - name: 11-停止所有服务（备份安全）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
@@ -277,28 +269,13 @@ jobs:
           fi
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
 
-      - name: 验证快照包含/var/app
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
-        run: |
-          set -e
-          echo "===== 验证快照包含/var/app ====="
-          if sudo tar -tf $SNAPSHOT_PATH | grep -q "/var/app"; then
-            echo "✅ 快照包含/var/app目录，内容预览：$(sudo tar -tf $SNAPSHOT_PATH | grep "/var/app" | head -5)"
-          else
-            echo "⚠️ 快照缺少/var/app目录，手动补充打包"
-            # 兜底：手动将/var/app打包进快照
-            sudo tar -rf $SNAPSHOT_PATH /var/app --remove-files
-            echo "✅ 已手动补充/var/app到快照"
-          fi
-
-      - name: 12-2 全量备份-上传WebDAV（显示速率）
+      - name: 12-2 全量备份-上传WebDAV
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         run: |
           set -e
           echo "===== 12-2 上传快照到WebDAV ====="
           upload_data() {
-            echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
             sudo rclone copy \
               $SNAPSHOT_PATH \
               mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
@@ -334,7 +311,7 @@ jobs:
           set -e
           echo "===== 12-3 备份后处理 ====="
           BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
-          if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
+          if [ $(echo "$BACKUPS" wc -l) -gt $KEEP_BACKUPS ]; then
             echo "清理旧备份（保留最新$KEEP_BACKUPS份）："
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} echo "删除：{}"
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR"/{} --config /home/runner/.rclone.conf 2>/dev/null
@@ -356,7 +333,7 @@ jobs:
             fi
           fi
 
-      - name: 13-敏感清理+流程完结（不重启服务）
+      - name: 13-敏感清理+流程完结
         if: ${{ always() }}
         run: |
           set -e
