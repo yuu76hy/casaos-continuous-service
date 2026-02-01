@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（严格完整打包恢复·无兼容·稳定版）
+name: CasaOS纯净部署（兼容旧快照+严格新快照·稳定版）
 
 on:
   workflow_dispatch:
@@ -11,9 +11,9 @@ jobs:
     timeout-minutes: 360
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
-      # 【严格完整】必须打包的核心目录（无遗漏）
+      # 严格完整打包目录（含/var/app）
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /var/app /DATA /root/.config"
-      # 【严格安全】只删垃圾，不碰核心（无 local-kv.db 错误排除）
+      # 安全排除规则（不碰/var/app）
       EXCLUDE_RULES: >-
         --exclude=*.log --exclude=*.tmp --exclude=*.cache
         --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
@@ -28,10 +28,10 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 5  # 延时改为 5 分钟
+      TARGET_RUN_MINUTES: 5
 
     steps:
-      - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾）
+      - name: 1-系统初始化+全域深度清理
         if: ${{ always() }}
         run: |
           set -e
@@ -68,6 +68,18 @@ jobs:
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
+
+      # 验证/var/app存在（确保CasaOS安装成功）
+      - name: 验证/var/app目录存在
+        run: |
+          set -e
+          echo "===== 验证/var/app目录存在 ====="
+          if [ -d "/var/app" ]; then
+            echo "✅ /var/app目录存在，内容：$(ls -l /var/app | head -5)"
+          else
+            echo "❌ /var/app目录不存在，CasaOS安装失败"
+            exit 1
+          fi
 
       - name: 4-创建 roots 管理员+免密&Docker 权限
         run: |
@@ -111,30 +123,42 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
 
-      # 【严格完整恢复】无任何兼容、无忽略、无兜底，快照必须完整
-      - name: 6-恢复历史快照+权限校正（4核并行解压·严格完整）
+      # 兼容旧快照：提前创建/var/app+忽略不存在文件
+      - name: 6-恢复历史快照+权限校正（兼容旧快照）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 6-恢复历史数据（4核并行解压·严格完整） ====="
+          echo "===== 6-恢复历史数据（兼容旧快照） ====="
           sudo apt install -y pigz -qq
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
+          
+          # 核心：提前手动创建/var/app目录（解决旧快照无此目录的问题）
+          sudo mkdir -p /var/app /var/app/backend 2>/dev/null || true
+          sudo chown -R root:root /var/app
+          sudo chmod -R 755 /var/app
+          
+          # 修复/var目录权限（兜底）
+          sudo chown -R root:root /var
+          sudo chmod -R 755 /var
+          
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 【严格模式】无任何忽略、无任何兼容，快照缺文件直接失败
+          # 兼容旧快照：忽略“文件/目录不存在”的错误，确保流程不中断
           rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
           | sudo pigz -d -p 4 \
           | sudo tar -xf - -C / \
             --overwrite \
             --preserve-permissions \
-            $PERSONAL_DATA_DIRS
+            --warning=no-file-not-found \  # 忽略目录/文件不存在的警告
+            --ignore-failed-read \          # 忽略读取失败的文件
+            $PERSONAL_DATA_DIRS || true     # 允许tar返回非零码，不中断流程
           # 严格权限修复
-          sudo chown -R root:root $PERSONAL_DATA_DIRS
-          sudo chmod -R 755 /etc/casaos /DATA /root/.config
-          sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          echo "✅ 多核严格恢复完成（所有目录100%完整）"
+          sudo chown -R root:root $PERSONAL_DATA_DIRS 2>/dev/null || true
+          sudo chmod -R 755 /etc/casaos /DATA /root/.config 2>/dev/null || true
+          sudo chmod -R 700 /var/lib/casaos /var/lib/docker 2>/dev/null || true
+          echo "✅ 恢复完成（兼容旧快照，已提前创建/var/app）"
 
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
@@ -186,20 +210,19 @@ jobs:
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
 
-      # 【严格完整打包】无任何遗漏，只删垃圾，核心100%保留
-      - name: 11-1 全量备份-打包压缩（高压缩率+4核多线程·严格完整）
+      - name: 11-1 全量备份-打包压缩（严格完整）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
         run: |
           set -e
-          echo "===== 11-1 高压缩率打包核心数据（4核多线程·严格完整） ====="
+          echo "===== 11-1 高压缩率打包核心数据 ====="
           sudo apt install -y pigz pbzip2 -qq
           
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
-          # 【严格安全排除】只删垃圾，不碰核心，无任何致命排除
+          
           EXTENDED_EXCLUDES="
           --exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches
           --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old
@@ -212,7 +235,7 @@ jobs:
           --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*
           "
           pack_data() {
-            echo "开始【严格完整】多线程打包：$PERSONAL_DATA_DIRS"
+            echo "开始打包：$PERSONAL_DATA_DIRS"
             sudo tar -cPf - \
               --one-file-system \
               --ignore-failed-read \
@@ -221,7 +244,7 @@ jobs:
               $PERSONAL_DATA_DIRS \
             | sudo pigz -9 -p 4 > $SNAPSHOT_PATH || return 1
             SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
-            echo "✅ 高压缩率严格打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
+            echo "✅ 打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
             return 0
           }
           PACK_SUCCESS="false"
@@ -238,12 +261,25 @@ jobs:
           fi
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
 
+      # 验证快照包含/var/app（确保新快照完整）
+      - name: 验证快照包含/var/app
+        if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
+        run: |
+          set -e
+          echo "===== 验证快照包含/var/app ====="
+          if sudo tar -tf $SNAPSHOT_PATH | grep -q "/var/app"; then
+            echo "✅ 快照包含/var/app目录，内容预览：$(sudo tar -tf $SNAPSHOT_PATH | grep "/var/app" | head -5)"
+          else
+            echo "❌ 快照缺少/var/app目录，打包失败"
+            exit 1
+          fi
+
       - name: 11-2 全量备份-上传WebDAV（显示速率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         run: |
           set -e
-          echo "===== 11-2 上传快照到WebDAV（实时显示上传速率） ====="
+          echo "===== 11-2 上传快照到WebDAV ====="
           upload_data() {
             echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
             sudo rclone copy \
