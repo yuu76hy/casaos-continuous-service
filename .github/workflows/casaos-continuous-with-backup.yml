@@ -1,22 +1,25 @@
 name: CasaOS纯净部署（备份保留2份+自动清理 稳定精简版）
+
 on:
+  # 手动触发工作流
   workflow_dispatch:
+  # 仓库事件触发（用于自动续跑）
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 360  # 超时时间360分钟
     env:
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
       EXCLUDE_RULES: >-
-        --exclude=*.log --exclude=*.tmp --exclude=*.cache 
-        --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log 
-        --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit 
+        --exclude=*.log --exclude=*.tmp --exclude=*.cache
+        --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
+        --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit
         --exclude=/var/lib/docker/image/*/layerdb/cache
-        --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/logs
+        --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志
       WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
       WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
@@ -25,10 +28,10 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 300  # 仅修改此处：15 → 300
+      TARGET_RUN_MINUTES: 15
 
     steps:
-      - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾｜释放20+G）
+      - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾|释放20+G）
         if: ${{ always() }}
         run: |
           set -e
@@ -95,11 +98,11 @@ jobs:
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
-          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || true
-          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
+          rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf 2>/dev/null || true
+          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 检测到快照：$REMOTE_SNAPSHOTS"
-            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOT" >> "$GITHUB_ENV"
+            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
             echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
           else
             echo "✅ 无快照，纯净启动"
@@ -118,7 +121,7 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          rclone cat mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
+          rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
@@ -138,11 +141,11 @@ jobs:
       - name: 8-Tailscale 组网（可选）
         run: |
           set -e
+          echo "===== 8-Tailscale 组网 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ Tailscale 未配置，跳过"
             exit 0
           fi
-          echo "===== 8-Tailscale 组网 ====="
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
           echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
           sudo apt update -y -qq && sudo apt install -y tailscale -qq
@@ -151,17 +154,17 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 9-延时校准（满300分钟再备份）
+      - name: 9-延时校准（满15分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（300分钟） ====="
+          echo "===== 9-延时校准（15分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满300分钟，准备备份"
+          echo "✅ 已运行满15分钟，准备备份"
 
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
@@ -174,22 +177,45 @@ jobs:
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
 
-      - name: 11-1 全量备份-打包压缩（4核多线程）
+      # ====================== 【已替换】优化版：高压缩率 + 4核多线程打包 ======================
+      - name: 11-1 全量备份-打包压缩（高压缩率+4核多线程）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
         run: |
           set -e
-          echo "===== 11-1 打包压缩核心数据（4核多线程） ====="
-          sudo apt install -y pigz -qq
+          echo "===== 11-1 高压缩率打包核心数据（4核多线程） ====="
+          sudo apt install -y pigz pbzip2 -qq
+          
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
 
+          # 扩展排除规则：进一步剔除垃圾，减小体积 + 提升压缩率
+          EXTENDED_EXCLUDES="
+          --exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches
+          --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old
+          --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
+          --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit
+          --exclude=/var/lib/docker/image/*/layerdb/cache --exclude=/var/lib/docker/volumes/*/_data/tmp
+          --exclude=/var/lib/docker/volumes/*/_data/cache --exclude=/var/lib/docker/network/files/local-kv.db
+          --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志 --exclude=/DATA/.DS_Store
+          --exclude=/root/.cache --exclude=/root/.local/share/Trash --exclude=/root/.npm --exclude=/root/.yarn
+          --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*
+          "
+
           pack_data() {
-            echo "开始多线程打包（使用4核CPU）：$PERSONAL_DATA_DIRS"
-            sudo tar -cPf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS | sudo pigz -p 4 > $SNAPSHOT_PATH || return 1
-            echo "✅ 打包完成，文件：$SNAPSHOT_PATH"
+            echo "开始【高压缩率】多线程打包（4核，压缩级别9）：$PERSONAL_DATA_DIRS"
+            sudo tar -cPf - \
+              --one-file-system \
+              --ignore-failed-read \
+              --warning=no-file-changed \
+              $EXTENDED_EXCLUDES \
+              $PERSONAL_DATA_DIRS \
+            | sudo pigz -9 -p 4 > $SNAPSHOT_PATH || return 1
+
+            SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
+            echo "✅ 高压缩率打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
             return 0
           }
 
@@ -206,9 +232,10 @@ jobs:
             echo "❌ 打包最终失败"
             exit 1
           fi
-          echo "pack_success=true" >> "$GITHUB_OUTPUT"
 
-      # ========== 优化上传：添加速率显示+优化上传参数 ==========
+          echo "pack_success=true" >> "$GITHUB_OUTPUT"
+      # ======================================================================================
+
       - name: 11-2 全量备份-上传WebDAV（显示速率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
@@ -224,7 +251,7 @@ jobs:
             # --low-level-retries 5：底层重试次数（增强稳定性）
             sudo rclone copy \
               $SNAPSHOT_PATH \
-              mywebdav:$WEBDAV_SNAPSHOT_DIR/ \
+              mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
               --config /home/runner/.rclone.conf \
               --transfers 8 \
               --buffer-size 64M \
@@ -232,14 +259,12 @@ jobs:
               --retries 3 \
               --low-level-retries 5 \
               --progress || return 1
-
             # 验证上传成功
-            rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME --config /home/runner/.rclone.conf >/dev/null || return 1
+            rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null || return 1
             sudo rm -f $SNAPSHOT_PATH
             echo "✅ 上传完成，快照已保存到WebDAV"
             return 0
           }
-
           UPLOAD_SUCCESS="false"
           if upload_data; then
             UPLOAD_SUCCESS="true"
@@ -248,7 +273,6 @@ jobs:
             sleep 600
             upload_data && UPLOAD_SUCCESS="true"
           fi
-
           if [ "$UPLOAD_SUCCESS" != "true" ]; then
             echo "❌ 上传最终失败"
             exit 1
@@ -260,23 +284,22 @@ jobs:
         run: |
           set -e
           echo "===== 11-3 备份后处理 ====="
-          BACKUPS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
+          BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
           if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
             echo "清理旧备份（保留最新$KEEP_BACKUPS份）："
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} echo "删除：{}"
-            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:$WEBDAV_SNAPSHOT_DIR/{} --config /home/runner/.rclone.conf 2>/dev/null
+            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR"/{} --config /home/runner/.rclone.conf 2>/dev/null
             echo "✅ 旧备份清理完成"
           else
             echo "✅ 当前备份数≤$KEEP_BACKUPS，无需清理"
           fi
-
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
             echo "📌 触发下一轮自动续跑..."
             curl -s -f -X POST \
-              -H "Authorization: token $USER_PAT" \
-              -H "Content-Type: application/json" \
-              https://api.github.com/repos/$REPO/dispatches \
-              -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
+            -H "Authorization: token $USER_PAT" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/$REPO/dispatches \
+            -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
             if [ $? -eq 0 ]; then
               echo "✅ 自动续跑触发成功（仅一次）"
             else
