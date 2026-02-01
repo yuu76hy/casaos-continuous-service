@@ -26,7 +26,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 5
+      TARGET_RUN_MINUTES: 15  # 已修改为15分钟
 
     steps:
       - name: 1-系统初始化+全域深度清理
@@ -46,7 +46,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
-          sync && sudo sysctl -w vm.drop_codes=3 2>/dev/null || true
+          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo "✅ 系统初始化+全域清理完成"
 
       - name: 2-官方纯净安装 Docker（含 compose）
@@ -195,17 +195,17 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
 
-      - name: 10-延时校准（满5分钟再备份）
+      - name: 10-延时校准（满15分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 10-延时校准（5分钟） ====="
+          echo "===== 10-延时校准（15分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满5分钟，准备备份"
+          echo "✅ 已运行满15分钟，准备备份"
 
       - name: 11-停止所有服务（备份安全）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
@@ -311,7 +311,7 @@ jobs:
           set -e
           echo "===== 12-3 备份后处理 ====="
           BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
-          if [ $(echo "$BACKUPS" wc -l) -gt $KEEP_BACKUPS ]; then
+          if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
             echo "清理旧备份（保留最新$KEEP_BACKUPS份）："
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} echo "删除：{}"
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR"/{} --config /home/runner/.rclone.conf 2>/dev/null
