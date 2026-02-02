@@ -25,7 +25,7 @@ jobs:
       # 适配4核16G：全局统一配置
       RCLONE_CONFIG: "/etc/rclone.conf"
       PARALLEL_CORE: 4  # 满4核并行
-      COMPRESS_LEVEL: 8  # 4核16G可拉到8级压缩（平衡速度/体积）
+      COMPRESS_LEVEL: 9  # ✅ 9级最高压缩比
       RCLONE_TRANSFERS: 16  # 16G内存支持高并发上传
       RCLONE_BUFFER: "128M"  # 大内存提升上传缓冲
 
@@ -36,8 +36,8 @@ jobs:
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          # 🔥 修复：补装缺失工具（psmisc=fuser, procps=pkill）+ 基础依赖
-          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz psmisc procps
+          # 🔥 修复：补装缺失工具（psmisc=fuser, procps=pkill）+ 基础依赖 + 中文语言包
+          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz psmisc procps language-pack-zh-hans
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -88,10 +88,10 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
-      - name: 5-WebDAV 配置+快照检测（全局rclone配置，权限修复）
+      - name: 5-WebDAV 配置+快照检测+读写连通性测试（全局rclone配置，权限修复）
         run: |
           set -e
-          echo "===== 5-WebDAV 环境初始化 ====="
+          echo "===== 5-WebDAV 环境初始化+连通性测试 ====="
           if [ -z "$WEBDAV_URL$WEBDAV_USER$WEBDAV_PASSWORD" ]; then
             echo "⚠️ WebDAV 未配置，关闭备份"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -103,6 +103,40 @@ jobs:
           sudo rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config "$RCLONE_CONFIG"
           sudo chmod 600 "$RCLONE_CONFIG"  # 仅root可读，安全
           rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" 2>/dev/null || true
+
+          # ===================== 【新增】WebDAV 读写连通性全链路测试 =====================
+          echo "🔍 开始 WebDAV 读写连通性测试（写文件→上传→校验→删除）"
+          TEST_FILE="test-webdav-connection-$(date +%s).txt"
+          TEST_CONTENT="WebDAV connection test passed at $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "$TEST_CONTENT" | sudo tee /tmp/"$TEST_FILE" >/dev/null
+
+          # 1. 测试写入（上传测试文件）
+          if ! sudo rclone copy "/tmp/$TEST_FILE" mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ --config "$RCLONE_CONFIG" -q; then
+            echo "❌ WebDAV 写入测试失败，连接异常，关闭备份功能"
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
+            rm -f /tmp/"$TEST_FILE"
+            exit 0
+          fi
+
+          # 2. 测试读取（校验文件存在）
+          if ! sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$TEST_FILE" --config "$RCLONE_CONFIG" -q >/dev/null; then
+            echo "❌ WebDAV 读取测试失败，文件未找到，关闭备份功能"
+            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
+            rm -f /tmp/"$TEST_FILE"
+            exit 0
+          fi
+
+          # 3. 测试删除（清理测试文件）
+          if ! sudo rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$TEST_FILE" --config "$RCLONE_CONFIG" -q; then
+            echo "⚠️ WebDAV 删除测试文件失败，但读写核心功能正常，继续流程"
+          else
+            echo "✅ WebDAV 写入→读取→删除 全链路测试通过，连接正常"
+          fi
+          rm -f /tmp/"$TEST_FILE"
+          # ============================================================================
+
           # 🔥 修复：快照名获取，去掉xargs避免空格截断
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" \
             | grep casaos-full-snapshot \
@@ -119,7 +153,7 @@ jobs:
             echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-          echo "✅ WebDAV 初始化完成"
+          echo "✅ WebDAV 初始化+连通性测试完成"
       - name: 6-恢复历史快照+最高权限全开（4核并行·适配4核16G）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -249,7 +283,7 @@ jobs:
               PACK_SUCCESS="true"
             else
               RETRY_COUNT=$((RETRY_COUNT+1))
-              echo "⚠️ 打包失败，第 $RETRY_COUNT 次重试，等待 300s"
+              echo "⚠️ 打包失败，第 $RETRY_COUNT 次重试，等待 300 秒"
               sleep 300
             fi
           done
@@ -260,16 +294,21 @@ jobs:
           fi
           
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
-      - name: 11-2 全量备份-上传WebDAV（显示速率·4核16G高并发）
+      - name: 11-2 全量备份-上传WebDAV（中文进度·实时显示上传速率/耗时/剩余时间）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         run: |
           set -e
-          echo "===== 11-2 上传快照到WebDAV（实时显示上传速率） ====="
+          echo "===== 11-2 上传快照到WebDAV（实时显示上传速率、已用时间、剩余时间） ====="
+          # 🔥 核心：启用中文本地化，让rclone进度显示全中文
+          export LANG=zh_CN.UTF-8
+          export LC_ALL=zh_CN.UTF-8
+          export LC_TIME=zh_CN.UTF-8
+          
           upload_data() {
             echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
-            # 🔥 修复：统一rclone config + 4核16G高并发参数
-            sudo rclone copy \
+            # 🔥 中文进度 + 4核16G高并发参数
+            sudo -E rclone copy \
               "$SNAPSHOT_PATH" \
               mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
               --config "$RCLONE_CONFIG" \
@@ -279,15 +318,15 @@ jobs:
               --retries 3 \
               --low-level-retries 5 \
               --progress || return 1
-            # 🔥 修复：上传后校验文件存在
+            # 🔥 上传后校验文件存在
             rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config "$RCLONE_CONFIG" >/dev/null || return 1
             sudo rm -f "$SNAPSHOT_PATH"
             echo "✅ 上传完成，快照已保存到WebDAV"
             return 0
           }
           
-          # 🔥 修复：重试逻辑（最多1次重试）
-          MAX_RETRY=1
+          # 🔥 修复：重试逻辑改为【最多3次重试】
+          MAX_RETRY=3
           RETRY_COUNT=0
           UPLOAD_SUCCESS="false"
           while [ $RETRY_COUNT -le $MAX_RETRY ] && [ "$UPLOAD_SUCCESS" != "true" ]; do
@@ -295,7 +334,7 @@ jobs:
               UPLOAD_SUCCESS="true"
             else
               RETRY_COUNT=$((RETRY_COUNT+1))
-              echo "⚠️ 上传失败，第 $RETRY_COUNT 次重试，等待 300s"
+              echo "⚠️ 上传失败，第 $RETRY_COUNT 次重试，等待 300 秒"
               sleep 300
             fi
           done
