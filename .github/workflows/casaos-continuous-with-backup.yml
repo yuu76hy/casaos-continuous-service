@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（严格完整打包恢复·无兼容·稳定版·最高权限）
+name: CasaOS 精简备份（无Docker镜像·公网OpenList本机代理·微软云盘·严格顺序·zstd-19）
 
 on:
   workflow_dispatch:
@@ -6,380 +6,321 @@ on:
     types: [renew_casaos_snapshot]
 
 jobs:
-  casaos-deploy:
+  casaos-deploy-backup:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 1440
     env:
+      # ====================== 1. 公网 OpenList · 本机代理 · 微软云盘 WebDAV（你现在的模式） ======================
+      WEBDAV_URL:          ${{ secrets.WEBDAV_URL }}
+      WEBDAV_USER:         ${{ secrets.WEBDAV_USER }}
+      WEBDAV_PASSWORD:     ${{ secrets.WEBDAV_PASSWORD }}
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
-      # 【严格完整】已剔除 /var/app 目录
-      PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
-      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-      WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
-      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      USER_PAT: ${{ secrets.USER_PAT }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      REPO: ${{ secrets.REPO }}
-      KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 10  # 🔥 已改为 10 分钟延时
-      # 适配4核16G：全局统一配置
-      RCLONE_CONFIG: "/etc/rclone.conf"
-      PARALLEL_CORE: 4  # 满4核并行
-      COMPRESS_LEVEL: 9  # ✅ 9级最高压缩比
-      RCLONE_TRANSFERS: 16  # 16G内存支持高并发上传
-      RCLONE_BUFFER: "128M"  # 大内存提升上传缓冲
+
+      # ====================== 2. 精简备份目录（无 Docker 镜像，不变） ======================
+      PERSONAL_DATA_DIRS: "
+        /var/lib/docker/containers
+        /var/lib/docker/volumes
+        /var/lib/docker/overlay2
+        /etc/casaos
+        /var/lib/casaos
+        /DATA
+        /root/.config
+      "
+
+      # ====================== 3. 通用配置（不变） ======================
+      ROOTS_PASSWORD:      ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT:            ${{ secrets.USER_PAT }}
+      REPO:                ${{ secrets.REPO }}
+      KEEP_BACKUPS:        2
+      TARGET_RUN_MINUTES:  10
+
+      # ====================== 4. OpenList 本机代理 · 微软云盘 专属 rclone 优化参数 ======================
+      RCLONE_CONFIG:       "/etc/rclone.conf"
+      PARALLEL_CORE:       4
+      ZSTD_LEVEL:          19
+      RCLONE_TRANSFERS:    1          # 本机代理/微软云盘 必须单线程，多线程必限流
+      RCLONE_BUFFER:       "512M"
+      WEBDAV_CHUNK_SIZE:   "64M"      # 本机代理支持完整分块 & 断点续传
+      MAX_REDIRECT:        20         # 本机代理一般跳转少，20 足够
+      TIMEOUT:             "120m"
+      CONTIMEOUT:          "10m"
+      # 本机代理公网适配：关闭 https 校验，禁用 http2，更稳定
+      WEBDAV_EXTRA_FLAGS:  "--no-check-certificate --disable-http2"
 
     steps:
-      - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾）
+      # ====================================== 步骤 1：系统初始化 + 全域深度清理 ======================================
+      - name: 1-系统初始化 + 全域深度清理
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 1-系统初始化+全域深度清理 ====="
+          echo "===== 1-系统初始化 + 全域深度清理 ====="
           sudo apt update -y -qq
-          # 🔥 修复：补装缺失工具（psmisc=fuser, procps=pkill）+ 基础依赖 + 中文语言包
-          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz psmisc procps language-pack-zh-hans
+          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hans
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
           sudo systemctl daemon-reload
-          # 🔥 修复：删除危险的 /usr/local/lib 清理，只清理无用预装工具
-          sudo rm -rf /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
-          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          echo "✅ 系统初始化+全域清理完成"
-      - name: 2-官方纯净安装 Docker（含 compose，保留官方源）
+          echo "✅ 系统初始化完成"
+
+      # ====================================== 步骤 2：安装 Docker ======================================
+      - name: 2-安装 Docker（官方源 + 阿里云镜像）
         run: |
           set -e
           echo "===== 2-安装 Docker ====="
-          # ✅ 保留你原有官方脚本，不替换国内源
           curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
           sudo systemctl enable --now docker containerd && sleep 2
           docker --version && docker compose version
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
-      - name: 3-官方纯净安装 CasaOS（保留官方源）
+
+      # ====================================== 步骤 3：安装 CasaOS（安装后禁用自启） ======================================
+      - name: 3-安装 CasaOS（安装后禁用自启，严格顺序）
         run: |
           set -e
           echo "===== 3-安装 CasaOS ====="
-          # ✅ 保留你原有官方脚本，不替换国内源
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
-          echo "✅ CasaOS 安装完成，待配置"
-      - name: 4-创建 roots 管理员+免密&Docker 权限
+          sudo systemctl disable casaos
+          echo "✅ CasaOS 安装完成（已禁用自启，等待 Docker 完全就绪）"
+
+      # ====================================== 步骤 4：配置 roots 管理员 ======================================
+      - name: 4-配置 roots 管理员（免密 + Docker 权限）
         run: |
           set -e
-          echo "===== 4-配置管理员用户 ====="
+          echo "===== 4-配置 roots 管理员 ====="
           USER_NAME="roots"
           id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
-          # 🔥 修复：特殊密码兼容（避免含!@#$解析失败）
           if [ -n "$ROOTS_PASSWORD" ]; then
             printf "%s:%s\n" "$USER_NAME" "$ROOTS_PASSWORD" | sudo chpasswd
           else
             RANDOM_PASS=$(openssl rand -base64 12)
             printf "%s:%s\n" "$USER_NAME" "$RANDOM_PASS" | sudo chpasswd
             echo "::add-mask::$RANDOM_PASS"
-            echo "🔑 roots 随机密码已生成（已掩码）"
+            echo "🔑 roots 随机密码已生成"
           fi
           echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
-      - name: 5-WebDAV 配置+快照检测+读写连通性测试（全局rclone配置，权限修复）
+
+      # ====================================== 步骤 5：配置 rclone 连接公网 OpenList（本机代理） ======================================
+      - name: 5-配置 rclone 连接公网 OpenList（本机代理·微软云盘）
         run: |
           set -e
-          echo "===== 5-WebDAV 环境初始化+连通性测试 ====="
+          echo "===== 5-配置 rclone（公网 OpenList 本机代理） ====="
           if [ -z "$WEBDAV_URL$WEBDAV_USER$WEBDAV_PASSWORD" ]; then
-            echo "⚠️ WebDAV 未配置，关闭备份"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
-            exit 0
+            echo "❌ WebDAV 信息未配置"
+            exit 1
           fi
-          # 🔥 修复：rclone配置放到/etc（root可读），统一配置文件
+
+          # 🔥 本机代理模式：vendor=onedrive 适配微软云盘 WebDAV
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
-          sudo rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config "$RCLONE_CONFIG"
-          sudo chmod 600 "$RCLONE_CONFIG"  # 仅root可读，安全
-          rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" 2>/dev/null || true
+          sudo rclone config create mywebdav webdav \
+            url="$WEBDAV_URL" \
+            user="$WEBDAV_USER" \
+            pass="$ENCRYPTED_PASS" \
+            vendor="onedrive" \
+            --config "$RCLONE_CONFIG"
+          sudo chmod 600 "$RCLONE_CONFIG"
 
-          # ===================== 【新增】WebDAV 读写连通性全链路测试（修复权限问题） =====================
-          echo "🔍 开始 WebDAV 读写连通性测试（写文件→上传→校验→删除）"
-          TEST_FILE="test-webdav-connection-$(date +%s).txt"
-          TEST_CONTENT="WebDAV connection test passed at $(date '+%Y-%m-%d %H:%M:%S')"
-          # 🔥 修复：去掉 sudo，/tmp 目录普通用户可读写，文件所有者为 runner，后续可正常删除
-          echo "$TEST_CONTENT" | tee /tmp/"$TEST_FILE" >/dev/null
+          # 创建备份目录
+          sudo rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" 2>/dev/null || true
 
-          # 1. 测试写入（上传测试文件，rclone 需 sudo 读取配置文件，保持不变）
+          # 连通性测试
+          TEST_FILE="test-openlist-$(date +%s).txt"
+          echo "OpenList Native Proxy Test" | tee /tmp/"$TEST_FILE" >/dev/null
           if ! sudo rclone copy "/tmp/$TEST_FILE" mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ --config "$RCLONE_CONFIG" -q; then
-            echo "❌ WebDAV 写入测试失败，连接异常，关闭备份功能"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
-            rm -f /tmp/"$TEST_FILE"  # 普通用户可删除自己创建的文件
-            exit 0
+            echo "❌ OpenList 连接失败"
+            exit 1
           fi
-
-          # 2. 测试读取（校验文件存在，保持不变）
-          if ! sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$TEST_FILE" --config "$RCLONE_CONFIG" -q >/dev/null; then
-            echo "❌ WebDAV 读取测试失败，文件未找到，关闭备份功能"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
-            rm -f /tmp/"$TEST_FILE"  # 普通用户可删除自己创建的文件
-            exit 0
-          fi
-
-          # 3. 测试删除（清理测试文件，保持不变）
-          if ! sudo rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$TEST_FILE" --config "$RCLONE_CONFIG" -q; then
-            echo "⚠️ WebDAV 删除测试文件失败，但读写核心功能正常，继续流程"
-          else
-            echo "✅ WebDAV 写入→读取→删除 全链路测试通过，连接正常"
-          fi
-          # 🔥 修复：现在文件所有者是 runner，普通 rm 即可删除，无权限问题
+          sudo rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$TEST_FILE" --config "$RCLONE_CONFIG" -q
           rm -f /tmp/"$TEST_FILE"
-          # ============================================================================
+          echo "✅ OpenList 连接正常"
 
-          # 🔥 修复：快照名获取，去掉xargs避免空格截断
-          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" \
-            | grep casaos-full-snapshot \
-            | sed 's/^[0-9]\+ //' \
-            | sort -r \
-            | head -1 \
-            | tr -d '\n')
-          if [ -n "$REMOTE_SNAPSHOTS" ]; then
-            echo "✅ 检测到快照：$REMOTE_SNAPSHOTS"
-            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
+          # 检测远端快照
+          REMOTE_SNAPSHOT=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" \
+            | grep casaos-full-snapshot | grep -E "\.tar\.zst$" \
+            | sed 's/^[0-9]\+ //' | sort -r | head -1 | tr -d '\n')
+          if [ -n "$REMOTE_SNAPSHOT" ]; then
+            echo "✅ 检测到历史备份：$REMOTE_SNAPSHOT"
+            echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOT" >> "$GITHUB_ENV"
             echo "HAS_SNAPSHOT=true" >> "$GITHUB_ENV"
           else
-            echo "✅ 无快照，纯净启动"
+            echo "✅ 无历史备份"
             echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
           fi
-          echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-          echo "✅ WebDAV 初始化+连通性测试完成"
-      - name: 6-恢复历史快照+最高权限全开（4核并行·适配4核16G）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
+
+      # ====================================== 步骤 6：恢复历史备份（如有） ======================================
+      - name: 6-恢复历史备份（精简版·无 Docker 镜像）
+        if: ${{ env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
-          echo "===== 6-恢复历史数据（4核并行解压·严格完整） ====="
-          # 🔥 修复：停止服务（无kill -9，避免数据损坏）
+          echo "===== 6-恢复历史备份 ====="
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
-          sudo pkill -f "docker|containerd|casaos" 2>/dev/null || true  # 去掉-9
+          sudo pkill -f "docker|containerd|casaos" 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
-          sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 🔥 修复：添加 -P 匹配打包参数，恢复绝对路径
-          rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config "$RCLONE_CONFIG" \
-          | sudo pigz -d -p $PARALLEL_CORE \
-          | sudo tar -xPf - -C / \
-            --overwrite \
-            $PERSONAL_DATA_DIRS
-          # ===================== 【权限修复·满足Docker要求】=====================
+
+          # 下载备份（rclone 断点续传）
+          echo "🔽 下载备份：$LATEST_SNAPSHOT"
+          sudo rclone copy mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" /tmp/ \
+            --config "$RCLONE_CONFIG" \
+            --transfers $RCLONE_TRANSFERS \
+            --buffer-size $RCLONE_BUFFER \
+            --webdav-chunk-size $WEBDAV_CHUNK_SIZE \
+            --max-redirect $MAX_REDIRECT \
+            --timeout $TIMEOUT \
+            --contimeout $CONTIMEOUT \
+            $WEBDAV_EXTRA_FLAGS \
+            --resume \
+            --progress
+
+          # zstd 解压恢复
+          echo "🗂️ 解压恢复系统"
+          zstd -d -c "/tmp/$LATEST_SNAPSHOT" | sudo tar -xPf - -C / --overwrite $PERSONAL_DATA_DIRS
+          sudo rm -f "/tmp/$LATEST_SNAPSHOT"
+
+          # 权限修复
           sudo chown -R root:docker /var/lib/docker
           sudo chmod -R 750 /var/lib/docker
           sudo chown -R root:root /etc/casaos /var/lib/casaos
           sudo chmod -R 755 /etc/casaos /var/lib/casaos
           sudo chown -R roots:roots /DATA /root/.config
           sudo chmod -R 775 /DATA /root/.config
-          # ======================================================================
-          echo "✅ 多核严格恢复完成（所有目录100%完整，已剔除/var/app）"
-          echo "✅ 权限已按系统要求配置，Docker/CasaOS可正常启动"
-      - name: 7-启动 Docker & CasaOS 核心服务
+          echo "✅ 备份恢复完成"
+
+      # ====================================== 步骤 7：严格顺序启动 Docker + 拉取所有镜像 + 运行所有容器 ======================================
+      - name: 7-【严格顺序】完整启动 Docker → 拉取所有镜像 → 运行所有容器
         run: |
           set -e
-          echo "===== 7-启动核心服务 ====="
-          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          sudo mkdir -p /run/docker 2>/dev/null || true
+          echo "===== 7-【严格顺序】Docker 全量启动 + 镜像拉取 + 容器运行 ====="
+          # 彻底重启 Docker，加载容器元数据
           sudo systemctl daemon-reload
-          sudo systemctl enable --now docker containerd && sleep 3
-          sudo systemctl enable --now casaos && sleep 4
-          # 🔥 新增：健康检查
-          docker info >/dev/null 2>&1 || { echo "❌ Docker 启动失败"; exit 1; }
-          timeout 10 bash -c 'until nc -z localhost 80; do sleep 1; done' || { echo "⚠️ CasaOS 80端口未就绪，继续流程"; }
-          echo "✅ 服务启动完成，CasaOS 可访问"
-      - name: 8-Tailscale 组网（可选）
-        run: |
-          set -e
-          echo "===== 8-Tailscale 组网 ====="
-          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Tailscale 未配置，跳过"
+          sudo systemctl restart docker containerd
+          sleep 15
+
+          # 提取所有容器镜像（去重）
+          IMAGES=$(docker ps -a --format "{{.Image}}" | grep -v "^$" | sort | uniq)
+          if [ -z "$IMAGES" ]; then
+            echo "✅ 无容器，跳过拉取镜像"
             exit 0
           fi
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt update -y -qq && sudo apt install -y tailscale -qq
-          sudo systemctl enable --now tailscaled && sleep 2
-          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
-          TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
-          echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
-      - name: 9-延时校准（满10分钟再备份）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
+
+          # 批量拉取所有镜像
+          echo "🚀 批量拉取镜像："
+          for IMG in $IMAGES; do
+            echo "Pulling: $IMG"
+            docker pull "$IMG"
+          done
+
+          # 拉取完成，重启所有容器
+          echo "🔄 重启所有容器"
+          docker restart $(docker ps -a -q)
+          sleep 40
+
+          # 验证运行状态
+          echo "✅ Docker 运行正常"
+          echo "✅ 容器运行列表："
+          docker ps
+          echo "✅ Docker 完全就绪"
+
+      # ====================================== 步骤 8：Docker 完全就绪后，最后启动 CasaOS ======================================
+      - name: 8-【最后启动】Docker 100% 就绪后，启动 CasaOS
         run: |
           set -e
-          echo "===== 9-延时校准（10分钟） ====="
-          START_TIME=$(date +%s)
-          sleep 5
-          CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
-          WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
-          # 🔥 修复：强制非负，避免sleep负数报错
-          WAIT_TIME=$(( WAIT_TIME > 0 ? WAIT_TIME : 0 ))
-          sleep $WAIT_TIME
-          echo "✅ 已运行满10分钟，准备备份"
-      - name: 10-停止所有服务（备份前置，无文件占用）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
+          echo "===== 8-【最后启动】CasaOS（Docker 已完全就绪） ====="
+          sudo systemctl enable --now casaos
+          sleep 15
+          echo "✅ CasaOS 启动完成（无镜像不完整报错）"
+
+      # ====================================== 步骤 9：系统稳定延时 ======================================
+      - name: 9-系统稳定延时
         run: |
           set -e
-          echo "===== 10-停止所有服务（备份安全） ====="
-          # 🔥 修复：无kill -9，温和停止+清理pid
-          sudo systemctl stop casaos docker containerd tailscaled 2>/dev/null || true
-          sudo pkill -f "casaos|docker|containerd|tailscaled" 2>/dev/null || true
-          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
-          sync && sleep 5
-          echo "✅ 所有服务已停止，可安全备份"
-      - name: 11-1 全量备份-打包压缩（4核满核·适配4核16G·严格完整）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
-        id: backup_pack
+          echo "===== 9-系统稳定延时 $TARGET_RUN_MINUTES 分钟 ====="
+          sleep $((TARGET_RUN_MINUTES * 60))
+          echo "✅ 系统稳定"
+
+      # ====================================== 步骤 10：打包精简备份（zstd-19） ======================================
+      - name: 10-打包精简备份（无 Docker 镜像·zstd-19）
         run: |
           set -e
-          echo "===== 11-1 高压缩率打包核心数据（4核满核·严格完整） ====="
-          # 🔥 适配4核16G：磁盘空间检查（避免tmp满）
-          REQUIRED_SPACE_GB=30
-          AVAILABLE_SPACE_GB=$(df -BG /tmp | awk 'NR==2 {print $4}' | tr -d 'G')
-          if [ "$AVAILABLE_SPACE_GB" -lt "$REQUIRED_SPACE_GB" ]; then
-            echo "❌ /tmp 空间不足，需要 $REQUIRED_SPACE_GB GB，剩余 $AVAILABLE_SPACE_GB GB"
-            exit 1
-          fi
-          SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
-          SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
+          echo "===== 10-打包精简备份（zstd-19） ====="
+          sudo systemctl stop docker containerd casaos 2>/dev/null || true
+          sudo pkill -f "docker|containerd|casaos" 2>/dev/null || true
+          sync && sleep 2
+
+          SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
+          echo "🗜️ 生成备份：$SNAPSHOT_NAME"
+
+          sudo tar -cPf - --warning=no-file-changed $PERSONAL_DATA_DIRS \
+            | zstd -$ZSTD_LEVEL -T$PARALLEL_CORE \
+            > /tmp/$SNAPSHOT_NAME
+
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
-          echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
-          # 🔥 修复：排除规则改用数组，避免参数拆分错误
-          EXTENDED_EXCLUDES=(
-            --exclude="*.log" --exclude="*.logs" --exclude="*.tmp" --exclude="*.temp" --exclude="*.cache" --exclude="*.caches"
-            --exclude="*.pid" --exclude="*.lock" --exclude="*.swp" --exclude="*.bak" --exclude="*.old"
-            --exclude="/var/lib/docker/tmp" --exclude="/var/lib/docker/containers/*/*.log"
-            --exclude="/var/lib/docker/overlay2/*/tmp" --exclude="/var/lib/docker/buildkit"
-            --exclude="/var/lib/docker/image/*/layerdb/cache" --exclude="/var/lib/docker/volumes/*/_data/tmp"
-            --exclude="/var/lib/docker/volumes/*/_data/cache"
-            --exclude="/DATA/tmp" --exclude="/DATA/cache" --exclude="/DATA/日志" --exclude="/DATA/.DS_Store"
-            --exclude="/root/.cache" --exclude="/root/.local/share/Trash" --exclude="/root/.npm" --exclude="/root/.yarn"
-            --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/run/*" --exclude="/var/spool/*"
-          )
-          
-          pack_data() {
-            echo "开始【严格完整】多线程打包（已剔除/var/app）：$PERSONAL_DATA_DIRS"
-            # 🔥 修复：使用数组展开排除规则
-            sudo tar -cPf - --warning=no-file-changed "${EXTENDED_EXCLUDES[@]}" $PERSONAL_DATA_DIRS \
-            | sudo pigz -$COMPRESS_LEVEL -p $PARALLEL_CORE > "$SNAPSHOT_PATH" || return 1
-            
-            SNAPSHOT_SIZE=$(du -sh "$SNAPSHOT_PATH" | awk '{print $1}')
-            echo "✅ 高压缩率严格打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
-            return 0
-          }
-          
-          # 🔥 修复：重试逻辑（最多1次重试，避免无限等待）
-          MAX_RETRY=1
-          RETRY_COUNT=0
-          PACK_SUCCESS="false"
-          while [ $RETRY_COUNT -le $MAX_RETRY ] && [ "$PACK_SUCCESS" != "true" ]; do
-            if pack_data; then
-              PACK_SUCCESS="true"
-            else
-              RETRY_COUNT=$((RETRY_COUNT+1))
-              echo "⚠️ 打包失败，第 $RETRY_COUNT 次重试，等待 300 秒"
-              sleep 300
-            fi
-          done
-          
-          if [ "$PACK_SUCCESS" != "true" ]; then
-            echo "❌ 打包最终失败"
-            exit 1
-          fi
-          
-          echo "pack_success=true" >> "$GITHUB_OUTPUT"
-      - name: 11-2 全量备份-上传WebDAV（中文进度·实时显示上传速率/耗时/剩余时间）
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
-        id: backup_upload
+          echo "✅ 备份完成：$(du -h /tmp/$SNAPSHOT_NAME)"
+
+      # ====================================== 步骤 11：上传备份到公网 OpenList（本机代理） ======================================
+      - name: 11-上传备份到公网 OpenList（本机代理·微软云盘）
         run: |
           set -e
-          echo "===== 11-2 上传快照到WebDAV（实时显示上传速率、已用时间、剩余时间） ====="
-          # 🔥 核心：启用中文本地化，让rclone进度显示全中文
-          export LANG=zh_CN.UTF-8
-          export LC_ALL=zh_CN.UTF-8
-          export LC_TIME=zh_CN.UTF-8
-          
-          upload_data() {
-            echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
-            # 🔥 中文进度 + 4核16G高并发参数
-            sudo -E rclone copy \
-              "$SNAPSHOT_PATH" \
-              mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
-              --config "$RCLONE_CONFIG" \
-              --transfers $RCLONE_TRANSFERS \
-              --buffer-size $RCLONE_BUFFER \
-              --fast-list \
-              --retries 3 \
-              --low-level-retries 5 \
-              --progress || return 1
-            # 🔥 上传后校验文件存在
-            rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config "$RCLONE_CONFIG" >/dev/null || return 1
-            sudo rm -f "$SNAPSHOT_PATH"
-            echo "✅ 上传完成，快照已保存到WebDAV"
-            return 0
-          }
-          
-          # 🔥 修复：重试逻辑改为【最多3次重试】
-          MAX_RETRY=3
-          RETRY_COUNT=0
-          UPLOAD_SUCCESS="false"
-          while [ $RETRY_COUNT -le $MAX_RETRY ] && [ "$UPLOAD_SUCCESS" != "true" ]; do
-            if upload_data; then
-              UPLOAD_SUCCESS="true"
-            else
-              RETRY_COUNT=$((RETRY_COUNT+1))
-              echo "⚠️ 上传失败，第 $RETRY_COUNT 次重试，等待 300 秒"
-              sleep 300
-            fi
-          done
-          
-          if [ "$UPLOAD_SUCCESS" != "true" ]; then
-            echo "❌ 上传最终失败"
-            exit 1
-          fi
-          
-          echo "upload_success=true" >> "$GITHUB_OUTPUT"
-      - name: 11-3 备份后处理-清理旧备份+触发续跑
-        if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_upload.outputs.upload_success == 'true' }}
+          echo "===== 11-上传备份到 OpenList ====="
+          SNAPSHOT_NAME="$SNAPSHOT_NAME"
+          sudo rclone copy /tmp/$SNAPSHOT_NAME mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
+            --config "$RCLONE_CONFIG" \
+            --transfers $RCLONE_TRANSFERS \
+            --buffer-size $RCLONE_BUFFER \
+            --webdav-chunk-size $WEBDAV_CHUNK_SIZE \
+            --max-redirect $MAX_REDIRECT \
+            --timeout $TIMEOUT \
+            --contimeout $CONTIMEOUT \
+            $WEBDAV_EXTRA_FLAGS \
+            --resume \
+            --retries 10 \
+            --retries-sleep 60s \
+            --stats 30s \
+            --progress
+          sudo rm -f /tmp/$SNAPSHOT_NAME
+          echo "✅ 上传完成"
+
+      # ====================================== 步骤 12：清理旧备份 ======================================
+      - name: 12-自动清理旧备份（保留最新 2 份）
         run: |
           set -e
-          echo "===== 11-3 备份后处理 ====="
-          BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r)
-          if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
-            echo "清理旧备份（保留最新$KEEP_BACKUPS份）："
-            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} echo "删除：{}"
-            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR"/{} --config "$RCLONE_CONFIG" 2>/dev/null
+          echo "===== 12-自动清理旧备份 ====="
+          OLD_SNAPSHOTS=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" \
+            | grep casaos-full-snapshot | grep -E "\.tar\.zst$" \
+            | sed 's/^[0-9]\+ //' | sort -r | tail -n +$((KEEP_BACKUPS+1)) | tr '\n' ' ')
+          if [ -n "$OLD_SNAPSHOTS" ]; then
+            for snap in $OLD_SNAPSHOTS; do
+              sudo rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$snap" --config "$RCLONE_CONFIG" -q
+            done
             echo "✅ 旧备份清理完成"
-          else
-            echo "✅ 当前备份数≤$KEEP_BACKUPS，无需清理"
           fi
+
+      # ====================================== 步骤 13：自动触发下一轮备份 ======================================
+      - name: 13-自动触发下一轮备份
+        run: |
+          set -e
+          echo "===== 13-自动触发下一轮备份 ====="
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
-            echo "📌 触发下一轮自动续跑..."
-            # 🔥 修复：去掉-f，避免续跑失败中断主流程
             curl -s -X POST \
-            -H "Authorization: token $USER_PAT" \
-            -H "Content-Type: application/json" \
-            https://api.github.com/repos/$REPO/dispatches \
-            -d '{"event_type": "renew_casaos_snapshot"}' >/dev/null 2>&1 || true
-            echo "✅ 自动续跑触发成功（仅一次）"
+              -H "Authorization: token $USER_PAT" \
+              -H "Content-Type: application/json" \
+              https://api.github.com/repos/$REPO/dispatches \
+              -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
+            echo "✅ 下一轮备份已触发"
           fi
-      - name: 12-敏感清理+流程完结（不重启服务）
+
+      # ====================================== 步骤 14：最终清理 ======================================
+      - name: 14-最终清理
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 12-清理+完结 ====="
-          # 🔥 修复：不全局清理 /tmp/*，只删除本次生成的快照文件
+          echo "===== 14-最终清理 ====="
           sudo rm -rf /tmp/casaos-full-snapshot-* "$RCLONE_CONFIG" /etc/sudoers.d/roots 2>/dev/null || true
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          sudo rm -rf /var/cache/apt/* 2>/dev/null || true
-          echo "✅ 敏感信息清理完成"
-          echo "🎉 CasaOS 部署+备份全流程 100% 完成（已剔除/var/app，权限合规）"
-          echo "🔚 当前流程结束，服务不重启，等待下一次调度全新启动"
+          echo "✅ 全部清理完成"
+          echo "🎉 CasaOS 精简备份（本机代理 OpenList·严格顺序·zstd-19）全流程完成"
