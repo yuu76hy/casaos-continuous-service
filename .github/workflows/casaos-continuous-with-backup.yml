@@ -21,7 +21,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 300  # 🔥 已改为 300 分钟延时
+      TARGET_RUN_MINUTES: 10  # 🔥 已改为 10 分钟延时
       # 适配4核16G：全局统一配置
       RCLONE_CONFIG: "/etc/rclone.conf"
       PARALLEL_CORE: 4  # 满4核并行
@@ -37,20 +37,20 @@ jobs:
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
           # 🔥 修复：补装缺失工具（psmisc=fuser, procps=pkill）+ 基础依赖
-          sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz psmisc procps -qq
+          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz psmisc procps
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
           sudo systemctl daemon-reload
-          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
+          # 🔥 修复：删除危险的 /usr/local/lib 清理，只清理无用预装工具
+          sudo rm -rf /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
           sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo "✅ 系统初始化+全域清理完成"
-
       - name: 2-官方纯净安装 Docker（含 compose，保留官方源）
         run: |
           set -e
@@ -61,7 +61,6 @@ jobs:
           docker --version && docker compose version
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
-
       - name: 3-官方纯净安装 CasaOS（保留官方源）
         run: |
           set -e
@@ -70,7 +69,6 @@ jobs:
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
-
       - name: 4-创建 roots 管理员+免密&Docker 权限
         run: |
           set -e
@@ -83,13 +81,13 @@ jobs:
           else
             RANDOM_PASS=$(openssl rand -base64 12)
             printf "%s:%s\n" "$USER_NAME" "$RANDOM_PASS" | sudo chpasswd
-            echo "🔑 roots 随机密码：$RANDOM_PASS"
+            echo "::add-mask::$RANDOM_PASS"
+            echo "🔑 roots 随机密码已生成（已掩码）"
           fi
           echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
-
       - name: 5-WebDAV 配置+快照检测（全局rclone配置，权限修复）
         run: |
           set -e
@@ -105,8 +103,13 @@ jobs:
           sudo rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config "$RCLONE_CONFIG"
           sudo chmod 600 "$RCLONE_CONFIG"  # 仅root可读，安全
           rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" 2>/dev/null || true
-          # 检测最新快照
-          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
+          # 🔥 修复：快照名获取，去掉xargs避免空格截断
+          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config "$RCLONE_CONFIG" \
+            | grep casaos-full-snapshot \
+            | sed 's/^[0-9]\+ //' \
+            | sort -r \
+            | head -1 \
+            | tr -d '\n')
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 检测到快照：$REMOTE_SNAPSHOTS"
             echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
@@ -117,7 +120,6 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
-
       - name: 6-恢复历史快照+最高权限全开（4核并行·适配4核16G）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -129,21 +131,22 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 🔥 修复：删除--preserve-permissions（与强制权限冲突）+ 4核并行解压
+          # 🔥 修复：添加 -P 匹配打包参数，恢复绝对路径
           rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config "$RCLONE_CONFIG" \
           | sudo pigz -d -p $PARALLEL_CORE \
-          | sudo tar -xf - -C / \
+          | sudo tar -xPf - -C / \
             --overwrite \
             $PERSONAL_DATA_DIRS
-          # ===================== 【最高权限·全放开】=====================
-          sudo chown -R root:root $PERSONAL_DATA_DIRS
-          sudo chmod -R 777 $PERSONAL_DATA_DIRS
-          find $PERSONAL_DATA_DIRS -type d -exec chmod 777 {} \;
-          find $PERSONAL_DATA_DIRS -type f -exec chmod 777 {} \;
-          # ==============================================================
+          # ===================== 【权限修复·满足Docker要求】=====================
+          sudo chown -R root:docker /var/lib/docker
+          sudo chmod -R 750 /var/lib/docker
+          sudo chown -R root:root /etc/casaos /var/lib/casaos
+          sudo chmod -R 755 /etc/casaos /var/lib/casaos
+          sudo chown -R roots:roots /DATA /root/.config
+          sudo chmod -R 775 /DATA /root/.config
+          # ======================================================================
           echo "✅ 多核严格恢复完成（所有目录100%完整，已剔除/var/app）"
-          echo "✅ 权限已设为最高：全部 root:root + 全部 777 全放开"
-
+          echo "✅ 权限已按系统要求配置，Docker/CasaOS可正常启动"
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
           set -e
@@ -153,8 +156,10 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 4
+          # 🔥 新增：健康检查
+          docker info >/dev/null 2>&1 || { echo "❌ Docker 启动失败"; exit 1; }
+          timeout 10 bash -c 'until nc -z localhost 80; do sleep 1; done' || { echo "⚠️ CasaOS 80端口未就绪，继续流程"; }
           echo "✅ 服务启动完成，CasaOS 可访问"
-
       - name: 8-Tailscale 组网（可选）
         run: |
           set -e
@@ -170,19 +175,19 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
-
-      - name: 9-延时校准（满300分钟再备份）
+      - name: 9-延时校准（满10分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（300分钟） ====="
+          echo "===== 9-延时校准（10分钟） ====="
           START_TIME=$(date +%s)
           sleep 5
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
-          [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满300分钟，准备备份"
-
+          # 🔥 修复：强制非负，避免sleep负数报错
+          WAIT_TIME=$(( WAIT_TIME > 0 ? WAIT_TIME : 0 ))
+          sleep $WAIT_TIME
+          echo "✅ 已运行满10分钟，准备备份"
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -194,7 +199,6 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
-
       - name: 11-1 全量备份-打包压缩（4核满核·适配4核16G·严格完整）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
@@ -208,26 +212,27 @@ jobs:
             echo "❌ /tmp 空间不足，需要 $REQUIRED_SPACE_GB GB，剩余 $AVAILABLE_SPACE_GB GB"
             exit 1
           fi
-
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
-          # 🔥 修复：删除--one-file-system（跨分区备份）+ --ignore-failed-read（严格模式）
-          EXTENDED_EXCLUDES="--exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches \
-          --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old \
-          --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log \
-          --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit \
-          --exclude=/var/lib/docker/image/*/layerdb/cache --exclude=/var/lib/docker/volumes/*/_data/tmp \
-          --exclude=/var/lib/docker/volumes/*/_data/cache \
-          --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志 --exclude=/DATA/.DS_Store \
-          --exclude=/root/.cache --exclude=/root/.local/share/Trash --exclude=/root/.npm --exclude=/root/.yarn \
-          --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*"
+          # 🔥 修复：排除规则改用数组，避免参数拆分错误
+          EXTENDED_EXCLUDES=(
+            --exclude="*.log" --exclude="*.logs" --exclude="*.tmp" --exclude="*.temp" --exclude="*.cache" --exclude="*.caches"
+            --exclude="*.pid" --exclude="*.lock" --exclude="*.swp" --exclude="*.bak" --exclude="*.old"
+            --exclude="/var/lib/docker/tmp" --exclude="/var/lib/docker/containers/*/*.log"
+            --exclude="/var/lib/docker/overlay2/*/tmp" --exclude="/var/lib/docker/buildkit"
+            --exclude="/var/lib/docker/image/*/layerdb/cache" --exclude="/var/lib/docker/volumes/*/_data/tmp"
+            --exclude="/var/lib/docker/volumes/*/_data/cache"
+            --exclude="/DATA/tmp" --exclude="/DATA/cache" --exclude="/DATA/日志" --exclude="/DATA/.DS_Store"
+            --exclude="/root/.cache" --exclude="/root/.local/share/Trash" --exclude="/root/.npm" --exclude="/root/.yarn"
+            --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/run/*" --exclude="/var/spool/*"
+          )
           
           pack_data() {
             echo "开始【严格完整】多线程打包（已剔除/var/app）：$PERSONAL_DATA_DIRS"
-            # 🔥 修复：无--one-file-system、无--ignore-failed-read，严格打包
-            sudo tar -cPf - --warning=no-file-changed $EXTENDED_EXCLUDES $PERSONAL_DATA_DIRS \
+            # 🔥 修复：使用数组展开排除规则
+            sudo tar -cPf - --warning=no-file-changed "${EXTENDED_EXCLUDES[@]}" $PERSONAL_DATA_DIRS \
             | sudo pigz -$COMPRESS_LEVEL -p $PARALLEL_CORE > "$SNAPSHOT_PATH" || return 1
             
             SNAPSHOT_SIZE=$(du -sh "$SNAPSHOT_PATH" | awk '{print $1}')
@@ -255,7 +260,6 @@ jobs:
           fi
           
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
-
       - name: 11-2 全量备份-上传WebDAV（显示速率·4核16G高并发）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
@@ -302,7 +306,6 @@ jobs:
           fi
           
           echo "upload_success=true" >> "$GITHUB_OUTPUT"
-
       - name: 11-3 备份后处理-清理旧备份+触发续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_upload.outputs.upload_success == 'true' }}
         run: |
@@ -327,16 +330,15 @@ jobs:
             -d '{"event_type": "renew_casaos_snapshot"}' >/dev/null 2>&1 || true
             echo "✅ 自动续跑触发成功（仅一次）"
           fi
-
       - name: 12-敏感清理+流程完结（不重启服务）
         if: ${{ always() }}
         run: |
           set -e
           echo "===== 12-清理+完结 ====="
-          # 🔥 修复：清理全局rclone配置
-          sudo rm -rf /tmp/* "$RCLONE_CONFIG" /etc/sudoers.d/roots 2>/dev/null || true
+          # 🔥 修复：不全局清理 /tmp/*，只删除本次生成的快照文件
+          sudo rm -rf /tmp/casaos-full-snapshot-* "$RCLONE_CONFIG" /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
           echo "✅ 敏感信息清理完成"
-          echo "🎉 CasaOS 部署+备份全流程 100% 完成（已剔除/var/app，权限全放开）"
+          echo "🎉 CasaOS 部署+备份全流程 100% 完成（已剔除/var/app，权限合规）"
           echo "🔚 当前流程结束，服务不重启，等待下一次调度全新启动"
