@@ -27,7 +27,7 @@ jobs:
       USER_PAT:            ${{ secrets.USER_PAT }}
       REPO:                ${{ secrets.REPO }}
       KEEP_BACKUPS:        2
-      TARGET_RUN_MINUTES:  10
+      TARGET_RUN_MINUTES:  1  # 系统稳定延时已设为1分钟
 
       # ====================== 4. 压缩 & 上传参数 ======================
       RCLONE_CONFIG:       "/etc/rclone.conf"
@@ -42,18 +42,18 @@ jobs:
       WEBDAV_EXTRA_FLAGS:  "--no-check-certificate --disable-http2"
 
     steps:
-      # ====================================== Step 1：系统初始化 + 深度清理（升级rclone至最新版） ======================================
+      # ====================================== Step 1：系统初始化 + 深度清理（修复语言包名称） ======================================
       - name: 1-系统初始化 + 全域深度清理
         if: ${{ always() }}
         run: |
           set -euo pipefail
           echo -e "\033[1;34m===== 1-系统初始化 + 全域深度清理 =====\033[0m"
           
-          # 修复：去掉独立的fuser包（fuser包含在psmisc中）
+          # 修复：语言包名称改为正确的language-pack-zh-hans，同时安装openssl
           sudo apt update -y -qq
-          sudo apt install -y -qq curl wget jq tar gzip lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hanss
+          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hans openssl
           
-          # 关键修改：升级rclone至最新稳定版（解决参数兼容问题）
+          # 升级rclone至最新稳定版（解决参数兼容问题）
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip rclone-current-linux-amd64.zip
           sudo cp rclone-*-linux-amd64/rclone /usr/bin/
@@ -70,7 +70,7 @@ jobs:
           # 强制释放文件锁（fuser来自psmisc，已安装）
           sudo fuser -k /var/lib/docker /var/lib/casaos 2>/dev/null || true
           
-          # 全域缓存清理（修复：不删/root/.config）
+          # 全域缓存清理（不删/root/.config）
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /var/cache/apt/* /var/lib/docker/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           
@@ -250,7 +250,7 @@ jobs:
             --config "$RCLONE_CONFIG" \
             --transfers $RCLONE_TRANSFERS \
             --buffer-size $RCLONE_BUFFER \
-            --backend-flag "webdav-chunk-size=$WEBDAV_CHUNK_SIZE" \  # 同步修正下载时的参数
+            --backend-flag "webdav-chunk-size=$WEBDAV_CHUNK_SIZE" \
             --max-redirect $MAX_REDIRECT \
             --timeout $TIMEOUT \
             --contimeout $CONTIMEOUT \
@@ -258,7 +258,7 @@ jobs:
             --resume \
             --progress
           
-          # 解压恢复（修复：保留权限/ACL）
+          # 解压恢复（保留权限/ACL）
           echo -e "\033[1;33m🗜️ 解压恢复系统\033[0m"
           zstd -d -c "/tmp/$LATEST_SNAPSHOT" | sudo tar -xP --preserve-permissions --preserve-acls --selinux -f - -C / --overwrite --ignore-failed-read $PERSONAL_DATA_DIRS
           sudo rm -f "/tmp/$LATEST_SNAPSHOT"
@@ -329,7 +329,7 @@ jobs:
           echo -e "\033[1;31m❌ CasaOS 启动失败\033[0m"
           exit 1
 
-      # ====================================== Step 10：系统稳定延时 ======================================
+      # ====================================== Step 10：系统稳定延时（1分钟） ======================================
       - name: 10-系统稳定延时
         run: |
           set -euo pipefail
@@ -353,7 +353,7 @@ jobs:
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
           echo -e "\033[1;33m🗜️ 生成备份：$SNAPSHOT_NAME\033[0m"
           
-          # 打包（修复：--one-file-system 避免跨分区冗余）
+          # 打包（避免跨分区冗余）
           sudo tar -cPf - --one-file-system --warning=no-file-changed --ignore-failed-read $PERSONAL_DATA_DIRS \
             | zstd -$ZSTD_LEVEL -T$PARALLEL_CORE \
             > /tmp/$SNAPSHOT_NAME
@@ -373,12 +373,12 @@ jobs:
           set -euo pipefail
           echo -e "\033[1;34m===== 12-上传备份到 OpenList =====\033[0m"
           
-          # 关键修改：将--webdav-chunk-size改为--backend-flag传递
+          # 上传（修复参数传递方式）
           sudo rclone copy /tmp/$SNAPSHOT_NAME mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
             --config "$RCLONE_CONFIG" \
             --transfers $RCLONE_TRANSFERS \
             --buffer-size $RCLONE_BUFFER \
-            --backend-flag "webdav-chunk-size=$WEBDAV_CHUNK_SIZE" \  # 修复参数传递方式
+            --backend-flag "webdav-chunk-size=$WEBDAV_CHUNK_SIZE" \
             --max-redirect $MAX_REDIRECT \
             --timeout $TIMEOUT \
             --contimeout $CONTIMEOUT \
@@ -430,7 +430,7 @@ jobs:
             exit 0
           fi
           
-          # 触发 repository dispatch（修复：增加HTTP码校验）
+          # 触发 repository dispatch（增加HTTP码校验）
           RESPONSE=$(curl -s -w "%{http_code}" -X POST \
             -H "Authorization: token $USER_PAT" \
             -H "Accept: application/vnd.github.v3+json" \
@@ -452,7 +452,7 @@ jobs:
           set -euo pipefail
           echo -e "\033[1;34m===== 15-最终清理 =====\033[0m"
           
-          # 新增：退出 Tailscale，停止服务
+          # 退出 Tailscale，停止服务
           sudo tailscale down 2>/dev/null || true
           sudo systemctl stop tailscaled 2>/dev/null || true
           sudo systemctl disable tailscaled 2>/dev/null || true
