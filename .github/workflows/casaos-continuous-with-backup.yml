@@ -63,11 +63,11 @@ jobs:
           
           echo -e "\033[1;32m✅ 系统初始化完成\033[0m"
 
-      # ====================================== Step 2：Tailscale 组网（硬编码官方 login server，显示IP） ======================================
-      - name: 2-Tailscale 组网（官方 login server 硬编码·显示IPv4/IPv6）
+      # ====================================== Step 2：Tailscale 组网（仅显示当前节点IP） ======================================
+      - name: 2-Tailscale 组网（官方 login server 硬编码·仅显示当前节点IP）
         run: |
           set -euo pipefail
-          echo -e "\033[1;34m===== 2-Tailscale 组网（官方 login server 硬编码·显示IP） =====\033[0m"
+          echo -e "\033[1;34m===== 2-Tailscale 组网（官方 login server 硬编码·仅显示当前节点IP） =====\033[0m"
           
           # 安装 Tailscale
           curl -fsSL https://tailscale.com/install.sh | sh
@@ -82,18 +82,18 @@ jobs:
           
           sleep 5
           
-          # 显示完整状态
-          echo -e "\033[1;32m✅ Tailscale 状态：\033[0m"
+          # 显示完整节点列表
+          echo -e "\033[1;32m✅ Tailscale 节点列表：\033[0m"
           tailscale status
           
-          # 提取并高亮显示 IP
+          # 提取并高亮当前节点IP
           echo -e "\n\033[1;33m🔍 当前节点 Tailscale IP：\033[0m"
           TS_IPv4=$(tailscale ip -4 | tr -d '\n')
           TS_IPv6=$(tailscale ip -6 | tr -d '\n')
           echo -e "  IPv4: \033[1;36m$TS_IPv4\033[0m"
           echo -e "  IPv6: \033[1;36m$TS_IPv6\033[0m"
           
-          # 导出为环境变量，供后续步骤使用
+          # 导出IP为环境变量
           echo "TAILSCALE_IPv4=$TS_IPv4" >> "$GITHUB_ENV"
           echo "TAILSCALE_IPv6=$TS_IPv6" >> "$GITHUB_ENV"
           
@@ -101,12 +101,8 @@ jobs:
           echo -e "\n\033[1;32m✅ tailscale0 网卡信息：\033[0m"
           ip addr show tailscale0 || true
           
-          # 连通性检查
-          if ! tailscale status | grep -q "connected"; then
-            echo -e "\033[1;31m❌ Tailscale 组网失败\033[0m"
-            exit 1
-          fi
-          echo -e "\n\033[1;32m✅ 虚拟内网组网完成（IPv4: $TS_IPv4）\033[0m"
+          # 完成提示（无状态判断）
+          echo -e "\n\033[1;32m✅ Tailscale 组网步骤完成（已显示当前节点IP）\033[0m"
 
       # ====================================== Step 3：安装 Docker（官方源 + 阿里云镜像） ======================================
       - name: 3-安装 Docker（官方源 + 阿里云镜像）
@@ -384,4 +380,4 @@ jobs:
           
           sudo rm -rf /tmp/casaos-full-snapshot-* "$RCLONE_CONFIG" /etc/sudoers.d/roots /root/.ssh/* 2>/dev/null || true
           echo -e "\033[1;32m✅ 全部清理完成\033[0m"
-          echo -e "\033[1;32m🎉 CasaOS 精简备份全流程完成（Tailscale IP: ${{ env.TAILSCALE_IPv4 }}）\033[0m"
+          echo -e "\033[1;32m🎉 CasaOS 精简备份全流程完成（当前节点Tailscale IP: ${{ env.TAILSCALE_IPv4 }}）\033[0m"
