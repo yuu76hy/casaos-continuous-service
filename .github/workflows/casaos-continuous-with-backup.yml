@@ -42,7 +42,7 @@ jobs:
       WEBDAV_EXTRA_FLAGS:  "--no-check-certificate --disable-http2"
 
     steps:
-      # ====================================== Step 1：系统初始化 + 深度清理（修复fuser包问题） ======================================
+      # ====================================== Step 1：系统初始化 + 深度清理（升级rclone至最新版） ======================================
       - name: 1-系统初始化 + 全域深度清理
         if: ${{ always() }}
         run: |
@@ -51,7 +51,14 @@ jobs:
           
           # 修复：去掉独立的fuser包（fuser包含在psmisc中）
           sudo apt update -y -qq
-          sudo apt install -y -qq curl wget jq tar gzip rclone lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hans**s**
+          sudo apt install -y -qq curl wget jq tar gzip lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hanss
+          
+          # 关键修改：升级rclone至最新稳定版（解决参数兼容问题）
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
+          unzip rclone-current-linux-amd64.zip
+          sudo cp rclone-*-linux-amd64/rclone /usr/bin/
+          rm -rf rclone-*-linux-amd64 rclone-current-linux-amd64.zip
+          rclone version  # 验证版本
           
           # 清理旧 Docker/CasaOS 残留
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
@@ -243,7 +250,7 @@ jobs:
             --config "$RCLONE_CONFIG" \
             --transfers $RCLONE_TRANSFERS \
             --buffer-size $RCLONE_BUFFER \
-            --webdav-chunk-size $WEBDAV_CHUNK_SIZE \
+            --backend-flag "webdav-chunk-size=$WEBDAV_CHUNK_SIZE" \  # 同步修正下载时的参数
             --max-redirect $MAX_REDIRECT \
             --timeout $TIMEOUT \
             --contimeout $CONTIMEOUT \
@@ -276,7 +283,7 @@ jobs:
           sudo systemctl restart docker containerd
           sleep 15
           
-          # 获取容器镜像（去重）容器镜像（去重）
+          # 获取容器镜像（去重）
           IMAGES=$(docker ps -a --format "{{.Image}}" | grep -v "^$" | sort | uniq || true)
           if [ -z "$IMAGES" ]; then
             echo -e "\033[1;33m✅ 无容器，跳过镜像拉取/容器启动\033[0m"
@@ -366,12 +373,12 @@ jobs:
           set -euo pipefail
           echo -e "\033[1;34m===== 12-上传备份到 OpenList =====\033[0m"
           
-          # 上传（断点续传+重试）
+          # 关键修改：将--webdav-chunk-size改为--backend-flag传递
           sudo rclone copy /tmp/$SNAPSHOT_NAME mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
             --config "$RCLONE_CONFIG" \
             --transfers $RCLONE_TRANSFERS \
             --buffer-size $RCLONE_BUFFER \
-            --webdav-chunk-size $WEBDAV_CHUNK_SIZE \
+            --backend-flag "webdav-chunk-size=$WEBDAV_CHUNK_SIZE" \  # 修复参数传递方式
             --max-redirect $MAX_REDIRECT \
             --timeout $TIMEOUT \
             --contimeout $CONTIMEOUT \
