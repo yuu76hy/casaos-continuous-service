@@ -18,7 +18,7 @@ jobs:
       USER_PAT:            ${{ secrets.USER_PAT }}
       REPO:                ${{ secrets.REPO }}
 
-      # 固定配置（已移除不支持的MAX_REDIRECT）
+      # 固定配置
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS:  "/var/lib/docker/containers /var/lib/docker/volumes /var/lib/docker/overlay2 /etc/casaos /var/lib/casaos /DATA /root/.config"
       KEEP_BACKUPS:        2
@@ -42,8 +42,9 @@ jobs:
           set -euo pipefail
           echo -e "\033[1;34m===== 1-系统初始化+依赖锁定（基础环境） =====\033[0m"
           sudo apt update -y -qq || (echo -e "\033[1;31m❌ apt更新失败\033[0m" && exit 1)
-          sudo apt install -y -qq curl wget jq tar gzip lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hans openssl net-tools iputils-ping || (echo -e "\033[1;31m❌ 依赖安装失败\033[0m" && exit 1)
+          sudo apt install -y -qq curl wget jq tar gzip lsof ca-certificates gnupg pigz zstd psmisc procps language-pack-zh-hans openssl net-tools iputils-ping acl || (echo -e "\033[1;31m❌ 依赖安装失败\033[0m" && exit 1)
           echo -e "\033[1;32m✅ 基础环境初始化完成\033[0m"
+
       # ====================================== 2. 锁定rclone版本（1.60.0稳定版） ======================================
       - name: 2-锁定rclone版本（1.60.0稳定版）
         if: ${{ always() }}
@@ -60,13 +61,15 @@ jobs:
             echo -e "\033[1;31m❌ rclone版本错误（需v1.60.0，当前$RCLONE_VER）\033[0m" && exit 1
           fi
           echo -e "\033[1;32m✅ rclone 1.60.0安装完成\033[0m"
-      # ====================================== 3. 清理系统残留（避免冲突） ======================================
+
+      # ====================================== 3. 清理系统残留（优化：精确卸载Docker包） ======================================
       - name: 3-清理系统残留（避免冲突）
         if: ${{ always() }}
         run: |
           set -euo pipefail
           echo -e "\033[1;34m===== 3-清理系统残留（避免冲突） =====\033[0m"
-          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
+          # 优化：精确卸载Docker核心包，避免误删无关依赖
+          sudo apt remove -y docker-ce docker-ce-cli containerd.io 2>/dev/null || true
           sudo systemctl stop casaos docker containerd 2>/dev/null || true
           sudo systemctl disable casaos docker containerd 2>/dev/null || true
           [ -f /etc/systemd/system/casaos.service ] && sudo rm -f /etc/systemd/system/casaos.service 2>/dev/null || true
@@ -75,6 +78,7 @@ jobs:
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo -e "\033[1;32m✅ 系统残留清理完成\033[0m"
+
       # ====================================== 4. 安装Tailscale客户端 ======================================
       - name: 4-安装Tailscale客户端
         run: |
@@ -83,31 +87,34 @@ jobs:
           curl -fsSL https://tailscale.com/install.sh | sh || (echo -e "\033[1;31m❌ Tailscale安装失败\033[0m" && exit 1)
           sleep 3
           echo -e "\033[1;32m✅ Tailscale客户端安装完成\033[0m"
-      # ====================================== 5. Tailscale安全组网+IP校验 ======================================
+
+      # ====================================== 5. Tailscale安全组网+IP校验（修复：移除引号） ======================================
       - name: 5-Tailscale安全组网+IP校验
         run: |
           set -euo pipefail
           echo -e "\033[1;34m===== 5-Tailscale安全组网+IP校验 =====\033[0m"
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then echo -e "\033[1;31m❌ TAILSCALE_AUTH_KEY为空\033[0m" && exit 1; fi
-          sudo tailscale up --auth-key="$TAILSCALE_AUTH_KEY" --login-server="https://controlplane.tailscale.com" --accept-routes --accept-dns || (echo -e "\033[1;31m❌ Tailscale组网失败\033[0m" && exit 1)
+          # 修复：移除--login-server等号后不必要的引号，避免参数解析错误
+          sudo tailscale up --auth-key="$TAILSCALE_AUTH_KEY" --login-server=https://controlplane.tailscale.com --accept-routes --accept-dns || (echo -e "\033[1;31m❌ Tailscale组网失败\033[0m" && exit 1)
           sleep 8
           TAILSCALE_IP=$(tailscale ip -4 2>/dev/null)
           if [ -z "$TAILSCALE_IP" ]; then echo -e "\033[1;31m❌ Tailscale未获取IP\033[0m" && exit 1; fi
           ping -c 3 $TAILSCALE_IP || (echo -e "\033[1;31m❌ Tailscale网络未就绪\033[0m" && exit 1)
           echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
           echo -e "\033[1;32m✅ Tailscale组网成功，IP：$TAILSCALE_IP\033[0m"
+
       # ====================================== 6. 安装Docker（阿里云镜像加速+安装校验） ======================================
       - name: 6-安装Docker（阿里云镜像加速+安装校验）
         run: |
           set -euo pipefail
           echo -e "\033[1;34m===== 6-安装Docker（阿里云镜像加速） =====\033[0m"
           curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun || (echo -e "\033[1;31m❌ Docker安装失败\033[0m" && exit 1)
-          # 新增：安装后校验Docker是否可用
           sleep 5
           if ! sudo docker --version; then
             echo -e "\033[1;31m❌ Docker安装不完整，命令无法执行\033[0m" && exit 1
           fi
           echo -e "\033[1;32m✅ Docker安装完成\033[0m"
+
       # ====================================== 7. Docker服务启动+权限配置 ======================================
       - name: 7-Docker服务启动+权限配置
         run: |
@@ -115,10 +122,12 @@ jobs:
           echo -e "\033[1;34m===== 7-Docker服务启动+权限配置 =====\033[0m"
           sudo systemctl enable --now docker containerd || (echo -e "\033[1;31m❌ Docker服务启动失败\033[0m" && exit 1)
           sleep 8
-          if ! docker --version; then echo -e "\033[1;31m❌ Docker未安装成功\033[0m" && exit 1; fi
+          if ! sudo docker --version; then echo -e "\033[1;31m❌ Docker未安装成功\033[0m" && exit 1; fi
+          # 注：usermod仅为后续可能的场景，当前shell会话不生效，所有docker命令均加sudo
           sudo usermod -aG docker runner
           newgrp docker || true
-          echo -e "\033[1;32m✅ Docker安装完成：$(docker --version)\033[0m"
+          echo -e "\033[1;32m✅ Docker安装完成：$(sudo docker --version)\033[0m"
+
       # ====================================== 8. 安装CasaOS稳定版 ======================================
       - name: 8-安装CasaOS稳定版
         run: |
@@ -126,6 +135,7 @@ jobs:
           echo -e "\033[1;34m===== 8-安装CasaOS稳定版 =====\033[0m"
           curl -fsSL https://get.casaos.io | sudo bash || (echo -e "\033[1;31m❌ CasaOS安装失败\033[0m" && exit 1)
           echo -e "\033[1;32m✅ CasaOS安装完成\033[0m"
+
       # ====================================== 9. CasaOS自启禁用+安装校验 ======================================
       - name: 9-CasaOS自启禁用+安装校验
         run: |
@@ -135,6 +145,7 @@ jobs:
           sudo systemctl disable casaos || (echo -e "\033[1;31m❌ CasaOS禁用自启失败\033[0m" && exit 1)
           if ! command -v casaos &>/dev/null; then echo -e "\033[1;31m❌ CasaOS未安装成功\033[0m" && exit 1; fi
           echo -e "\033[1;32m✅ CasaOS安装完成（已禁用自启）\033[0m"
+
       # ====================================== 10. roots用户创建+基础配置 ======================================
       - name: 10-roots用户创建+基础配置
         run: |
@@ -151,6 +162,7 @@ jobs:
             echo -e "\033[1;33m🔑 roots随机密码：$RANDOM_PASS\033[0m"
           fi
           echo -e "\033[1;32m✅ roots用户基础配置完成\033[0m"
+
       # ====================================== 11. roots用户权限强化（免密sudo+Docker） ======================================
       - name: 11-roots用户权限强化（免密sudo+Docker）
         run: |
@@ -161,6 +173,7 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME" || true
           echo -e "\033[1;32m✅ roots管理员配置完成\033[0m"
+
       # ====================================== 12. WebDAV核心参数校验 ======================================
       - name: 12-WebDAV核心参数校验
         run: |
@@ -170,6 +183,7 @@ jobs:
           if [ -z "$WEBDAV_USER" ]; then echo -e "\033[1;31m❌ WEBDAV_USER为空\033[0m" && exit 1; fi
           if [ -z "$WEBDAV_PASSWORD" ]; then echo -e "\033[1;31m❌ WEBDAV_PASSWORD为空\033[0m" && exit 1; fi
           echo -e "\033[1;32m✅ WebDAV核心参数校验通过\033[0m"
+
       # ====================================== 13. WebDAV 配置+快照检测 ======================================
       - name: 13-WebDAV 配置+快照检测
         run: |
@@ -196,7 +210,8 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
-      # ====================================== 14. 恢复历史备份（条件执行） ======================================
+
+      # ====================================== 14. 恢复历史备份（条件执行）（修复：新增目录创建+Docker权限） ======================================
       - name: 14-恢复历史备份（条件执行）
         if: ${{ env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -207,14 +222,36 @@ jobs:
           sudo fuser -k /var/lib/docker /var/lib/casaos 2>/dev/null || true
           sync && sleep 3
           echo -e "\033[1;33m🔽 下载备份：$LATEST_SNAPSHOT\033[0m"
-          sudo rclone copy mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" /tmp/ --config /home/runner/.rclone.conf $WEBDAV_EXTRA_FLAGS --progress || (echo -e "\033[1;31m❌ 备份下载失败\033[0m" && exit 1)
-          zstd -d -c /tmp/$LATEST_SNAPSHOT | sudo tar -xP --preserve-permissions --preserve-acls --selinux -f - -C / --overwrite --ignore-failed-read $PERSONAL_DATA_DIRS || (echo -e "\033[1;31m❌ 备份解压失败\033[0m" && exit 1)
+          
+          # 优化：Shell层重试（3次），提升网络操作健壮性
+          BACKUP_DOWNLOAD_SUCCESS=0
+          for i in {1..3}; do
+            if sudo rclone copy mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" /tmp/ --config /home/runner/.rclone.conf $WEBDAV_EXTRA_FLAGS --progress; then
+              BACKUP_DOWNLOAD_SUCCESS=1
+              break
+            fi
+            echo -e "\033[1;33m⚠️  第$i次下载失败，30秒后重试...\033[0m"
+            sleep 30
+          done
+          if [ $BACKUP_DOWNLOAD_SUCCESS -eq 0 ]; then
+            echo -e "\033[1;31m❌ 备份下载失败（3次重试均失败）\033[0m" && exit 1
+          fi
+          
+          # 修复：解压前创建目标目录，避免目录缺失导致解压失败
+          echo -e "\033[1;33m🔧 预创建恢复目录...\033[0m"
+          for DIR in $PERSONAL_DATA_DIRS; do
+            sudo mkdir -p "$DIR"
+          done
+          
+          # 修复：移除tar不兼容参数，所有操作加sudo保证权限
+          zstd -d -c /tmp/$LATEST_SNAPSHOT | sudo tar -xP --preserve-permissions -f - -C / --overwrite --ignore-failed-read $PERSONAL_DATA_DIRS || (echo -e "\033[1;31m❌ 备份解压失败\033[0m" && exit 1)
           sudo rm -f /tmp/$LATEST_SNAPSHOT
           [ -d /var/lib/docker ] && sudo chown -R root:docker /var/lib/docker || true
           [ -d /etc/casaos ] && sudo chown -R root:root /etc/casaos /var/lib/casaos || true
           [ -d /DATA ] && sudo chown -R roots:roots /DATA /root/.config || true
           echo -e "\033[1;32m✅ 备份恢复完成\033[0m"
-      # ====================================== 15. Docker启动+镜像拉取（适配全新环境） ======================================
+
+      # ====================================== 15. Docker启动+镜像拉取（修复：Docker命令加sudo+优化拉取逻辑） ======================================
       - name: 15-Docker启动+镜像拉取（适配全新环境）
         run: |
           set -euo pipefail
@@ -242,12 +279,12 @@ jobs:
           sudo chmod 666 /var/run/docker.sock || true
           newgrp docker >/dev/null 2>&1 || true
 
-          # 4. 容错获取镜像列表（无容器时不报错）
+          # 4. 容错获取镜像列表（修复：所有docker命令加sudo，避免permission denied）
           echo -e "\033[1;33m🔍 检查容器镜像（全新环境可能为空）\033[0m"
-          IMAGES=$(docker ps -a --format "{{.Image}}" 2>/dev/null | grep -v "^$" | sort | uniq || true)
+          IMAGES=$(sudo docker ps -a --format "{{.Image}}" 2>/dev/null | grep -v "^$" | sort | uniq || true)
 
-          # 5. 核心逻辑：有镜像拉取，无镜像跳过（完美适配新环境）
-          if [ -n "$IMAGES" ]; then
+          # 5. 优化：仅当无历史快照时，才执行镜像拉取（恢复备份后镜像已存在，无需重复拉取）
+          if [ "$HAS_SNAPSHOT" != "true" ] && [ -n "$IMAGES" ]; then
             echo -e "\033[1;33m📥 检测到镜像，开始拉取：$IMAGES\033[0m"
             for IMG in $IMAGES; do
               for i in {1..3}; do
@@ -257,34 +294,35 @@ jobs:
               done
             done
           else
-            # 全新环境必然走这里，正常提示，流程继续
-            echo -e "\033[1;32m✅ 全新Docker环境，无镜像需要拉取，跳过此步骤\033[0m"
+            # 全新环境/已恢复备份，跳过镜像拉取
+            echo -e "\033[1;32m✅ 无需拉取镜像（全新环境/已恢复历史备份），跳过此步骤\033[0m"
           fi
 
           echo -e "\033[1;32m🎉 Docker环境准备完成（全新环境适配成功）\033[0m"
-      # ====================================== 16. 容器恢复+健康检查（适配全新环境） ======================================
+
+      # ====================================== 16. 容器恢复+健康检查（修复：Docker命令加sudo） ======================================
       - name: 16-容器恢复+健康检查（适配全新环境）
         run: |
           set -euo pipefail
           echo -e "\033[1;34m===== 16-容器恢复+健康检查 =====\033[0m"
 
-          # 1. 新增：延长Docker服务稳定延时（全新环境必备，确保命令可执行）
+          # 1. 延长Docker服务稳定延时（全新环境必备，确保命令可执行）
           echo -e "\033[1;33m🔧 等待Docker服务完全就绪（20秒）\033[0m"
           sleep 20
 
-          # 2. 新增：再次权限兜底（确保runner用户可执行docker命令）
+          # 2. 再次权限兜底（确保runner用户可执行docker命令）
           sudo chmod 666 /var/run/docker.sock || true
           newgrp docker >/dev/null 2>&1 || true
 
-          # 3. 容错获取容器ID（增加错误重定向，避免命令失败报错）
+          # 3. 容错获取容器ID（修复：所有docker命令加sudo，避免permission denied）
           echo -e "\033[1;33m🔍 检查容器列表（全新环境可能为空）\033[0m"
-          CONTAINER_IDS=$(docker ps -a -q 2>/dev/null | grep -v "^$" || true)
+          CONTAINER_IDS=$(sudo docker ps -a -q 2>/dev/null | grep -v "^$" || true)
 
           # 4. 核心逻辑：有容器则启动，无容器则跳过（完美适配全新环境）
           if [ -n "$CONTAINER_IDS" ]; then
             echo -e "\033[1;33m🚀 启动所有Docker容器\033[0m"
             # 启动容器时增加sudo兜底+错误重试（1次）
-            if ! docker start $CONTAINER_IDS; then
+            if ! sudo docker start $CONTAINER_IDS; then
               echo -e "\033[1;33m⚠️  首次启动失败，重试1次...\033[0m"
               sleep 10
               sudo docker start $CONTAINER_IDS || (echo -e "\033[1;31m❌ 容器启动失败\033[0m" && exit 1)
@@ -295,10 +333,11 @@ jobs:
             echo -e "\033[1;32m✅ 全新Docker环境，无容器需要启动，跳过此步骤\033[0m"
           fi
 
-          # 5. 容错统计运行容器数（增加错误重定向，避免命令失败报错）
+          # 5. 容错统计运行容器数（修复：docker命令加sudo）
           echo -e "\033[1;33m🔍 统计运行容器数\033[0m"
-          RUNNING_COUNT=$(docker ps 2>/dev/null | wc -l || echo 0)
+          RUNNING_COUNT=$(sudo docker ps 2>/dev/null | wc -l || echo 0)
           echo -e "\033[1;32m✅ Docker就绪，运行容器数：$RUNNING_COUNT\033[0m"
+
       # ====================================== 17. CasaOS启动+健康检查 ======================================
       - name: 17-CasaOS启动+健康检查
         run: |
@@ -315,6 +354,7 @@ jobs:
             sleep 12
           done
           echo -e "\033[1;31m❌ CasaOS启动失败或端口未通\033[0m" && exit 1
+
       # ====================================== 18. 系统稳定延时（$TARGET_RUN_MINUTES分钟） ======================================
       - name: 18-系统稳定延时（$TARGET_RUN_MINUTES分钟）
         run: |
@@ -326,7 +366,8 @@ jobs:
             echo -e "\033[1;33m⚠️  延时时间为0，跳过休眠\033[0m"
           fi
           echo -e "\033[1;32m✅ 系统稳定运行完成\033[0m"
-      # ====================================== 19. 完整备份流程（打包+上传+清理+触发续跑）（修复rclone参数） ======================================
+
+      # ====================================== 19. 完整备份流程（打包+上传+清理+触发续跑）（优化：清理逻辑+重试） ======================================
       - name: 19-完整备份流程（打包+上传+清理+触发续跑）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -336,37 +377,61 @@ jobs:
           sudo pkill -f "docker|containerd|casaos" 2>/dev/null || true
           sudo fuser -k /var/lib/docker /var/lib/casaos 2>/dev/null || true
           sync && sleep 3
+          
+          # 预创建备份目录
           for DIR in $PERSONAL_DATA_DIRS; do
             [ -d "$DIR" ] || sudo mkdir -p "$DIR" && echo -e "\033[1;33m⚠️  创建缺失目录：$DIR\033[0m"
           done
+          
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
           echo -e "\033[1;33m🗜️  生成备份：$SNAPSHOT_NAME\033[0m"
           sudo tar -cPf - --warning=no-file-changed --ignore-failed-read --exclude="*/tmp/*" --exclude="*/cache/*" $PERSONAL_DATA_DIRS | zstd -$ZSTD_LEVEL -T$PARALLEL_CORE > /tmp/$SNAPSHOT_NAME || (echo -e "\033[1;31m❌ 备份打包失败\033[0m" && exit 1)
+          
           if [ ! -f "/tmp/$SNAPSHOT_NAME" ] || [ $(stat -c %s "/tmp/$SNAPSHOT_NAME") -lt 1024 ]; then
             echo -e "\033[1;31m❌ 备份文件无效（空/损坏）\033[0m" && exit 1
           fi
+          
           echo -e "\033[1;33m⬆️  上传备份：$SNAPSHOT_NAME\033[0m"
-          sudo rclone copy /tmp/$SNAPSHOT_NAME mywebdav:"$WEBDAV_SNAPSHOT_DIR/" \
-            --config /home/runner/.rclone.conf \
-            --transfers $RCLONE_TRANSFERS \
-            --buffer-size $RCLONE_BUFFER \
-            --timeout $TIMEOUT \
-            --contimeout $CONTIMEOUT \
-            $WEBDAV_EXTRA_FLAGS \
-            --retries 10 \
-            --retries-sleep 60s \
-            --stats 30s \
-            --progress || (echo -e "\033[1;31m❌ 备份上传失败\033[0m" && exit 1)
+          # 优化：Shell层重试（3次），提升上传健壮性
+          BACKUP_UPLOAD_SUCCESS=0
+          for i in {1..3}; do
+            if sudo rclone copy /tmp/$SNAPSHOT_NAME mywebdav:"$WEBDAV_SNAPSHOT_DIR/" \
+              --config /home/runner/.rclone.conf \
+              --transfers $RCLONE_TRANSFERS \
+              --buffer-size $RCLONE_BUFFER \
+              --timeout $TIMEOUT \
+              --contimeout $CONTIMEOUT \
+              $WEBDAV_EXTRA_FLAGS \
+              --webdav-vendor other \
+              --disable-http-keep-alive \
+              --retries 10 \
+              --retries-sleep 60s \
+              --stats 30s \
+              --progress; then
+              BACKUP_UPLOAD_SUCCESS=1
+              break
+            fi
+            echo -e "\033[1;33m⚠️  第$i次上传失败，30秒后重试...\033[0m"
+            sleep 30
+          done
+          if [ $BACKUP_UPLOAD_SUCCESS -eq 0 ]; then
+            echo -e "\033[1;31m❌ 备份上传失败（3次重试均失败）\033[0m" && exit 1
+          fi
+          
+          # 验证上传结果
           if ! sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null; then
             echo -e "\033[1;31m❌ 备份上传未验证成功\033[0m" && exit 1
           fi
           [ -f "/tmp/$SNAPSHOT_NAME" ] && sudo rm -f /tmp/$SNAPSHOT_NAME || true
+          
+          # 优化：强化旧备份清理逻辑，严格正则匹配备份文件名，避免误删
           echo -e "\033[1;33m🗑️  清理旧备份（保留$KEEP_BACKUPS个）\033[0m"
           OLD_SNAPSHOTS=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf \
-            | grep "casaos-full-snapshot.*\.tar\.zst$" \
+            | grep -E "^[0-9]+\s+casaos-full-snapshot-[0-9]{8}-[0-9]{6}\.tar\.zst$" \
             | sed 's/^[0-9]\+ //' \
             | sort -r \
             | tail -n +$((KEEP_BACKUPS + 1)))
+          
           if [ -n "$OLD_SNAPSHOTS" ]; then
             for snap in $OLD_SNAPSHOTS; do
               sudo rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR/$snap" --config /home/runner/.rclone.conf || echo -e "⚠️  清理$snap失败"
@@ -374,6 +439,8 @@ jobs:
           else
             echo -e "\033[1;33m✅ 无需清理（备份数≤$KEEP_BACKUPS）\033[0m"
           fi
+          
+          # 触发续跑
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
             echo -e "\033[1;33m🔄  触发下一轮备份（续跑）\033[0m"
             RESPONSE=$(curl -s -w "%{http_code}" -X POST \
@@ -390,6 +457,8 @@ jobs:
           else
             echo -e "\033[1;33m⚠️  未配置PAT/REPO，跳过续跑\033[0m"
           fi
+          
+          # 清理环境
           sudo tailscale down 2>/dev/null || true
           sudo systemctl stop tailscaled 2>/dev/null || true
           [ -f "/home/runner/.rclone.conf" ] && sudo rm -f /home/runner/.rclone.conf 2>/dev/null || true
