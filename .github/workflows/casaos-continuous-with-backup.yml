@@ -96,11 +96,12 @@ jobs:
             exit 0
           fi
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
-          rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
-          sudo chmod 600 /home/runner/.rclone.conf
-          rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf 2>/dev/null || true
+          # 【改动1】将rclone配置文件生成到/root/.rclone.conf（root用户可访问，解决sudo rclone无法读取配置的问题）
+          rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /root/.rclone.conf >/dev/null
+          sudo chmod 600 /root/.rclone.conf
+          rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf 2>/dev/null || true
           # 适配 zstd 快照后缀 .tar.zst
-          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep "casaos-full-snapshot.*\.tar\.zst" | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
+          REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf | grep "casaos-full-snapshot.*\.tar\.zst" | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 检测到 zstd 快照：$REMOTE_SNAPSHOTS"
             echo "LATEST_SNAPSHOT=$REMOTE_SNAPSHOTS" >> "$GITHUB_ENV"
@@ -124,17 +125,21 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 使用 zstd -d 解压（4核并行）
-          rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
+          # 【改动2】删除tar解压命令后的$PERSONAL_DATA_DIRS（解压阶段无需该参数，避免tar报错或解压不完整）
+          rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /root/.rclone.conf \
           | sudo zstd -d -p 4 \
           | sudo tar -xf - -C / \
             --overwrite \
-            --preserve-permissions \
-            $PERSONAL_DATA_DIRS
-          # 严格权限修复
-          sudo chown -R root:root $PERSONAL_DATA_DIRS
+            --preserve-permissions
+          # 【改动3】拆分权限校正逻辑，不对/var/lib/docker做全局chown（避免破坏docker运行权限），仅校准CasaOS相关目录
+          echo "✅ 开始针对性校准权限（保留docker目录原有权限）"
+          # 提取除/var/lib/docker外的其他核心目录
+          NON_DOCKER_DIRS=$(echo "$PERSONAL_DATA_DIRS" | sed 's/\/var\/lib\/docker//g')
+          sudo chown -R root:root $NON_DOCKER_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
-          sudo chmod -R 700 /var/lib/casaos /var/lib/docker
+          sudo chmod -R 700 /var/lib/casaos
+          # docker目录仅确保基础权限，不递归修改内部文件
+          sudo chmod 700 /var/lib/docker
           echo "✅ 多核严格恢复完成（所有目录100%完整）"
 
       - name: 7-启动 Docker & CasaOS 核心服务
@@ -170,9 +175,11 @@ jobs:
           set -e
           echo "===== 9-延时校准（5分钟） ====="
           START_TIME=$(date +%s)
-          sleep 5
+          # 【改动4】移除冗余的sleep 5，直接计算剩余等待时间
           CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
+          # 【改动5】对WAIT_TIME做下限校验，确保≥0，避免sleep负数报错
+          WAIT_TIME=$(( WAIT_TIME > 0 ? WAIT_TIME : 0 ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
           echo "✅ 已运行满5分钟，准备备份"
 
@@ -201,27 +208,18 @@ jobs:
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
           echo "SNAPSHOT_PATH=$SNAPSHOT_PATH" >> "$GITHUB_ENV"
-          # 【严格安全排除】只删垃圾，不碰核心，无任何致命排除
-          EXTENDED_EXCLUDES="
-          --exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches
-          --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old
-          --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log
-          --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit
-          --exclude=/var/lib/docker/image/*/layerdb/cache --exclude=/var/lib/docker/volumes/*/_data/tmp
-          --exclude=/var/lib/docker/volumes/*/_data/cache
-          --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志 --exclude=/DATA/.DS_Store
-          --exclude=/root/.cache --exclude=/root/.local/share/Trash --exclude=/root/.npm --exclude=/root/.yarn
-          --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*
-          "
+          # 【改动6】简化EXTENDED_EXCLUDES格式，减少不必要换行，避免bash单词分割异常
+          EXTENDED_EXCLUDES="--exclude=*.log --exclude=*.logs --exclude=*.tmp --exclude=*.temp --exclude=*.cache --exclude=*.caches --exclude=*.pid --exclude=*.lock --exclude=*.swp --exclude=*.bak --exclude=*.old --exclude=/var/lib/docker/tmp --exclude=/var/lib/docker/containers/*/*.log --exclude=/var/lib/docker/overlay2/*/tmp --exclude=/var/lib/docker/buildkit --exclude=/var/lib/docker/image/*/layerdb/cache --exclude=/var/lib/docker/volumes/*/_data/tmp --exclude=/var/lib/docker/volumes/*/_data/cache --exclude=/DATA/tmp --exclude=/DATA/cache --exclude=/DATA/日志 --exclude=/DATA/.DS_Store --exclude=/root/.cache --exclude=/root/.local/share/Trash --exclude=/root/.npm --exclude=/root/.yarn --exclude=/var/tmp/* --exclude=/var/log/* --exclude=/var/run/* --exclude=/var/spool/*"
           pack_data() {
             echo "开始【严格完整】多线程打包：$PERSONAL_DATA_DIRS"
+            # 【改动7】双引号包裹"$EXTENDED_EXCLUDES"，防止bash错误拆分排除规则参数
             sudo tar -cPf - \
               --one-file-system \
               --ignore-failed-read \
               --warning=no-file-changed \
-              $EXTENDED_EXCLUDES \
-              $PERSONAL_DATA_DIRS  # 【修复】删除此行末尾多余的反斜杠 \
-            | sudo zstd -19 -p 4 > $SNAPSHOT_PATH || return 1
+              "$EXTENDED_EXCLUDES" \
+              $PERSONAL_DATA_DIRS | \
+              sudo zstd -19 -p 4 > $SNAPSHOT_PATH || return 1
             SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
             echo "✅ zstd19 高压缩率严格打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
             return 0
@@ -248,17 +246,18 @@ jobs:
           echo "===== 11-2 上传快照到WebDAV（实时显示上传速率） ====="
           upload_data() {
             echo "开始上传：$SNAPSHOT_PATH → mywebdav:$WEBDAV_SNAPSHOT_DIR/"
+            # 【改动8】同步rclone配置文件路径为/root/.rclone.conf，确保root用户可读取
             sudo rclone copy \
               $SNAPSHOT_PATH \
               mywebdav:"$WEBDAV_SNAPSHOT_DIR"/ \
-              --config /home/runner/.rclone.conf \
+              --config /root/.rclone.conf \
               --transfers 8 \
               --buffer-size 64M \
               --fast-list \
               --retries 3 \
               --low-level-retries 5 \
               --progress || return 1
-            rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null || return 1
+            rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf >/dev/null || return 1
             sudo rm -f $SNAPSHOT_PATH
             echo "✅ 上传完成，zstd 快照已保存到WebDAV"
             return 0
@@ -282,12 +281,12 @@ jobs:
         run: |
           set -e
           echo "===== 11-3 备份后处理 ====="
-          # 适配 zstd 快照后缀 .tar.zst，只清理 zstd 格式旧备份
-          BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep "casaos-full-snapshot.*\.tar\.zst" | sed 's/^[0-9]\+ //' | sort -r)
+          # 【改动9】同步rclone配置文件路径为/root/.rclone.conf
+          BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf | grep "casaos-full-snapshot.*\.tar\.zst" | sed 's/^[0-9]\+ //' | sort -r)
           if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
             echo "清理旧备份（保留最新$KEEP_BACKUPS份 zstd 快照）："
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} echo "删除：{}"
-            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR"/{} --config /home/runner/.rclone.conf 2>/dev/null
+            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | xargs -I {} rclone delete mywebdav:"$WEBDAV_SNAPSHOT_DIR"/{} --config /root/.rclone.conf 2>/dev/null
             echo "✅ 旧备份清理完成"
           else
             echo "✅ 当前备份数≤$KEEP_BACKUPS，无需清理"
@@ -311,7 +310,8 @@ jobs:
         run: |
           set -e
           echo "===== 12-清理+完结 ====="
-          sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
+          # 【改动10】同步清理root下的rclone配置文件，确保敏感信息不残留
+          sudo rm -rf /tmp/* /root/.rclone.conf /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
           echo "✅ 敏感信息清理完成"
