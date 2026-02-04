@@ -18,11 +18,11 @@ jobs:
       USER_PAT:            ${{ secrets.USER_PAT }}
       REPO:                ${{ secrets.REPO }}
 
-      # 固定配置（已将TARGET_RUN_MINUTES从1改为5）
+      # 固定配置（已将TARGET_RUN_MINUTES从5改为10）
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS:  "/var/lib/docker/containers /var/lib/docker/volumes /var/lib/docker/overlay2 /etc/casaos /var/lib/casaos /DATA /root/.config"
       KEEP_BACKUPS:        2
-      TARGET_RUN_MINUTES:  5  # 关键修改：从1分钟改为5分钟
+      TARGET_RUN_MINUTES:  10  # 关键修改：从5分钟改为10分钟
       RCLONE_CONFIG:       "/home/runner/.rclone.conf"
       PARALLEL_CORE:       4
       ZSTD_LEVEL:          19
@@ -349,13 +349,13 @@ jobs:
           done
           echo -e "\033[1;31m❌ CasaOS启动失败或端口未通\033[0m" && exit 1
 
-      # ====================================== 18. 系统稳定延时（5分钟） ======================================
+      # ====================================== 18. 系统稳定延时（10分钟） ======================================
       - name: 18-系统稳定延时（$TARGET_RUN_MINUTES分钟）
         run: |
           set -euo pipefail
           echo -e "\033[1;34m===== 18-系统稳定延时$TARGET_RUN_MINUTES分钟 =====\033[0m"
           if [ "$TARGET_RUN_MINUTES" -gt 0 ]; then
-            sleep $((TARGET_RUN_MINUTES * 60))  # 自动计算5分钟=300秒
+            sleep $((TARGET_RUN_MINUTES * 60))  # 自动计算10分钟=600秒
           else
             echo -e "\033[1;33m⚠️  延时时间为0，跳过休眠\033[0m"
           fi
