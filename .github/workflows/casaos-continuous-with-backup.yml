@@ -50,6 +50,7 @@ jobs:
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           echo "✅ 系统初始化+全域清理完成"
+
       - name: 2-官方纯净安装 Docker（含 compose）
         run: |
           set -e
@@ -59,6 +60,7 @@ jobs:
           docker --version && docker compose version
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成"
+
       - name: 3-官方纯净安装 CasaOS
         run: |
           set -e
@@ -66,6 +68,7 @@ jobs:
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，待配置"
+
       - name: 4-创建 roots 管理员+免密&Docker 权限
         run: |
           set -e
@@ -81,6 +84,7 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
+
       - name: 5-WebDAV 配置+快照检测
         run: |
           set -e
@@ -95,7 +99,7 @@ jobs:
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
           rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf 2>/dev/null || true
-          # 【修改】适配 zstd 快照后缀 .tar.zst
+          # 适配 zstd 快照后缀 .tar.zst
           REMOTE_SNAPSHOTS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep "casaos-full-snapshot.*\.tar\.zst" | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
             echo "✅ 检测到 zstd 快照：$REMOTE_SNAPSHOTS"
@@ -107,20 +111,20 @@ jobs:
           fi
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
+
       # 【严格完整恢复】无任何兼容、无忽略、无兜底，快照必须完整
       - name: 6-恢复历史快照+权限校正（4核并行解压·严格完整）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
           set -e
           echo "===== 6-恢复历史数据（4核并行解压·严格完整） ====="
-          # 【修改】安装 zstd 解压工具（替换 pigz）
           sudo apt install -y zstd -qq
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 docker containerd casaos 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 【修改】使用 zstd -d 解压（4核并行，替换 pigz -d）
+          # 使用 zstd -d 解压（4核并行）
           rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf \
           | sudo zstd -d -p 4 \
           | sudo tar -xf - -C / \
@@ -132,6 +136,7 @@ jobs:
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
           echo "✅ 多核严格恢复完成（所有目录100%完整）"
+
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
           set -e
@@ -142,6 +147,7 @@ jobs:
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 4
           echo "✅ 服务启动完成，CasaOS 可访问"
+
       - name: 8-Tailscale 组网（可选）
         run: |
           set -e
@@ -157,6 +163,7 @@ jobs:
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="CasaOS-$(hostname | cut -c1-6)" --accept-routes
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
+
       - name: 9-延时校准（满5分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -168,6 +175,7 @@ jobs:
           WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
           [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
           echo "✅ 已运行满5分钟，准备备份"
+
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -178,6 +186,7 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
+
       # 【严格完整打包】无任何遗漏，只删垃圾，核心100%保留
       - name: 11-1 全量备份-打包压缩（zstd19高压缩+4核多线程·严格完整）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
@@ -185,10 +194,9 @@ jobs:
         run: |
           set -e
           echo "===== 11-1 高压缩率打包核心数据（zstd19+4核多线程·严格完整） ====="
-          # 【修改】安装 zstd 压缩工具（移除 pigz、pbzip2）
           sudo apt install -y zstd -qq
           
-          # 【修改】快照后缀改为 .tar.zst（对应 zstd 格式）
+          # 快照后缀改为 .tar.zst（对应 zstd 格式）
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
@@ -212,8 +220,7 @@ jobs:
               --ignore-failed-read \
               --warning=no-file-changed \
               $EXTENDED_EXCLUDES \
-              $PERSONAL_DATA_DIRS \
-            # 【修改】使用 zstd -19 -p 4 压缩（最高压缩率之一，4核并行）
+              $PERSONAL_DATA_DIRS  # 【修复】删除此行末尾多余的反斜杠 \
             | sudo zstd -19 -p 4 > $SNAPSHOT_PATH || return 1
             SNAPSHOT_SIZE=$(du -sh $SNAPSHOT_PATH | awk '{print $1}')
             echo "✅ zstd19 高压缩率严格打包完成，文件：$SNAPSHOT_PATH（大小：$SNAPSHOT_SIZE）"
@@ -232,6 +239,7 @@ jobs:
             exit 1
           fi
           echo "pack_success=true" >> "$GITHUB_OUTPUT"
+
       - name: 11-2 全量备份-上传WebDAV（显示速率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
@@ -268,12 +276,13 @@ jobs:
             exit 1
           fi
           echo "upload_success=true" >> "$GITHUB_OUTPUT"
+
       - name: 11-3 备份后处理-清理旧备份+触发续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_upload.outputs.upload_success == 'true' }}
         run: |
           set -e
           echo "===== 11-3 备份后处理 ====="
-          # 【修改】适配 zstd 快照后缀 .tar.zst，只清理 zstd 格式旧备份
+          # 适配 zstd 快照后缀 .tar.zst，只清理 zstd 格式旧备份
           BACKUPS=$(rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | grep "casaos-full-snapshot.*\.tar\.zst" | sed 's/^[0-9]\+ //' | sort -r)
           if [ $(echo "$BACKUPS" | wc -l) -gt $KEEP_BACKUPS ]; then
             echo "清理旧备份（保留最新$KEEP_BACKUPS份 zstd 快照）："
@@ -296,6 +305,7 @@ jobs:
               echo "⚠️ 自动续跑触发失败"
             fi
           fi
+
       - name: 12-敏感清理+流程完结（不重启服务）
         if: ${{ always() }}
         run: |
