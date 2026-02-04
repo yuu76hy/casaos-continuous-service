@@ -18,7 +18,7 @@ jobs:
       USER_PAT:            ${{ secrets.USER_PAT }}
       REPO:                ${{ secrets.REPO }}
 
-      # 固定配置（无需修改）
+      # 固定配置（已移除不支持的MAX_REDIRECT）
       WEBDAV_SNAPSHOT_DIR: "/z/Udu/CasaOS-Backup"
       PERSONAL_DATA_DIRS:  "/var/lib/docker/containers /var/lib/docker/volumes /var/lib/docker/overlay2 /etc/casaos /var/lib/casaos /DATA /root/.config"
       KEEP_BACKUPS:        2
@@ -29,7 +29,6 @@ jobs:
       RCLONE_TRANSFERS:    1
       RCLONE_BUFFER:       "512M"
       WEBDAV_CHUNK_SIZE:   "64M"
-      MAX_REDIRECT:        20
       TIMEOUT:             "60m"
       CONTIMEOUT:          "10m"
       WEBDAV_EXTRA_FLAGS:  "--no-check-certificate --disable-http2"
@@ -327,7 +326,7 @@ jobs:
             echo -e "\033[1;33m⚠️  延时时间为0，跳过休眠\033[0m"
           fi
           echo -e "\033[1;32m✅ 系统稳定运行完成\033[0m"
-      # ====================================== 19. 完整备份流程（打包+上传+清理+触发续跑） ======================================
+      # ====================================== 19. 完整备份流程（打包+上传+清理+触发续跑）（修复rclone参数） ======================================
       - name: 19-完整备份流程（打包+上传+清理+触发续跑）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -351,7 +350,6 @@ jobs:
             --config /home/runner/.rclone.conf \
             --transfers $RCLONE_TRANSFERS \
             --buffer-size $RCLONE_BUFFER \
-            --max-redirect $MAX_REDIRECT \
             --timeout $TIMEOUT \
             --contimeout $CONTIMEOUT \
             $WEBDAV_EXTRA_FLAGS \
