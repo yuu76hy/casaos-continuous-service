@@ -175,17 +175,50 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
           
-      - name: 9-延时校准（满15分钟再备份）
+      - name: 9-延时校准（智能轮询等待，满15分钟再备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（15分钟） ====="
-          START_TIME=$(date +%s)
-          sleep 5
-          CURRENT_DURATION=$(( $(date +%s) - START_TIME ))
-          WAIT_TIME=$(( TARGET_RUN_MINUTES*60 - CURRENT_DURATION ))
-          [ $WAIT_TIME -gt 0 ] && sleep $WAIT_TIME
-          echo "✅ 已运行满15分钟，准备备份"
+          echo "===== 9-延时校准（智能轮询等待） ====="
+          
+          # 记录开始时间
+          START_TIMESTAMP=$(date +%s)
+          TARGET_SECONDS=$((TARGET_RUN_MINUTES * 60))
+          
+          echo "开始时间: $(date -d @$START_TIMESTAMP '+%Y-%m-%d %H:%M:%S')"
+          echo "目标运行时间: $TARGET_RUN_MINUTES 分钟 ($TARGET_SECONDS 秒)"
+          
+          # 已经运行的时间（秒）
+          ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
+          
+          # 计算需要等待的时间
+          if [ $ELAPSED_TIME -lt $TARGET_SECONDS ]; then
+            REMAINING_TIME=$((TARGET_SECONDS - ELAPSED_TIME))
+            echo "当前已运行: $ELAPSED_TIME 秒"
+            echo "需要继续等待: $REMAINING_TIME 秒"
+            
+            # 智能轮询等待：每30秒输出一次进度，避免长时间无输出
+            while [ $REMAINING_TIME -gt 0 ]; do
+              # 每次等待30秒或剩余时间中的较小值
+              SLEEP_TIME=$((REMAINING_TIME > 30 ? 30 : REMAINING_TIME))
+              echo "等待 ${SLEEP_TIME} 秒 (剩余: ${REMAINING_TIME} 秒)..."
+              sleep $SLEEP_TIME
+              
+              # 更新已运行时间和剩余时间
+              ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
+              REMAINING_TIME=$((TARGET_SECONDS - ELAPSED_TIME))
+              
+              # 每5分钟输出一次详细状态
+              if [ $((ELAPSED_TIME % 300)) -lt 30 ]; then
+                echo "⏰ 已运行 $((ELAPSED_TIME / 60)) 分钟 $((ELAPSED_TIME % 60)) 秒"
+              fi
+            done
+          else
+            echo "✅ 已满足最小运行时间，跳过等待"
+          fi
+          
+          TOTAL_ELAPSED=$(( $(date +%s) - START_TIMESTAMP ))
+          echo "✅ 总运行时间: $((TOTAL_ELAPSED / 60)) 分钟 $((TOTAL_ELAPSED % 60)) 秒，准备备份"
           
       - name: 10-停止所有服务（备份前置，无文件占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
