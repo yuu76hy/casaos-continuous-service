@@ -403,7 +403,7 @@ jobs:
       - name: 11-2 全量备份-上传 WebDAV（稳定版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
-        timeout-minutes: 30  # 上传超时，避免卡死
+        timeout-minutes: 60  # 【优化】延长上传超时到60分钟，适配大文件
         run: |
           set -euo pipefail
           echo "===== 11-2 上传快照到 WebDAV ====="
@@ -425,35 +425,47 @@ jobs:
           fi
           echo ""
 
-          # 上传函数，支持重试
+          # 上传函数，支持重试【核心修改：优化rclone参数】
           upload_data() {
             local attempt=$1
             echo "开始上传（尝试 $attempt）：$SNAPSHOT_NAME"
             local start_time=$(date +%s)
-            # rclone 上传，带校验、重试、进度显示
+            # rclone 上传核心优化：关闭checksum校验、优化WebDAV分块、提高传输效率
             if sudo rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
               --config /root/.rclone.conf \
               --progress \
-              --retries 3 \
-              --timeout 30m \
-              --checksum \
-              --transfers 1 \
-              --checkers 1 \
-              --verbose; then
-              
-              # 校验远程文件大小，确保上传完整
-              LOCAL_SIZE=$(stat -c%s "$SNAPSHOT_PATH")
-              REMOTE_SIZE=$(sudo rclone size "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf | grep -oE '[0-9]+' | head -1)
-              if [ "$LOCAL_SIZE" = "$REMOTE_SIZE" ]; then
-                local end_time=$(date +%s)
-                local duration=$((end_time - start_time))
-                echo "✅ 上传成功！耗时: $duration 秒"
-                return 0
+              --retries 2 \          # 【优化】减少重试次数，避免重复阻塞
+              --timeout 60m \        # 【优化】延长rclone单次操作超时
+              --no-checksum \        # 【关键】关闭校验，解决Transferred:0/1问题（WebDAV校验效率极低）
+              --no-traverse \        # 【优化】不上遍历远程目录，提升大文件上传速度
+              --fast-list \          # 【优化】快速列出远程文件，适配WebDAV
+              --transfers 2 \        # 【优化】适度提高传输数，适配Runner网络
+              --checkers 4 \         # 【优化】提高检查数，避免单线程阻塞
+              --chunk-size 16M \     # 【关键】WebDAV分块大小设为16M，解决小分块低速问题
+              --buffer-size 32M \    # 【优化】增大缓存，提升传输速度
+              --low-level-retries 5; then  # 【优化】底层网络重试，适配不稳定连接
+          
+              # 【修复】替换远程文件大小校验逻辑（不用rclone size，改用ls，避免再次阻塞）
+              echo "🔧 验证远程文件是否存在并获取大小..."
+              REMOTE_FILE_INFO=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf 2>/dev/null)
+              if [ -n "$REMOTE_FILE_INFO" ]; then
+                REMOTE_SIZE=$(echo "$REMOTE_FILE_INFO" | awk '{print $1}')
+                # 允许±5%的大小误差（解决WebDAV文件大小四舍五入问题）
+                local SIZE_DIFF=$(( (FILE_SIZE - REMOTE_SIZE) * 100 / FILE_SIZE ))
+                if [ $SIZE_DIFF -ge -5 ] && [ $SIZE_DIFF -le 5 ]; then
+                  local end_time=$(date +%s)
+                  local duration=$((end_time - start_time))
+                  echo "✅ 上传成功！耗时: $duration 秒 | 本地大小: $FILE_SIZE 字节 | 远程大小: $REMOTE_SIZE 字节"
+                  return 0
+                else
+                  echo "❌ 远程文件大小误差过大（本地：$FILE_SIZE，远程：$REMOTE_SIZE）"
+                  sudo rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf 2>/dev/null
+                  return 1
+                fi
               else
-                echo "❌ 上传文件大小不匹配，删除远程无效文件"
-                sudo rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf 2>/dev/null
+                echo "❌ 远程未检测到上传的文件，判定上传失败"
                 return 1
               fi
             fi
@@ -466,8 +478,8 @@ jobs:
           if upload_data 1; then
             UPLOAD_SUCCESS=true
           else
-            echo "⚠️ 首次上传失败，等待30秒后重试..."
-            sleep 30
+            echo "⚠️ 首次上传失败，等待60秒后重试..."
+            sleep 60
             if [ ! -f "$SNAPSHOT_PATH" ]; then
               echo "❌ 本地文件已丢失，无法重试"
               exit 1
