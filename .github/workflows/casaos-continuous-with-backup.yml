@@ -91,63 +91,32 @@ jobs:
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
           
-      - name: 5-WebDAV 配置+快照检测（调试版）
+      - name: 5-WebDAV 快速配置（跳过检测）
         run: |
           set -e
-          echo "===== 5-WebDAV 环境初始化（调试） ====="
-          
-          # 显示当前配置状态
-          echo "🔍 配置检查:"
-          echo "  WEBDAV_URL 已设置: ${WEBDAV_URL:+是}"
-          echo "  WEBDAV_USER 已设置: ${WEBDAV_USER:+是}"
-          echo "  WEBDAV_PASSWORD 已设置: ${WEBDAV_PASSWORD:+是}"
+          echo "===== 5-WebDAV 快速配置 ====="
           
           # 检查WebDAV配置是否完整
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
-            echo "❌ WebDAV 配置不完整："
-            [ -z "$WEBDAV_URL" ] && echo "  - WEBDAV_URL 未设置"
-            [ -z "$WEBDAV_USER" ] && echo "  - WEBDAV_USER 未设置"
-            [ -z "$WEBDAV_PASSWORD" ] && echo "  - WEBDAV_PASSWORD 未设置"
-            echo "⚠️ 跳过备份流程"
+            echo "⚠️ WebDAV 配置不完整，跳过备份流程"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "HAS_SNAPSHOT=false" >> "$GITHUB_ENV"
+            echo "✅ WebDAV 配置跳过（配置不完整）"
             exit 0
           fi
           
-          # 测试WebDAV连接
-          echo "测试WebDAV连接..."
-          WEBDAV_CONNECT_TIMEOUT=30
-          
-          # 使用更详细的连接测试
-          echo "尝试连接到WebDAV..."
-          
-          # 测试连接（使用HTTP状态码）
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout $WEBDAV_CONNECT_TIMEOUT --max-time $WEBDAV_CONNECT_TIMEOUT \
-               -u "$WEBDAV_USER:$WEBDAV_PASSWORD" "$WEBDAV_URL" 2>/dev/null || echo "000")
-          
-          echo "HTTP状态码: $HTTP_CODE"
-          
-          # 检查HTTP状态码（2xx或3xx表示成功）
-          if [[ "$HTTP_CODE" =~ ^[23][0-9][0-9]$ ]]; then
-            echo "✅ WebDAV连接测试成功"
-          else
-            echo "❌ WebDAV连接测试失败，HTTP状态码: $HTTP_CODE"
-            echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
-            exit 0
-          fi
+          echo "✅ WebDAV 配置已设置，跳过连接测试，直接配置..."
           
           # 配置rclone
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
           
-          # 测试rclone配置
-          echo "测试rclone配置..."
-          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || {
-            echo "⚠️ 无法创建目录，但可能已存在，继续..."
-          }
+          # 创建目录（忽略错误）
+          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || true
           
-          # 检查现有快照
-          LATEST_SNAPSHOT=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1)
+          # 检查现有快照（不阻塞）
+          LATEST_SNAPSHOT=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1)
           if [ -n "$LATEST_SNAPSHOT" ]; then
             echo "✅ 检测到快照：$LATEST_SNAPSHOT"
             echo "LATEST_SNAPSHOT=$LATEST_SNAPSHOT" >> "$GITHUB_ENV"
@@ -158,14 +127,7 @@ jobs:
           fi
           
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
-          echo "✅ WebDAV 初始化完成"
-          
-      - name: 5.1-WebDAV状态显示
-        run: |
-          echo "===== WebDAV状态 ====="
-          echo "WEBDAV_AVAILABLE: ${WEBDAV_AVAILABLE:-未设置}"
-          echo "HAS_SNAPSHOT: ${HAS_SNAPSHOT:-未设置}"
-          echo "LATEST_SNAPSHOT: ${LATEST_SNAPSHOT:-无}"
+          echo "✅ WebDAV 配置完成（跳过连接测试）"
           
       - name: 6-恢复历史快照+权限校正
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
@@ -210,7 +172,7 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
           
-      - name: 9-延时校准（智能轮询等待，满15分钟再备份）
+      - name: 9-延时校准（智能轮询等待）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
