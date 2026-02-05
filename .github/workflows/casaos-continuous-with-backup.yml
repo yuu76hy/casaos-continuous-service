@@ -35,27 +35,34 @@ jobs:
           trap 'echo "🔄 清理临时文件..." && sudo rm -rf /tmp/casaos_* /tmp/backup_* 2>/dev/null || true' EXIT
           echo "✅ 全局错误处理已设置"
           
-      - name: 1-系统初始化+全域深度清理
+      - name: 1-系统初始化+全域深度清理（修复rclone安装+抑制apt警告）
         run: |
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
-          sudo apt update -y -qq
-          # 强制安装最新版 rclone，避免版本兼容问题
-          curl https://rclone.org/install.sh | sudo bash -s -- -v
-          sudo apt install -y curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc -qq
-          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
+          # 抑制apt警告，仅输出错误信息
+          sudo DEBIAN_FRONTEND=noninteractive apt update -y -qq 2>/dev/null
+          # 修复rclone安装命令：使用官方标准方式，无需额外参数
+          curl https://rclone.org/install.sh | sudo bash
+          # 安装依赖，抑制所有非必要输出
+          sudo apt install -y -qq curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc 2>/dev/null
+          sudo apt remove -y -qq docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
           sudo systemctl daemon-reload
           sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
           sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y -qq 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt clean -y -qq 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          # 验证 rclone 版本
-          rclone --version
+          # 验证rclone安装成功
+          if command -v rclone &>/dev/null; then
+            echo "✅ rclone 安装成功，版本：$(rclone --version | head -1)"
+          else
+            echo "❌ rclone 安装失败"
+            exit 1
+          fi
           echo "✅ 系统初始化+全域清理完成"
           
       - name: 2-官方纯净安装 Docker
