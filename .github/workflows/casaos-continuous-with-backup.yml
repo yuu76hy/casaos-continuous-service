@@ -37,12 +37,11 @@ jobs:
           trap 'echo "🔄 清理临时文件..." && sudo rm -rf /tmp/casaos_* /tmp/backup_* 2>/dev/null || true' EXIT
           echo "✅ 全局错误处理已设置"
           
-      - name: 1-系统初始化+全域深度清理（旧Docker+旧CasaOS+Runner垃圾｜释放20+G）
+      - name: 1-系统初始化+全域深度清理
         run: |
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          # 确保安装jq（用于JSON解析）
           sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg pv pigz psmisc -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
@@ -55,9 +54,9 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          echo "✅ 系统初始化+全域清理完成，释放20+G空间"
+          echo "✅ 系统初始化+全域清理完成"
           
-      - name: 2-官方纯净安装 Docker（含 compose）
+      - name: 2-官方纯净安装 Docker
         timeout-minutes: ${{ env.DEPLOY_TIMEOUT_MINUTES }}
         run: |
           set -e
@@ -74,7 +73,7 @@ jobs:
           echo "===== 3-安装 CasaOS ====="
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
-          echo "✅ CasaOS 安装完成，待配置"
+          echo "✅ CasaOS 安装完成"
           
       - name: 4-创建 roots 管理员+免密&Docker 权限
         run: |
@@ -92,14 +91,24 @@ jobs:
           sudo usermod -aG docker "$USER_NAME"
           echo "✅ 管理员配置完成"
           
-      - name: 5-WebDAV 配置+快照检测
+      - name: 5-WebDAV 配置+快照检测（调试版）
         run: |
           set -e
-          echo "===== 5-WebDAV 环境初始化 ====="
+          echo "===== 5-WebDAV 环境初始化（调试） ====="
+          
+          # 显示当前配置状态
+          echo "🔍 配置检查:"
+          echo "  WEBDAV_URL 已设置: ${WEBDAV_URL:+是}"
+          echo "  WEBDAV_USER 已设置: ${WEBDAV_USER:+是}"
+          echo "  WEBDAV_PASSWORD 已设置: ${WEBDAV_PASSWORD:+是}"
           
           # 检查WebDAV配置是否完整
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
-            echo "⚠️ WebDAV 未完整配置，跳过备份流程"
+            echo "❌ WebDAV 配置不完整："
+            [ -z "$WEBDAV_URL" ] && echo "  - WEBDAV_URL 未设置"
+            [ -z "$WEBDAV_USER" ] && echo "  - WEBDAV_USER 未设置"
+            [ -z "$WEBDAV_PASSWORD" ] && echo "  - WEBDAV_PASSWORD 未设置"
+            echo "⚠️ 跳过备份流程"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
@@ -107,18 +116,37 @@ jobs:
           # 测试WebDAV连接
           echo "测试WebDAV连接..."
           WEBDAV_CONNECT_TIMEOUT=30
-          if ! curl -fsSL --connect-timeout $WEBDAV_CONNECT_TIMEOUT --max-time $WEBDAV_CONNECT_TIMEOUT \
-               -u "$WEBDAV_USER:$WEBDAV_PASSWORD" "$WEBDAV_URL" >/dev/null 2>&1; then
-            echo "❌ WebDAV连接测试失败，跳过备份"
+          
+          # 使用更详细的连接测试
+          echo "尝试连接到WebDAV..."
+          
+          # 测试连接（使用HTTP状态码）
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout $WEBDAV_CONNECT_TIMEOUT --max-time $WEBDAV_CONNECT_TIMEOUT \
+               -u "$WEBDAV_USER:$WEBDAV_PASSWORD" "$WEBDAV_URL" 2>/dev/null || echo "000")
+          
+          echo "HTTP状态码: $HTTP_CODE"
+          
+          # 检查HTTP状态码（2xx或3xx表示成功）
+          if [[ "$HTTP_CODE" =~ ^[23][0-9][0-9]$ ]]; then
+            echo "✅ WebDAV连接测试成功"
+          else
+            echo "❌ WebDAV连接测试失败，HTTP状态码: $HTTP_CODE"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
             exit 0
           fi
           
+          # 配置rclone
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
-          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || true
           
+          # 测试rclone配置
+          echo "测试rclone配置..."
+          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || {
+            echo "⚠️ 无法创建目录，但可能已存在，继续..."
+          }
+          
+          # 检查现有快照
           LATEST_SNAPSHOT=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1)
           if [ -n "$LATEST_SNAPSHOT" ]; then
             echo "✅ 检测到快照：$LATEST_SNAPSHOT"
@@ -131,6 +159,13 @@ jobs:
           
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成"
+          
+      - name: 5.1-WebDAV状态显示
+        run: |
+          echo "===== WebDAV状态 ====="
+          echo "WEBDAV_AVAILABLE: ${WEBDAV_AVAILABLE:-未设置}"
+          echo "HAS_SNAPSHOT: ${HAS_SNAPSHOT:-未设置}"
+          echo "LATEST_SNAPSHOT: ${LATEST_SNAPSHOT:-无}"
           
       - name: 6-恢复历史快照+权限校正
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
@@ -254,13 +289,13 @@ jobs:
           fi
           echo "✅ 磁盘空间检查完成"
           
-      - name: 11-1 全量备份-打包压缩（智能重试+进度显示）
+      - name: 11-1 全量备份-打包压缩
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
         timeout-minutes: ${{ env.BACKUP_TIMEOUT_MINUTES }}
         run: |
           set -e
-          echo "===== 11-1 打包压缩核心数据（智能重试） ====="
+          echo "===== 11-1 打包压缩核心数据 ====="
           
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.gz"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
@@ -303,26 +338,25 @@ jobs:
             fi
           done
           
-      - name: 11-2 全量备份-上传WebDAV（OpenLustre对象存储+302重定向优化）
+      - name: 11-2 全量备份-上传WebDAV
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         timeout-minutes: ${{ env.BACKUP_TIMEOUT_MINUTES }}
         run: |
           set -euo pipefail
-          echo "===== 11-2 上传快照到WebDAV（OpenLustre+302重定向优化） ====="
+          echo "===== 11-2 上传快照到WebDAV ====="
           
-          # 1. 环境变量校验（避免未定义变量失败）
+          # 环境变量校验
           if [ -z "$SNAPSHOT_NAME" ] || [ -z "$SNAPSHOT_PATH" ] || [ -z "$WEBDAV_SNAPSHOT_DIR" ]; then
             echo "❌ 错误：必要环境变量未定义"
             exit 1
           fi
           echo "✅ 环境变量校验通过"
           
-          # 2. 上传函数（适配OpenLustre对象存储+302重定向）
+          # 上传函数
           upload_data() {
-            echo "开始上传：$SNAPSHOT_NAME → OpenLustre WebDAV（302重定向）"
+            echo "开始上传：$SNAPSHOT_NAME"
             
-            # 核心优化：适配302重定向+对象存储大文件传输
             rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
@@ -343,7 +377,7 @@ jobs:
               --partial-suffix .rclone.part \
               --no-fast-list
             
-            # 3. 完整性验证（对比本地与远程文件大小）
+            # 完整性验证
             echo "开始验证上传完整性..."
             local local_size=$(stat -c %s "$SNAPSHOT_PATH")
             local remote_size=$(rclone size --json "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf | jq -r '.bytes')
@@ -354,7 +388,7 @@ jobs:
             fi
             echo "✅ 上传完整性验证通过"
             
-            # 4. 清理本地文件
+            # 清理本地文件
             if [ -f "$SNAPSHOT_PATH" ]; then
               rm -f "$SNAPSHOT_PATH"
               echo "✅ 本地快照已清理"
@@ -363,7 +397,7 @@ jobs:
             return 0
           }
           
-          # 5. 双层重试（首次失败→10分钟后重试→仍失败则终止）
+          # 双层重试
           if ! upload_data; then
             echo "⚠️ 首次上传失败，10分钟后重试..."
             sleep 600
@@ -403,7 +437,7 @@ jobs:
             fi
           fi
           
-      - name: 12-健康检查（可选）
+      - name: 12-健康检查
         run: |
           echo "===== 12-服务健康检查 ====="
           
@@ -418,7 +452,6 @@ jobs:
           # 检查CasaOS服务
           if systemctl is-active --quiet casaos; then
             echo "✅ CasaOS 服务运行正常"
-            # 尝试获取CasaOS状态
             CASAOS_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "localhost")
             echo "CasaOS访问地址: http://$CASAOS_IP:80"
           else
@@ -429,7 +462,7 @@ jobs:
           echo "磁盘使用情况:"
           df -h / /tmp /DATA 2>/dev/null || true
           
-      - name: 13-敏感清理+流程完结（不重启服务）
+      - name: 13-敏感清理+流程完结
         if: ${{ always() }}
         run: |
           set -e
@@ -438,5 +471,5 @@ jobs:
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
           echo "✅ 敏感信息清理完成"
-          echo "🎉 CasaOS 部署+备份全流程 100% 完成"
-          echo "🔚 当前流程结束，服务不重启，等待下一次调度全新启动"
+          echo "🎉 CasaOS 部署+备份全流程完成"
+          echo "🔚 当前流程结束，等待下一次调度"
