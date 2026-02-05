@@ -39,11 +39,8 @@ jobs:
         run: |
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
-          # 抑制apt警告，仅输出错误信息
           sudo DEBIAN_FRONTEND=noninteractive apt update -y -qq 2>/dev/null
-          # 官方标准rclone安装，增加安装验证
           curl https://rclone.org/install.sh | sudo bash
-          # 安装依赖，抑制所有非必要输出
           sudo apt install -y -qq curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc 2>/dev/null
           sudo apt remove -y -qq docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
@@ -56,7 +53,6 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt clean -y -qq 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          # 验证rclone安装成功
           if command -v rclone &>/dev/null; then
             echo "✅ rclone 安装成功，版本：$(rclone --version | head -1)"
           else
@@ -115,13 +111,12 @@ jobs:
           echo "✅ WebDAV 配置已设置，跳过连接测试，直接配置..."
           
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
-          rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
-          sudo chmod 600 /home/runner/.rclone.conf
+          rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /root/.rclone.conf >/dev/null
+          sudo chmod 600 /root/.rclone.conf
           
-          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || true
+          rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /root/.rclone.conf 2>/dev/null || true
           
-          # 适配 zstd 格式，同时兼容旧 gzip 格式
-          LATEST_SNAPSHOT=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" | sed 's/^[0-9]\+ //' | sort -r | head -1)
+          LATEST_SNAPSHOT=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /root/.rclone.conf 2>/dev/null | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" | sed 's/^[0-9]\+ //' | sort -r | head -1)
           if [ -n "$LATEST_SNAPSHOT" ]; then
             echo "✅ 检测到快照：$LATEST_SNAPSHOT"
             echo "LATEST_SNAPSHOT=$LATEST_SNAPSHOT" >> "$GITHUB_ENV"
@@ -145,13 +140,12 @@ jobs:
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
           
-          # 自动识别快照格式，适配 zstd 和 gzip
           if [[ "$LATEST_SNAPSHOT" == *.tar.zst ]]; then
             echo "检测到 zstd 格式快照，使用 zstd 解压..."
-            rclone cat mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf | sudo tar --use-compress-program=zstd -xf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
+            rclone cat mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /root/.rclone.conf | sudo tar --use-compress-program=zstd -xf - -C / --overwrite --preserve-permissions
           else
             echo "检测到 gzip 格式快照，使用 gzip 解压..."
-            rclone cat mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /home/runner/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
+            rclone cat mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT --config /root/.rclone.conf | sudo tar -xzf - -C / --overwrite --preserve-permissions
           fi
           
           sudo chown -R root:root $PERSONAL_DATA_DIRS
@@ -167,7 +161,6 @@ jobs:
           sudo mkdir -p /run/docker 2>/dev/null || true
           sudo systemctl daemon-reload
           sudo systemctl enable --now docker containerd
-          # 等待 Docker 完全就绪，避免 CasaOS 启动失败
           while ! docker info > /dev/null 2>&1; do
             echo "等待 Docker 启动..."
             sleep 1
@@ -203,27 +196,18 @@ jobs:
           echo "开始时间: $(date -d @$START_TIMESTAMP '+%Y-%m-%d %H:%M:%S')"
           echo "目标运行时间: $TARGET_RUN_MINUTES 分钟"
           
-          ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
-          
-          if [ $ELAPSED_TIME -lt $TARGET_SECONDS ]; then
+          while true; do
+            ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
             REMAINING_TIME=$((TARGET_SECONDS - ELAPSED_TIME))
-            echo "当前已运行: $ELAPSED_TIME 秒"
-            echo "需要继续等待: $REMAINING_TIME 秒"
             
-            while [ $REMAINING_TIME -gt 0 ]; do
-              SLEEP_TIME=$((REMAINING_TIME > 30 ? 30 : REMAINING_TIME))
-              sleep $SLEEP_TIME
-              
-              ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
-              REMAINING_TIME=$((TARGET_SECONDS - ELAPSED_TIME))
-              
-              if [ $((ELAPSED_TIME % 30)) -lt 2 ]; then
-                echo "已运行: $((ELAPSED_TIME / 60)) 分钟 $((ELAPSED_TIME % 60)) 秒"
-              fi
-            done
-          else
-            echo "✅ 已满足最小运行时间，跳过等待"
-          fi
+            if [ $REMAINING_TIME -le 0 ]; then
+              break
+            fi
+            
+            echo "当前已运行: $((ELAPSED_TIME/60))分$((ELAPSED_TIME%60))秒，还需等待: $((REMAINING_TIME/60))分$((REMAINING_TIME%60))秒"
+            SLEEP_TIME=$((REMAINING_TIME > 30 ? 30 : REMAINING_TIME))
+            sleep $SLEEP_TIME
+          done
           
           TOTAL_ELAPSED=$(( $(date +%s) - START_TIMESTAMP ))
           echo "✅ 总运行时间: $((TOTAL_ELAPSED / 60)) 分钟 $((TOTAL_ELAPSED % 60)) 秒，准备备份"
@@ -267,7 +251,6 @@ jobs:
           set -e
           echo "===== 11-1 打包压缩核心数据 ====="
           
-          # 切换为 zstd 格式，提升压缩率与速度
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
           SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
           echo "SNAPSHOT_NAME=$SNAPSHOT_NAME" >> "$GITHUB_ENV"
@@ -277,22 +260,21 @@ jobs:
             local attempt=$1
             echo "第${attempt}次打包尝试..."
             
-            # zstd -T4 4线程，-19 最高压缩级别，兼顾速度与压缩率
             sudo tar -cPf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS 2>/dev/null | \
-              sudo pv -p -t -e -b -a | \
-              sudo zstd -T4 -19 > $SNAPSHOT_PATH
+              pv -p -t -e -b -a | \
+              zstd -T4 -19 > $SNAPSHOT_PATH
             
-            if [ -f "$SNAPSHOT_PATH" ] && sudo zstd -t "$SNAPSHOT_PATH" 2>/dev/null; then
+            if [ -f "$SNAPSHOT_PATH" ] && zstd -t "$SNAPSHOT_PATH" 2>/dev/null; then
               FILE_SIZE=$(du -h "$SNAPSHOT_PATH" | cut -f1)
               echo "✅ 打包成功！文件大小: $FILE_SIZE"
               return 0
             else
               echo "❌ 打包文件验证失败"
+              rm -f "$SNAPSHOT_PATH"
               return 1
             fi
           }
           
-          # 最多重试3次，应对临时文件占用问题
           for i in {1..3}; do
             if pack_data $i; then
               echo "pack_success=true" >> "$GITHUB_OUTPUT"
@@ -307,13 +289,10 @@ jobs:
             fi
           done
           
-      # ==============================================
-      # 核心修改：11-2 上传步骤（大文件WebDAV优化版）
-      # ==============================================
-      - name: 11-2 全量备份-上传WebDAV（大文件优化+卡滞修复版）
+      - name: 11-2 全量备份-上传WebDAV（修复参数错误+稳定版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
-        timeout-minutes: 60  # 大文件上传延长超时到60分钟
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           echo "===== 11-2 上传快照到WebDAV ====="
@@ -323,69 +302,63 @@ jobs:
             exit 1
           fi
           echo "✅ 环境变量校验通过"
+          
           echo "备份文件信息："
           ls -lh "$SNAPSHOT_PATH"
-          local LOCAL_FILE_SIZE=$(stat -c %s "$SNAPSHOT_PATH")
-          echo "本地文件大小(字节)：$LOCAL_FILE_SIZE"
+          if [ $(stat -c%s "$SNAPSHOT_PATH") -lt 1024 ]; then
+            echo "❌ 备份文件过小（<1KB），上传终止"
+            exit 1
+          fi
           echo ""
-
+          
           upload_data() {
             local attempt=$1
             echo "开始上传（尝试 $attempt）：$SNAPSHOT_NAME"
             local start_time=$(date +%s)
             
-            # 大文件WebDAV核心优化参数
-            # 1. 移除传输中--checksum，移到上传后单独校验
-            # 2. 配置块大小/缓存，适配1G+大文件
-            # 3. 提升底层重试次数，解决网络波动
-            # 4. 关闭目录遍历，减少服务端交互
             if rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
-              --config /home/runner/.rclone.conf \
+              --config /root/.rclone.conf \
               --progress \
-              --retries 5 \          # 整体重试次数
-              --low-level-retries 10 # 底层网络重试次数（关键）
-              --timeout 60m \        # 单连接超时60分钟
-              --transfers 1 \        # WebDAV强制单线程
-              --checkers 1 \         # 强制单校验线程
-              --chunk-size 64M \     # 分片大小64M，适配大文件
-              --buffer-size 128M \   # 缓存128M，提升传输速度
-              --no-traverse \        # 不遍历目标目录，减少开销
-              --ignore-existing; then# 忽略已存在文件，避免重复传输
+              --retries 3 \
+              --timeout 30m \
+              --checksum \
+              --transfers 1 \
+              --checkers 1 \
+              --verbose; then
               
-              echo "✅ 传输完成，开始校验文件完整性..."
-              sleep 10 # 给服务端10秒完成文件落地
-              
-              # 上传后单独做完整性校验（比传输中校验更稳定）
-              local REMOTE_FILE_SIZE=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null | awk '{print $1}')
-              if [ "$REMOTE_FILE_SIZE" -eq "$LOCAL_FILE_SIZE" ]; then
+              LOCAL_SIZE=$(stat -c%s "$SNAPSHOT_PATH")
+              REMOTE_SIZE=$(rclone size "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf | grep -oE '[0-9]+' | head -1)
+              if [ "$LOCAL_SIZE" = "$REMOTE_SIZE" ]; then
                 local end_time=$(date +%s)
                 local duration=$((end_time - start_time))
-                echo "✅ 上传+校验成功！耗时: $((duration/60))分$((duration%60))秒"
+                echo "✅ 上传成功！耗时: $duration 秒"
                 return 0
               else
-                echo "❌ 文件大小不匹配！本地: $LOCAL_FILE_SIZE 字节 | 远程: $REMOTE_FILE_SIZE 字节"
-                # 删除损坏的远程文件
-                rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null
+                echo "❌ 上传文件大小不匹配（本地：$LOCAL_SIZE 字节，远程：$REMOTE_SIZE 字节）"
+                rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf 2>/dev/null
                 return 1
               fi
             fi
-            echo "❌ 传输过程失败"
             return 1
           }
           
           TOTAL_START_TIME=$(date +%s)
+          UPLOAD_SUCCESS=false
           
-          # 最多重试2次，应对网络波动
-          if ! upload_data 1; then
-            echo "⚠️ 首次上传失败，等待60秒后重试..."
-            sleep 60
+          if upload_data 1; then
+            UPLOAD_SUCCESS=true
+          else
+            echo "⚠️ 首次上传失败，等待30秒后重试..."
+            sleep 30
             if [ ! -f "$SNAPSHOT_PATH" ]; then
               echo "❌ 本地文件已丢失，无法重试"
               exit 1
             fi
-            if ! upload_data 2; then
+            if upload_data 2; then
+              UPLOAD_SUCCESS=true
+            else
               echo "❌ 上传最终失败"
               TOTAL_END_TIME=$(date +%s)
               TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
@@ -394,47 +367,56 @@ jobs:
             fi
           fi
           
-          # 清理本地文件
-          rm -f "$SNAPSHOT_PATH"
-          echo "✅ 本地快照已清理"
-          echo "upload_success=true" >> "$GITHUB_OUTPUT"
+          if [ "$UPLOAD_SUCCESS" = "true" ]; then
+            rm -f "$SNAPSHOT_PATH"
+            echo "✅ 本地快照已清理"
+            
+            TOTAL_END_TIME=$(date +%s)
+            TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
+            echo "✅ 上传成功！总耗时: $((TOTAL_DURATION / 60))分$((TOTAL_DURATION % 60))秒"
+            
+            echo "upload_success=true" >> "$GITHUB_OUTPUT"
+          fi
           
       - name: 11-3 备份后处理-清理旧备份+触发续跑（时间排序防误删）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_upload.outputs.upload_success == 'true' }}
         run: |
           set -e
           echo "===== 11-3 备份后处理 ====="
-          # 基于文件时间戳排序，而非文件名，避免格式变更导致误删
-          BACKUPS=$(rclone lsf --format "tp" mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" | sort -r)
+          BACKUPS=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /root/.rclone.conf | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" | sed 's/^[0-9]\+ //' | sort -r)
           BACKUP_COUNT=$(echo "$BACKUPS" | wc -l)
           
           if [ $BACKUP_COUNT -gt $KEEP_BACKUPS ]; then
             echo "当前备份数: $BACKUP_COUNT，保留最新 $KEEP_BACKUPS 份"
-            # 提取旧备份路径并删除
-            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | cut -d';' -f2 | xargs -I {} echo "删除：{}"
-            echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)) | cut -d';' -f2 | xargs -I {} rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/{}" --config /home/runner/.rclone.conf 2>/dev/null
+            OLD_BACKUPS=$(echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS+1)))
+            while IFS= read -r backup; do
+              if [ -n "$backup" ]; then
+                echo "删除旧备份：$backup"
+                rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$backup" --config /root/.rclone.conf 2>/dev/null
+              fi
+            done <<< "$OLD_BACKUPS"
             echo "✅ 旧备份清理完成"
           else
             echo "✅ 当前备份数 $BACKUP_COUNT ≤ $KEEP_BACKUPS，无需清理"
           fi
           
-          # 触发下一轮自动续跑
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
             echo "📌 触发下一轮自动续跑..."
-            curl -s -f -X POST \
+            RESPONSE=$(curl -s -f -X POST \
               -H "Authorization: token $USER_PAT" \
               -H "Content-Type: application/json" \
               https://api.github.com/repos/$REPO/dispatches \
-              -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
+              -d '{"event_type":"renew_casaos_snapshot"}' 2>&1)
             if [ $? -eq 0 ]; then
               echo "✅ 自动续跑触发成功（仅一次）"
             else
-              echo "⚠️ 自动续跑触发失败"
+              echo "⚠️ 自动续跑触发失败，响应：$RESPONSE"
             fi
           fi
           
       - name: 12-健康检查
         run: |
+          set -euo pipefail || true
           echo "===== 12-服务健康检查 ====="
           
           if systemctl is-active --quiet docker; then
@@ -460,12 +442,11 @@ jobs:
         run: |
           set -e
           echo "===== 13-清理+完结 ====="
-          # 彻底清理敏感信息与临时文件
-          sudo rm -rf /tmp/* /home/runner/.rclone.conf /etc/sudoers.d/roots
+          sudo rm -rf /tmp/* /root/.rclone.conf /etc/sudoers.d/roots
           sudo rm -rf ~/.bash_history /root/.bash_history ~/.zsh_history /root/.zsh_history
           sudo rm -rf /home/runner/.cache /root/.cache
-          # 注销敏感环境变量，避免泄露
-          unset WEBDAV_PASSWORD ROOTS_PASSWORD USER_PAT TAILSCALE_AUTH_KEY
+          unset WEBDAV_URL WEBDAV_USER WEBDAV_PASSWORD ROOTS_PASSWORD USER_PAT TAILSCALE_AUTH_KEY REPO
+          sudo truncate -s 0 /var/log/syslog /var/log/auth.log 2>/dev/null || true
           
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
