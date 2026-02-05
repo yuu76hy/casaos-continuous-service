@@ -61,11 +61,12 @@ jobs:
           fi
           echo "✅ 系统初始化+全域清理完成"
           
-      - name: 2-官方纯净安装 Docker
+      - name: 2-官方纯净安装 Docker（使用官方一键命令）
         run: |
           set -e
           echo "===== 2-安装 Docker ====="
-          curl -fsSL https://get.docker.com | sudo bash -s docker --mirror Aliyun
+          # 【修改点】移除阿里云镜像参数，使用Docker官方一键安装命令
+          curl -fsSL https://get.docker.com | sudo bash
           sudo systemctl enable --now docker containerd && sleep 2
           docker --version && docker compose version
           sudo usermod -aG docker runner
