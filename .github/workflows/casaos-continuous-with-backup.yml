@@ -287,9 +287,10 @@ jobs:
             fi
           done
           
-      - name: 11-2 全量备份-上传WebDAV（优化显示频率）
+      - name: 11-2 全量备份-上传WebDAV（修复卡顿版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
+        timeout-minutes: 15  # 为上传步骤单独设置超时
         run: |
           set -euo pipefail
           echo "===== 11-2 上传快照到WebDAV ====="
@@ -306,111 +307,124 @@ jobs:
           ls -lh "$SNAPSHOT_PATH"
           echo ""
           
-          # 上传函数（优化显示频率）
+          # 上传函数 - 使用copyto命令避免卡顿
           upload_data() {
-            echo "开始上传：$SNAPSHOT_NAME"
+            local attempt=$1
+            echo "开始上传（尝试 $attempt）：$SNAPSHOT_NAME"
             
-            # 使用简洁参数，30秒显示一次进度
-            rclone copy \
+            # 记录开始时间
+            local start_time=$(date +%s)
+            
+            # 使用copyto命令，专门用于单个文件上传
+            echo "开始上传文件..."
+            if rclone copyto \
               "$SNAPSHOT_PATH" \
-              "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
+              "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" \
               --config /home/runner/.rclone.conf \
-              --stats 30s \
-              --stats-one-line \
-              --retries 3 \
-              --low-level-retries 10 \
-              --timeout 30m \
+              --progress \
+              --retries 2 \
+              --timeout 10m \
               --no-check-dest \
               --ignore-checksum \
-              --no-update-modtime || {
-              echo "⚠️ 上传失败"
-              return 1
-            }
-            
-            # 等待几秒让服务器处理
-            echo "等待服务器处理文件..."
-            sleep 5
-            
-            # 验证文件是否已上传
-            echo "检查文件是否已上传..."
-            local check_count=0
-            local max_checks=10  # 最多检查10次，每次3秒
-            
-            while [ $check_count -lt $max_checks ]; do
-              check_count=$((check_count + 1))
+              --transfers 1 \
+              --checkers 1 \
+              --verbose 2>&1 | tee /tmp/rclone.log; then
               
-              if rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null 2>&1; then
-                echo "✅ 第 $check_count 次检查：文件已找到"
-                break
-              fi
+              echo "✅ 文件传输完成"
               
-              if [ $check_count -eq $max_checks ]; then
-                echo "❌ 文件上传后检查超时"
-                return 1
-              fi
+              # 等待服务器处理
+              echo "等待服务器处理文件..."
+              sleep 5
               
-              sleep 3
-            done
-            
-            # 大小验证
-            echo "进行大小验证..."
-            local local_size=$(stat -c %s "$SNAPSHOT_PATH")
-            echo "本地文件大小: $((local_size / 1024 / 1024)) MB"
-            
-            # 获取远程文件大小
-            local remote_size=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null | awk '{print $1}')
-            
-            if [ -n "$remote_size" ] && [ "$remote_size" -gt 0 ]; then
-              echo "远程文件大小: $((remote_size / 1024 / 1024)) MB"
+              # 检查文件是否上传成功
+              local check_attempt=1
+              while [ $check_attempt -le 5 ]; do
+                echo "第 $check_attempt 次检查文件..."
+                if rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+                  echo "✅ 文件已确认上传成功"
+                  
+                  # 记录结束时间
+                  local end_time=$(date +%s)
+                  local duration=$((end_time - start_time))
+                  echo "上传耗时: $duration 秒"
+                  
+                  return 0
+                fi
+                
+                echo "等待3秒后重试检查..."
+                sleep 3
+                check_attempt=$((check_attempt + 1))
+              done
               
-              if [ "$local_size" != "$remote_size" ]; then
-                echo "⚠️ 大小不匹配：本地 $((local_size / 1024 / 1024)) MB，远程 $((remote_size / 1024 / 1024)) MB"
-                return 1
+              echo "⚠️ 文件上传但无法确认，尝试获取文件大小..."
+              
+              # 尝试获取文件大小
+              local remote_size=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null | awk '{print $1}' || echo "0")
+              local local_size=$(stat -c %s "$SNAPSHOT_PATH")
+              
+              if [ "$remote_size" != "0" ] && [ "$remote_size" != "" ]; then
+                echo "远程文件大小: $((remote_size / 1024 / 1024)) MB"
+                echo "本地文件大小: $((local_size / 1024 / 1024)) MB"
+                
+                if [ "$local_size" = "$remote_size" ]; then
+                  echo "✅ 文件大小验证通过"
+                  
+                  local end_time=$(date +%s)
+                  local duration=$((end_time - start_time))
+                  echo "上传耗时: $duration 秒"
+                  
+                  return 0
+                else
+                  echo "⚠️ 文件大小不匹配"
+                  return 1
+                fi
               else
-                echo "✅ 大小验证通过"
+                echo "⚠️ 无法获取远程文件大小"
+                return 1
               fi
             else
-              echo "⚠️ 无法获取远程文件大小，但文件已存在"
-              echo "✅ 上传基本成功（无法验证大小）"
+              echo "❌ 文件传输失败"
+              return 1
             fi
-            
-            # 清理本地文件
-            if [ -f "$SNAPSHOT_PATH" ]; then
-              rm -f "$SNAPSHOT_PATH"
-              echo "✅ 本地快照已清理"
-            fi
-            
-            return 0
           }
           
-          # 记录开始时间
-          START_TIME=$(date +%s)
+          # 记录总开始时间
+          TOTAL_START_TIME=$(date +%s)
           
           # 尝试上传（最多2次）
-          if ! upload_data; then
+          if ! upload_data 1; then
             echo "⚠️ 首次上传失败，等待30秒后重试..."
             sleep 30
             
+            # 检查本地文件是否还在
             if [ ! -f "$SNAPSHOT_PATH" ]; then
               echo "❌ 本地文件已丢失，无法重试"
               exit 1
             fi
             
-            if ! upload_data; then
+            echo "开始第二次上传尝试..."
+            if ! upload_data 2; then
               echo "❌ 上传最终失败"
               
-              END_TIME=$(date +%s)
-              TOTAL_TIME=$((END_TIME - START_TIME))
-              echo "总耗时: $((TOTAL_TIME / 60))分$((TOTAL_TIME % 60))秒"
+              # 计算总耗时
+              TOTAL_END_TIME=$(date +%s)
+              TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
+              echo "总耗时: $((TOTAL_DURATION / 60))分$((TOTAL_DURATION % 60))秒"
               
               exit 1
             fi
           fi
           
+          # 清理本地文件
+          if [ -f "$SNAPSHOT_PATH" ]; then
+            rm -f "$SNAPSHOT_PATH"
+            echo "✅ 本地快照已清理"
+          fi
+          
           # 计算总耗时
-          END_TIME=$(date +%s)
-          TOTAL_TIME=$((END_TIME - START_TIME))
-          echo "✅ 上传成功！总耗时: $((TOTAL_TIME / 60))分$((TOTAL_TIME % 60))秒"
+          TOTAL_END_TIME=$(date +%s)
+          TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
+          echo "✅ 上传成功！总耗时: $((TOTAL_DURATION / 60))分$((TOTAL_DURATION % 60))秒"
           
           echo "upload_success=true" >> "$GITHUB_OUTPUT"
           
