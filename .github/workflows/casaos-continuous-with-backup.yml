@@ -31,11 +31,16 @@ jobs:
       # 备份策略
       KEEP_BACKUPS: 2  # 保留最新2份备份
       TARGET_RUN_MINUTES: 5  # 服务运行稳定后再备份
+      # 新增：备份与传输优化参数
+      BACKUP_THREADS: 4  # 备份压缩线程数
+      UPLOAD_RETRY_TIMES: 2  # 上传重试次数
+      UPLOAD_CHUNK_SIZE: 16M  # WebDAV分块大小
+      UPLOAD_BUFFER_SIZE: 32M  # 上传缓存大小
 
     steps:
       - name: 0-全局错误处理+临时文件清理
         run: |
-          set -e
+          set -euo pipefail
           # 全局错误捕获，失败时提示行号
           trap 'echo "❌ 流程在第 $LINENO 行失败，退出码: $?"' ERR
           # 流程结束（成功/失败）自动清理临时文件，避免磁盘泄漏
@@ -44,13 +49,13 @@ jobs:
 
       - name: 1-系统初始化+全域深度清理
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 1-系统初始化+全域深度清理 ====="
           # 非交互模式更新系统，抑制冗余输出
           sudo DEBIAN_FRONTEND=noninteractive apt update -y -qq 2>/dev/null
           # 安装 rclone（WebDAV 核心工具）- 增加幂等性检查，避免重复安装
           if ! command -v rclone &>/dev/null; then
-            curl https://rclone.org/install.sh | sudo bash
+            curl -fsSL https://rclone.org/install.sh | sudo bash
             # 验证安装结果
             if ! command -v rclone &>/dev/null; then
               echo "❌ rclone 安装失败，流程终止"
@@ -58,7 +63,7 @@ jobs:
             fi
           fi
           # 安装依赖工具（压缩、网络、系统工具）
-          sudo apt install -y -qq curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc 2>/dev/null
+          sudo apt install -y -qq curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc htop iotop 2>/dev/null
           # 清理旧版 Docker/Containerd，避免冲突
           sudo apt remove -y -qq docker* containerd* runc* 2>/dev/null || true
           # 清理旧 CasaOS 服务残留
@@ -81,7 +86,7 @@ jobs:
 
       - name: 2-官方纯净安装 Docker
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 2-安装 Docker（官方一键脚本） ====="
           # 使用 Docker 官方一键安装，避免第三方源问题
           curl -fsSL https://get.docker.com | sudo bash
@@ -95,9 +100,7 @@ jobs:
 
       - name: 3-官方纯净安装 CasaOS
         run: |
-          set -e
-          # 启用 pipefail，确保管道中任一命令失败即终止
-          set -o pipefail
+          set -euo pipefail
           echo "===== 3-安装 CasaOS（官方一键脚本） ====="
           # 使用 CasaOS 官方一键安装
           curl -fsSL https://get.casaos.io | sudo bash
@@ -107,7 +110,7 @@ jobs:
 
       - name: 4-创建 roots 管理员+免密权限
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 4-配置管理员用户（roots） ====="
           USER_NAME="roots"
           # 若用户不存在则创建
@@ -127,7 +130,7 @@ jobs:
 
       - name: 5-WebDAV 快速配置（跳过连接测试）
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 5-WebDAV 配置（备份核心） ====="
           # 检查 WebDAV 核心配置是否完整
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
@@ -145,7 +148,7 @@ jobs:
             exit 1
           fi
 
-          # 【关键修复1】强制修复 /root 目录权限（必须为700，否则无法访问内部文件）
+          # 强制修复 /root 目录权限（必须为700，否则无法访问内部文件）
           echo "🔧 修复 /root 目录基础权限..."
           sudo chmod 700 /root
           if [ $(sudo stat -c %a /root) -ne 700 ]; then
@@ -163,7 +166,7 @@ jobs:
           # sudo 执行 rclone 配置，确保 /root 目录写入权限
           sudo rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /root/.rclone.conf 1>/dev/null
           
-          # 【关键修复2】强制设置配置文件所有者为root + 权限600，并双重验证
+          # 强制设置配置文件所有者为root + 权限600，并双重验证
           sudo chown root:root /root/.rclone.conf
           sudo chmod 600 /root/.rclone.conf
           # 验证权限和所有者
@@ -172,7 +175,7 @@ jobs:
             exit 1
           fi
 
-          # 【关键修复3】提前测试配置文件可访问性（模拟后续操作）
+          # 提前测试配置文件可访问性（模拟后续操作）
           echo "🔧 测试 rclone 配置文件访问..."
           if ! sudo rclone config show mywebdav --config /root/.rclone.conf 1>/dev/null 2>&1; then
             echo "❌ 错误：rclone 配置文件无法读取，权限异常"
@@ -181,10 +184,10 @@ jobs:
 
           # 尝试创建备份目录（已存在则忽略）
           echo "📌 创建 WebDAV 备份目录：$WEBDAV_SNAPSHOT_DIR"
-          sudo rclone mkdir mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf 2>/dev/null || echo "ℹ️ 目录已存在"
+          sudo rclone mkdir "mywebdav:$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf 2>/dev/null || echo "ℹ️ 目录已存在"
 
           # 优化快照解析逻辑，处理特殊字符和空输入
-          LATEST_SNAPSHOT=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf 2>/dev/null \
+          LATEST_SNAPSHOT=$(sudo rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf 2>/dev/null \
             | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" \
             | sed -E 's/^[0-9]+[[:space:]]+//' \
             | grep -v '^$' \
@@ -207,7 +210,7 @@ jobs:
       - name: 6-恢复历史快照（适配 zstd/gzip 双格式）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 6-恢复历史数据（从 WebDAV） ====="
           # 优先优雅停止服务，避免强制杀死导致数据损坏
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
@@ -225,14 +228,14 @@ jobs:
           # 使用通用 -I 参数解压 zstd，添加退出码检查
           if [[ "$LATEST_SNAPSHOT" == *.tar.zst ]]; then
             echo "检测到 zstd 格式快照，开始解压..."
-            sudo rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /root/.rclone.conf | sudo tar -I zstd -xf - -C / --overwrite -p
+            sudo rclone cat "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /root/.rclone.conf | sudo tar -I zstd -xf - -C / --overwrite -p
             if [ $? -ne 0 ]; then
               echo "❌ zstd 解压失败，流程终止"
               exit 1
             fi
           else
             echo "检测到 gzip 格式快照，开始解压..."
-            sudo rclone cat mywebdav:"$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /root/.rclone.conf | sudo tar -xzf - -C / --overwrite -p
+            sudo rclone cat "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /root/.rclone.conf | sudo tar -xzf - -C / --overwrite -p
             if [ $? -ne 0 ]; then
               echo "❌ gzip 解压失败，流程终止"
               exit 1
@@ -247,7 +250,7 @@ jobs:
 
       - name: 7-启动 Docker & CasaOS 核心服务
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 7-启动核心服务 ====="
           # 释放 80/443 端口，避免冲突
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
@@ -265,7 +268,7 @@ jobs:
 
       - name: 8-Tailscale 组网（可选，内网穿透）
         run: |
-          set -e
+          set -euo pipefail
           # 无 Auth Key 则跳过
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ Tailscale 未配置，跳过"
@@ -293,7 +296,7 @@ jobs:
       - name: 9-延时校准（服务稳定后备份）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 9-延时校准（等待服务稳定） ====="
           START_TIMESTAMP=$(date +%s)
           TARGET_SECONDS=$((TARGET_RUN_MINUTES * 60))
@@ -318,7 +321,7 @@ jobs:
       - name: 10-停止所有服务（备份前置，安全无占用）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 10-停止所有服务（备份安全保障） ====="
           # 优先优雅停止服务，避免强制杀死导致数据损坏
           sudo systemctl stop casaos docker containerd tailscaled 2>/dev/null || true
@@ -334,7 +337,7 @@ jobs:
       - name: 11-0 备份前磁盘空间检查
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 11-0 磁盘空间检查 ====="
           FREE_SPACE=$(df -h /tmp | awk 'NR==2 {print $4}')
           echo "临时目录可用空间: $FREE_SPACE"
@@ -356,7 +359,7 @@ jobs:
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         id: backup_pack
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 11-1 打包压缩核心数据 ====="
           # 生成快照名称（时间戳）
           SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
@@ -371,7 +374,7 @@ jobs:
             # 调整tar参数顺序，确保排除规则生效（--exclude必须在源目录前）
             sudo tar -cPf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS 2>/dev/null | \
               pv -p -t -e -b -a | \
-              zstd -T4 -19 > $SNAPSHOT_PATH  # -T4 多线程，-19 最高压缩比
+              zstd -T${BACKUP_THREADS} -19 > "$SNAPSHOT_PATH"  # 多线程+最高压缩比
 
             # 验证打包文件完整性
             if [ -f "$SNAPSHOT_PATH" ] && zstd -t "$SNAPSHOT_PATH" 2>/dev/null; then
@@ -403,7 +406,7 @@ jobs:
       - name: 11-2 全量备份-上传 WebDAV（稳定版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
-        timeout-minutes: 60  # 【优化】延长上传超时到60分钟，适配大文件
+        timeout-minutes: 60  # 延长上传超时到60分钟，适配大文件
         run: |
           set -euo pipefail
           echo "===== 11-2 上传快照到 WebDAV ====="
@@ -425,31 +428,31 @@ jobs:
           fi
           echo ""
 
-          # 上传函数，支持重试【核心修改：优化rclone参数】
+          # 上传函数，支持重试
           upload_data() {
             local attempt=$1
             echo "开始上传（尝试 $attempt）：$SNAPSHOT_NAME"
             local start_time=$(date +%s)
-            # rclone 上传核心优化：关闭checksum校验、优化WebDAV分块、提高传输效率
+            # 核心修正：用引号包裹路径，确保参数为2个；规范flags顺序
             if sudo rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
               --config /root/.rclone.conf \
               --progress \
-              --retries 2 \          # 【优化】减少重试次数，避免重复阻塞
-              --timeout 60m \        # 【优化】延长rclone单次操作超时
-              --no-checksum \        # 【关键】关闭校验，解决Transferred:0/1问题（WebDAV校验效率极低）
-              --no-traverse \        # 【优化】不上遍历远程目录，提升大文件上传速度
-              --fast-list \          # 【优化】快速列出远程文件，适配WebDAV
-              --transfers 2 \        # 【优化】适度提高传输数，适配Runner网络
-              --checkers 4 \         # 【优化】提高检查数，避免单线程阻塞
-              --chunk-size 16M \     # 【关键】WebDAV分块大小设为16M，解决小分块低速问题
-              --buffer-size 32M \    # 【优化】增大缓存，提升传输速度
-              --low-level-retries 5; then  # 【优化】底层网络重试，适配不稳定连接
+              --retries ${UPLOAD_RETRY_TIMES} \
+              --timeout 60m \
+              --no-checksum \
+              --no-traverse \
+              --fast-list \
+              --transfers 2 \
+              --checkers 4 \
+              --chunk-size ${UPLOAD_CHUNK_SIZE} \
+              --buffer-size ${UPLOAD_BUFFER_SIZE} \
+              --low-level-retries 5; then
           
-              # 【修复】替换远程文件大小校验逻辑（不用rclone size，改用ls，避免再次阻塞）
+              # 验证远程文件是否存在并获取大小
               echo "🔧 验证远程文件是否存在并获取大小..."
-              REMOTE_FILE_INFO=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf 2>/dev/null)
+              REMOTE_FILE_INFO=$(sudo rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /root/.rclone.conf 2>/dev/null)
               if [ -n "$REMOTE_FILE_INFO" ]; then
                 REMOTE_SIZE=$(echo "$REMOTE_FILE_INFO" | awk '{print $1}')
                 # 允许±5%的大小误差（解决WebDAV文件大小四舍五入问题）
@@ -508,10 +511,10 @@ jobs:
       - name: 11-3 备份后处理-清理旧备份+自动续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_upload.outputs.upload_success == 'true' }}
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 11-3 备份后处理 ====="
           # 获取所有备份文件，按时间倒序
-          BACKUPS=$(sudo rclone ls mywebdav:"$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" | sed -E 's/^[0-9]+[[:space:]]+//' | grep -v '^$' | sort -r)
+          BACKUPS=$(sudo rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR" --config /root/.rclone.conf | grep -E "casaos-full-snapshot.*\.(tar\.gz|tar\.zst)" | sed -E 's/^[0-9]+[[:space:]]+//' | grep -v '^$' | sort -r)
           # 给变量添加默认值，避免空值比较错误
           BACKUP_COUNT=$(echo "$BACKUPS" | wc -l | tr -d ' ')
           BACKUP_COUNT=${BACKUP_COUNT:-0}
@@ -561,7 +564,7 @@ jobs:
       - name: 12-服务健康检查
         run: |
           # 关闭严格错误退出，确保检查完整执行
-          set +e
+          set +euo pipefail
           echo "===== 12-服务健康检查 ====="
           # 检查 Docker 状态
           if systemctl is-active --quiet docker; then
@@ -585,7 +588,7 @@ jobs:
       - name: 13-敏感信息清理+流程完结
         if: ${{ always() }}  # 无论成功/失败都执行
         run: |
-          set -e
+          set -euo pipefail
           echo "===== 13-敏感信息清理+流程完结 ====="
           # 清理临时文件、配置文件、历史记录
           sudo rm -rf /tmp/* /root/.rclone.conf /etc/sudoers.d/roots
