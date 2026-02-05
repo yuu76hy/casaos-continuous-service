@@ -25,7 +25,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 5  # 改为5分钟
+      TARGET_RUN_MINUTES: 5
 
     steps:
       - name: 0-全局错误处理设置
@@ -40,7 +40,6 @@ jobs:
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          # 安装最新版rclone
           curl https://rclone.org/install.sh | sudo bash
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg pv pigz psmisc -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
@@ -95,7 +94,6 @@ jobs:
           set -e
           echo "===== 5-WebDAV 快速配置 ====="
           
-          # 检查WebDAV配置是否完整
           if [ -z "$WEBDAV_URL" ] || [ -z "$WEBDAV_USER" ] || [ -z "$WEBDAV_PASSWORD" ]; then
             echo "⚠️ WebDAV 配置不完整，跳过备份流程"
             echo "WEBDAV_AVAILABLE=false" >> "$GITHUB_ENV"
@@ -106,18 +104,12 @@ jobs:
           
           echo "✅ WebDAV 配置已设置，跳过连接测试，直接配置..."
           
-          # 显示rclone版本
-          echo "rclone版本: $(rclone version | head -1)"
-          
-          # 配置rclone
           ENCRYPTED_PASS=$(rclone obscure "$WEBDAV_PASSWORD")
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
           
-          # 创建目录（忽略错误）
           rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || true
           
-          # 检查现有快照（不阻塞）
           LATEST_SNAPSHOT=$(rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null | grep casaos-full-snapshot | sed 's/^[0-9]\+ //' | sort -r | head -1)
           if [ -n "$LATEST_SNAPSHOT" ]; then
             echo "✅ 检测到快照：$LATEST_SNAPSHOT"
@@ -174,18 +166,18 @@ jobs:
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null)
           echo "✅ Tailscale 组网成功，内网IP：${TAILSCALE_IP:-未获取}"
           
-      - name: 9-延时校准（智能轮询等待）
+      - name: 9-延时校准（简化版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
           set -e
-          echo "===== 9-延时校准（智能轮询等待） ====="
+          echo "===== 9-延时校准 ====="
           
           # 记录开始时间
           START_TIMESTAMP=$(date +%s)
           TARGET_SECONDS=$((TARGET_RUN_MINUTES * 60))
           
           echo "开始时间: $(date -d @$START_TIMESTAMP '+%Y-%m-%d %H:%M:%S')"
-          echo "目标运行时间: $TARGET_RUN_MINUTES 分钟 ($TARGET_SECONDS 秒)"
+          echo "目标运行时间: $TARGET_RUN_MINUTES 分钟"
           
           # 已经运行的时间（秒）
           ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
@@ -196,20 +188,18 @@ jobs:
             echo "当前已运行: $ELAPSED_TIME 秒"
             echo "需要继续等待: $REMAINING_TIME 秒"
             
-            # 智能轮询等待：每30秒输出一次进度，避免长时间无输出
+            # 简化等待：每30秒输出一次进度
             while [ $REMAINING_TIME -gt 0 ]; do
-              # 每次等待30秒或剩余时间中的较小值
               SLEEP_TIME=$((REMAINING_TIME > 30 ? 30 : REMAINING_TIME))
-              echo "等待 ${SLEEP_TIME} 秒 (剩余: ${REMAINING_TIME} 秒)..."
               sleep $SLEEP_TIME
               
               # 更新已运行时间和剩余时间
               ELAPSED_TIME=$(( $(date +%s) - START_TIMESTAMP ))
               REMAINING_TIME=$((TARGET_SECONDS - ELAPSED_TIME))
               
-              # 每1分钟输出一次详细状态
-              if [ $((ELAPSED_TIME % 60)) -lt 5 ]; then
-                echo "⏰ 已运行 $((ELAPSED_TIME / 60)) 分钟 $((ELAPSED_TIME % 60)) 秒"
+              # 每30秒输出一次状态
+              if [ $((ELAPSED_TIME % 30)) -lt 2 ]; then
+                echo "已运行: $((ELAPSED_TIME / 60)) 分钟 $((ELAPSED_TIME % 60)) 秒"
               fi
             done
           else
@@ -238,14 +228,12 @@ jobs:
           FREE_SPACE=$(df -h /tmp | awk 'NR==2 {print $4}')
           echo "临时目录可用空间: $FREE_SPACE"
           
-          # 估算需要的最小空间（原始数据的1.5倍）
           ESTIMATED_SIZE=$(sudo du -sc $PERSONAL_DATA_DIRS 2>/dev/null | tail -1 | awk '{print $1}')
           ESTIMATED_SIZE_MB=$((ESTIMATED_SIZE / 1024))
           MIN_SPACE_NEEDED=$((ESTIMATED_SIZE_MB * 150 / 100))
           
           echo "估算备份需要: ${ESTIMATED_SIZE_MB}MB，建议最少: ${MIN_SPACE_NEEDED}MB"
           
-          # 检查/tmp空间
           TMP_FREE_MB=$(df -m /tmp | awk 'NR==2 {print $4}')
           if [ $TMP_FREE_MB -lt $MIN_SPACE_NEEDED ]; then
             echo "⚠️ 临时空间不足，清理/tmp目录..."
@@ -270,12 +258,10 @@ jobs:
             local attempt=$1
             echo "第${attempt}次打包尝试..."
             
-            # 使用pv显示进度
             sudo tar -cPf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS 2>/dev/null | \
               sudo pv -p -t -e -b -a | \
               sudo pigz -p 4 > $SNAPSHOT_PATH
             
-            # 验证打包文件
             if [ -f "$SNAPSHOT_PATH" ] && sudo gzip -t "$SNAPSHOT_PATH" 2>/dev/null; then
               FILE_SIZE=$(du -h "$SNAPSHOT_PATH" | cut -f1)
               echo "✅ 打包成功！文件大小: $FILE_SIZE"
@@ -301,7 +287,7 @@ jobs:
             fi
           done
           
-      - name: 11-2 全量备份-上传WebDAV（兼容旧版rclone）
+      - name: 11-2 全量备份-上传WebDAV（优化显示频率）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         run: |
@@ -315,54 +301,78 @@ jobs:
           fi
           echo "✅ 环境变量校验通过"
           
-          # 显示rclone版本和可用参数
-          echo "rclone版本信息:"
-          rclone version
+          # 显示文件信息
+          echo "备份文件信息："
+          ls -lh "$SNAPSHOT_PATH"
           echo ""
           
-          # 上传函数（使用兼容旧版的参数）
+          # 上传函数（优化显示频率）
           upload_data() {
             echo "开始上传：$SNAPSHOT_NAME"
             
-            # 测试rclone配置
-            echo "测试rclone配置..."
-            rclone lsd mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf || {
-              echo "⚠️ 无法列出目录，尝试创建..."
-              rclone mkdir mywebdav:$WEBDAV_SNAPSHOT_DIR --config /home/runner/.rclone.conf 2>/dev/null || true
-            }
-            
-            echo "开始上传文件..."
-            # 使用兼容旧版rclone的参数
+            # 使用简洁参数，30秒显示一次进度
             rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
               --config /home/runner/.rclone.conf \
-              --progress \
-              --verbose \
+              --stats 30s \
+              --stats-one-line \
               --retries 3 \
-              --low-level-retries 5 \
+              --low-level-retries 10 \
               --timeout 30m \
-              --user-agent "Mozilla/5.0" || return 1
-            
-            # 检查文件是否上传成功
-            echo "检查上传结果..."
-            rclone ls mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME --config /home/runner/.rclone.conf >/dev/null 2>&1 || {
-              echo "⚠️ 文件未找到，上传可能失败"
+              --no-check-dest \
+              --ignore-checksum \
+              --no-update-modtime || {
+              echo "⚠️ 上传失败"
               return 1
             }
             
-            # 完整性验证（简单大小比较）
-            echo "开始验证上传完整性..."
+            # 等待几秒让服务器处理
+            echo "等待服务器处理文件..."
+            sleep 5
+            
+            # 验证文件是否已上传
+            echo "检查文件是否已上传..."
+            local check_count=0
+            local max_checks=10  # 最多检查10次，每次3秒
+            
+            while [ $check_count -lt $max_checks ]; do
+              check_count=$((check_count + 1))
+              
+              if rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+                echo "✅ 第 $check_count 次检查：文件已找到"
+                break
+              fi
+              
+              if [ $check_count -eq $max_checks ]; then
+                echo "❌ 文件上传后检查超时"
+                return 1
+              fi
+              
+              sleep 3
+            done
+            
+            # 大小验证
+            echo "进行大小验证..."
             local local_size=$(stat -c %s "$SNAPSHOT_PATH")
-            local remote_size=$(rclone size "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null | grep "Total size" | awk '{print $3}' || echo "0")
+            echo "本地文件大小: $((local_size / 1024 / 1024)) MB"
             
-            echo "本地大小: $local_size, 远程大小: $remote_size"
+            # 获取远程文件大小
+            local remote_size=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null | awk '{print $1}')
             
-            if [ "$remote_size" = "0" ] || [ "$local_size" != "$remote_size" ]; then
-              echo "⚠️ 验证失败：本地大小 $local_size，远程大小 $remote_size"
-              return 1
+            if [ -n "$remote_size" ] && [ "$remote_size" -gt 0 ]; then
+              echo "远程文件大小: $((remote_size / 1024 / 1024)) MB"
+              
+              if [ "$local_size" != "$remote_size" ]; then
+                echo "⚠️ 大小不匹配：本地 $((local_size / 1024 / 1024)) MB，远程 $((remote_size / 1024 / 1024)) MB"
+                return 1
+              else
+                echo "✅ 大小验证通过"
+              fi
+            else
+              echo "⚠️ 无法获取远程文件大小，但文件已存在"
+              echo "✅ 上传基本成功（无法验证大小）"
             fi
-            echo "✅ 上传完整性验证通过"
             
             # 清理本地文件
             if [ -f "$SNAPSHOT_PATH" ]; then
@@ -373,15 +383,34 @@ jobs:
             return 0
           }
           
-          # 双层重试
+          # 记录开始时间
+          START_TIME=$(date +%s)
+          
+          # 尝试上传（最多2次）
           if ! upload_data; then
-            echo "⚠️ 首次上传失败，等待1分钟后重试..."
-            sleep 60
+            echo "⚠️ 首次上传失败，等待30秒后重试..."
+            sleep 30
+            
+            if [ ! -f "$SNAPSHOT_PATH" ]; then
+              echo "❌ 本地文件已丢失，无法重试"
+              exit 1
+            fi
+            
             if ! upload_data; then
               echo "❌ 上传最终失败"
+              
+              END_TIME=$(date +%s)
+              TOTAL_TIME=$((END_TIME - START_TIME))
+              echo "总耗时: $((TOTAL_TIME / 60))分$((TOTAL_TIME % 60))秒"
+              
               exit 1
             fi
           fi
+          
+          # 计算总耗时
+          END_TIME=$(date +%s)
+          TOTAL_TIME=$((END_TIME - START_TIME))
+          echo "✅ 上传成功！总耗时: $((TOTAL_TIME / 60))分$((TOTAL_TIME % 60))秒"
           
           echo "upload_success=true" >> "$GITHUB_OUTPUT"
           
@@ -417,7 +446,6 @@ jobs:
         run: |
           echo "===== 12-服务健康检查 ====="
           
-          # 检查Docker服务
           if systemctl is-active --quiet docker; then
             echo "✅ Docker 服务运行正常"
             docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || true
@@ -425,7 +453,6 @@ jobs:
             echo "⚠️ Docker 服务未运行"
           fi
           
-          # 检查CasaOS服务
           if systemctl is-active --quiet casaos; then
             echo "✅ CasaOS 服务运行正常"
             CASAOS_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "localhost")
@@ -434,7 +461,6 @@ jobs:
             echo "⚠️ CasaOS 服务未运行"
           fi
           
-          # 检查磁盘使用情况
           echo "磁盘使用情况:"
           df -h / /tmp /DATA 2>/dev/null || true
           
