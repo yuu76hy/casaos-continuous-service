@@ -40,8 +40,8 @@ jobs:
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          curl https://rclone.org/install.sh | sudo bash
-          # 新增 zstd 高压缩算法，替换传统 gzip
+          # 强制安装最新版 rclone，避免版本兼容问题
+          curl https://rclone.org/install.sh | sudo bash -s -- -v
           sudo apt install -y curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
@@ -54,6 +54,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
+          # 验证 rclone 版本
+          rclone --version
           echo "✅ 系统初始化+全域清理完成"
           
       - name: 2-官方纯净安装 Docker
@@ -298,7 +300,7 @@ jobs:
             fi
           done
           
-      - name: 11-2 全量备份-上传WebDAV（断点续传+校验版）
+      - name: 11-2 全量备份-上传WebDAV（修复参数错误+稳定版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
         timeout-minutes: 30  # 大文件上传延长超时
@@ -321,7 +323,7 @@ jobs:
             echo "开始上传（尝试 $attempt）：$SNAPSHOT_NAME"
             local start_time=$(date +%s)
             
-            # rclone copy 支持断点续传、校验，比 copyto 更稳定
+            # 核心修复：移除无效的 --resume，修正参数语法，保留有效参数
             if rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
@@ -329,11 +331,10 @@ jobs:
               --progress \
               --retries 3 \
               --timeout 30m \
-              --resume \          # 断点续传核心参数
-              --checksum \        # 基于校验和验证，避免文件损坏
+              --checksum \
               --transfers 1 \
               --checkers 1 \
-              --verbose 2>&1 | tee /tmp/rclone.log; then
+              --verbose; then
               
               # 验证文件完整性
               if rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null 2>&1; then
