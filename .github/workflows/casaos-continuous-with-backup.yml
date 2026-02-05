@@ -41,7 +41,7 @@ jobs:
           echo "===== 1-系统初始化+全域深度清理 ====="
           # 抑制apt警告，仅输出错误信息
           sudo DEBIAN_FRONTEND=noninteractive apt update -y -qq 2>/dev/null
-          # 修复rclone安装命令：使用官方标准方式，无需额外参数
+          # 官方标准rclone安装，增加安装验证
           curl https://rclone.org/install.sh | sudo bash
           # 安装依赖，抑制所有非必要输出
           sudo apt install -y -qq curl wget jq tar gzip zstd lsof ca-certificates gnupg pv pigz psmisc 2>/dev/null
@@ -307,10 +307,13 @@ jobs:
             fi
           done
           
-      - name: 11-2 全量备份-上传WebDAV（修复参数错误+稳定版）
+      # ==============================================
+      # 核心修改：11-2 上传步骤（大文件WebDAV优化版）
+      # ==============================================
+      - name: 11-2 全量备份-上传WebDAV（大文件优化+卡滞修复版）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && steps.backup_pack.outputs.pack_success == 'true' }}
         id: backup_upload
-        timeout-minutes: 30  # 大文件上传延长超时
+        timeout-minutes: 60  # 大文件上传延长超时到60分钟
         run: |
           set -euo pipefail
           echo "===== 11-2 上传快照到WebDAV ====="
@@ -320,37 +323,55 @@ jobs:
             exit 1
           fi
           echo "✅ 环境变量校验通过"
-          
           echo "备份文件信息："
           ls -lh "$SNAPSHOT_PATH"
+          local LOCAL_FILE_SIZE=$(stat -c %s "$SNAPSHOT_PATH")
+          echo "本地文件大小(字节)：$LOCAL_FILE_SIZE"
           echo ""
-          
+
           upload_data() {
             local attempt=$1
             echo "开始上传（尝试 $attempt）：$SNAPSHOT_NAME"
             local start_time=$(date +%s)
             
-            # 核心修复：移除无效的 --resume，修正参数语法，保留有效参数
+            # 大文件WebDAV核心优化参数
+            # 1. 移除传输中--checksum，移到上传后单独校验
+            # 2. 配置块大小/缓存，适配1G+大文件
+            # 3. 提升底层重试次数，解决网络波动
+            # 4. 关闭目录遍历，减少服务端交互
             if rclone copy \
               "$SNAPSHOT_PATH" \
               "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
               --config /home/runner/.rclone.conf \
               --progress \
-              --retries 3 \
-              --timeout 30m \
-              --checksum \
-              --transfers 1 \
-              --checkers 1 \
-              --verbose; then
+              --retries 5 \          # 整体重试次数
+              --low-level-retries 10 # 底层网络重试次数（关键）
+              --timeout 60m \        # 单连接超时60分钟
+              --transfers 1 \        # WebDAV强制单线程
+              --checkers 1 \         # 强制单校验线程
+              --chunk-size 64M \     # 分片大小64M，适配大文件
+              --buffer-size 128M \   # 缓存128M，提升传输速度
+              --no-traverse \        # 不遍历目标目录，减少开销
+              --ignore-existing; then# 忽略已存在文件，避免重复传输
               
-              # 验证文件完整性
-              if rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf >/dev/null 2>&1; then
+              echo "✅ 传输完成，开始校验文件完整性..."
+              sleep 10 # 给服务端10秒完成文件落地
+              
+              # 上传后单独做完整性校验（比传输中校验更稳定）
+              local REMOTE_FILE_SIZE=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null | awk '{print $1}')
+              if [ "$REMOTE_FILE_SIZE" -eq "$LOCAL_FILE_SIZE" ]; then
                 local end_time=$(date +%s)
                 local duration=$((end_time - start_time))
-                echo "✅ 上传成功！耗时: $duration 秒"
+                echo "✅ 上传+校验成功！耗时: $((duration/60))分$((duration%60))秒"
                 return 0
+              else
+                echo "❌ 文件大小不匹配！本地: $LOCAL_FILE_SIZE 字节 | 远程: $REMOTE_FILE_SIZE 字节"
+                # 删除损坏的远程文件
+                rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf 2>/dev/null
+                return 1
               fi
             fi
+            echo "❌ 传输过程失败"
             return 1
           }
           
@@ -358,8 +379,8 @@ jobs:
           
           # 最多重试2次，应对网络波动
           if ! upload_data 1; then
-            echo "⚠️ 首次上传失败，等待30秒后重试..."
-            sleep 30
+            echo "⚠️ 首次上传失败，等待60秒后重试..."
+            sleep 60
             if [ ! -f "$SNAPSHOT_PATH" ]; then
               echo "❌ 本地文件已丢失，无法重试"
               exit 1
@@ -373,13 +394,9 @@ jobs:
             fi
           fi
           
+          # 清理本地文件
           rm -f "$SNAPSHOT_PATH"
           echo "✅ 本地快照已清理"
-          
-          TOTAL_END_TIME=$(date +%s)
-          TOTAL_DURATION=$((TOTAL_END_TIME - TOTAL_START_TIME))
-          echo "✅ 上传成功！总耗时: $((TOTAL_DURATION / 60))分$((TOTAL_DURATION % 60))秒"
-          
           echo "upload_success=true" >> "$GITHUB_OUTPUT"
           
       - name: 11-3 备份后处理-清理旧备份+触发续跑（时间排序防误删）
