@@ -20,7 +20,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 5  # 已改为 5 分钟
+      TARGET_RUN_MINUTES: 5
 
     steps:
       - name: 1-系统初始化+全域深度清理
@@ -44,19 +44,19 @@ jobs:
           sudo systemctl enable --now ssh
           echo "✅ 系统初始化+清理完成"
 
-      - name: 2-官方纯净安装 Docker（官方源·无交互）
+      - name: 2-官方纯净安装 Docker
         run: |
           set -e
-          echo "===== 2-安装 Docker（官方源·静默无交互） ====="
+          echo "===== 2-安装 Docker（官方源） ====="
           export DEBIAN_FRONTEND=noninteractive
           curl -fsSL https://get.docker.com | sudo bash
           sudo systemctl enable docker containerd
           sudo systemctl stop docker containerd 2>/dev/null || true
           docker --version || true
           sudo usermod -aG docker runner
-          echo "✅ Docker 官方安装完成，已停止"
+          echo "✅ Docker 安装完成，已停止"
 
-      - name: 3-官方纯净安装 CasaOS（装完立即停止）
+      - name: 3-官方纯净安装 CasaOS
         run: |
           set -e
           echo "===== 3-安装 CasaOS ====="
@@ -65,10 +65,14 @@ jobs:
           sudo systemctl disable casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，已停止"
 
-      - name: 4-创建 roots 管理员+免密+SSH密码登录
+      - name: 4-创建 roots 管理员+SSH密码登录
         run: |
           set -e
           echo "===== 4-配置管理员用户 ====="
+          if [ -z "$SSH_PASS" ]; then
+            echo "❌ 错误：ROOTS_PASSWORD 未配置"
+            exit 1
+          fi
           USER_NAME="roots"
           id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
           echo "$USER_NAME:$SSH_PASS" | sudo chpasswd
@@ -80,12 +84,12 @@ jobs:
           sudo systemctl restart ssh
           echo "✅ 管理员配置完成"
 
-      - name: 5-Tailscale 组网+自动发现所有在线CasaOS机器
+      - name: 5-Tailscale 组网+自动发现CasaOS机器
         run: |
           set -e
-          echo "===== 5-Tailscale组网+自动搜索CasaOS ====="
+          echo "===== 5-Tailscale组网+搜索 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Tailscale未配置，无法内网"
+            echo "⚠️ Tailscale未配置"
             echo "HAS_CASAOS_PEERS=false" >> $GITHUB_ENV
             exit 0
           fi
@@ -106,38 +110,50 @@ jobs:
             echo "HAS_CASAOS_PEERS=false" >> $GITHUB_ENV
           fi
 
-      - name: 6-从内网/aaa拉最新备份→删除远程→本地恢复+权限校正
+      - name: 6-从内网/aaa拉备份→删远程→本地恢复
         run: |
           set -e
-          echo "===== 6-从/aaa拉备份→删远程→恢复 ====="
+          echo "===== 6-拉取备份并恢复 ====="
           if [ "$HAS_CASAOS_PEERS" != "true" ]; then
-            echo "ℹ️ 无机器，纯净启动"
+            echo "ℹ️ 无内网机器，纯净启动"
             exit 0
           fi
+          if [ -z "$SSH_PASS" ]; then
+            echo "❌ SSH_PASS 未配置"
+            exit 1
+          fi
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
-          sudo pkill -9 docker containerd casaos 2>/dev/null || true
+          sudo pkill -9 -x "casaos" "docker" "containerd" 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
+
           LATEST_FILE=""
           TARGET_HOST=""
           while IFS= read -r host; do
-            FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@$host" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1")
+            FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o CommandTimeout=30 "$SSH_USER@$host" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1")
+            if [ $? -ne 0 ]; then
+              echo "⚠️ 连接 $host 失败，跳过"
+              continue
+            fi
             if [ -n "$FILE" ]; then
               LATEST_FILE="$FILE"
               TARGET_HOST="$host"
               break
             fi
           done < /tmp/casaos_peers.txt
+
           if [ -z "$LATEST_FILE" ]; then
             echo "ℹ️ 无备份，纯净启动"
             exit 0
           fi
+
           echo "✅ 从 $TARGET_HOST 取备份: $LATEST_FILE"
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename $LATEST_FILE)"
-          sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no "$SSH_USER@$TARGET_HOST:$LATEST_FILE" "$LOCAL_FILE"
-          sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$TARGET_HOST" "rm -f $LATEST_FILE"
-          echo "✅ 远程源文件已删除"
+          sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o CommandTimeout=60 "$SSH_USER@$TARGET_HOST:$LATEST_FILE" "$LOCAL_FILE"
+          sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o CommandTimeout=30 "$SSH_USER@$TARGET_HOST" "rm -f $LATEST_FILE" || true
+          echo "✅ 远程文件已删除"
+
           sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
@@ -153,85 +169,124 @@ jobs:
           sudo systemctl daemon-reload
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 4
-          echo "✅ CasaOS 正常启动完成"
+          echo "✅ CasaOS 正常启动"
 
-      - name: 8-延时满5分钟再备份
+      - name: 8-稳定运行满5分钟
         run: |
           set -e
           echo "===== 8-延时 5 分钟 ====="
           START=$(date +%s)
-          sleep 5
-          USED=$(( $(date +%s) - START ))
-          WAIT=$(( TARGET_RUN_MINUTES*60 - USED ))
-          [ $WAIT -gt 0 ] && sleep $WAIT
+          TOTAL_WAIT=$(( TARGET_RUN_MINUTES * 60 ))
+          sleep "$TOTAL_WAIT"
           echo "✅ 已稳定运行 5 分钟"
 
       - name: 9-停止所有服务（安全备份）
         run: |
           set -e
-          echo "===== 9-停止所有服务（安全备份） ====="
+          echo "===== 9-停止所有服务 ====="
           sudo systemctl stop casaos docker containerd tailscaled 2>/dev/null || true
-          sudo pkill -9 -f "casaos|docker|containerd|tailscaled" 2>/dev/null || true
+          sudo pkill -9 -x "casaos" "docker" "containerd" "tailscaled" 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
+          sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || true
           sync && sleep 5
           echo "✅ 已停止，可安全备份"
 
-      - name: 10-本地全量备份
+      # ====================== 重点：完全修复的步骤10 ======================
+      - name: 10-本地全量备份（已修复tar报错）
         run: |
           set -e
           echo "===== 10-生成本地全量备份 ====="
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
+
+          # 修复1：自动创建不存在的目录（纯净部署必报的坑）
+          for dir in $PERSONAL_DATA_DIRS; do
+            if [ ! -d "$dir" ]; then
+              echo "⚠️ 目录 $dir 不存在，自动创建"
+              sudo mkdir -p "$dir"
+            fi
+          done
+
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.gz"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
-          sudo tar -czPf "$LOCAL_FILE" $EXCLUDE_RULES $PERSONAL_DATA_DIRS
-          echo "✅ 备份完成: $SNAP_NAME"
-          echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
-          echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
 
-      - name: 11-备份完成→立即触发续跑
-        run: |
-          set -e
-          echo "===== 11-触发下一轮续跑 ====="
-          if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
-            curl -s -f -X POST \
-              -H "Authorization: token $USER_PAT" \
-              -H "Content-Type: application/json" \
-              https://api.github.com/repos/$REPO/dispatches \
-              -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
-            [ $? -eq 0 ] && echo "✅ 续跑触发成功" || echo "⚠️ 续跑失败"
+          # 修复2：tar 正确顺序 + 容错 + 不再用混乱的 $EXCLUDE_RULES 变量
+          sudo tar -cz \
+            --ignore-failed-read \
+            --exclude='*.log' \
+            --exclude='*.tmp' \
+            --exclude='*.cache' \
+            --exclude='/var/lib/docker/tmp' \
+            --exclude='/var/lib/docker/containers/*/*.log' \
+            --exclude='/var/lib/docker/overlay2/*/tmp' \
+            --exclude='/DATA/tmp' \
+            --exclude='/DATA/cache' \
+            --exclude='/DATA/logs' \
+            -f "$LOCAL_FILE" \
+            $PERSONAL_DATA_DIRS
+
+          # 修复3：校验文件有效
+          if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
+            echo "✅ 备份完成：$SNAP_NAME"
+            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
+            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
+          else
+            echo "❌ 备份失败或为空"
+            exit 1
           fi
 
-      - name: 12-同步到所有机器/aaa→检测文件被删除后继续
+      - name: 11-触发下一轮续跑
         run: |
           set -e
-          echo "===== 12-同步到所有机器/aaa并检测删除 ====="
-          if [ "$HAS_CASAOS_PEERS" != "true" ]; then
-            echo "ℹ️ 无其他机器，跳过同步"
+          echo "===== 11-触发续跑 ====="
+          if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
+            echo "⚠️ 未配置 USER_PAT/REPO，跳过"
             exit 0
           fi
+          curl -s -f -X POST \
+            -H "Authorization: token $USER_PAT" \
+            -H "Content-Type: application/json" \
+            https://api.github.com/repos/$REPO/dispatches \
+            -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
+          [ $? -eq 0 ] && echo "✅ 续跑触发成功" || echo "⚠️ 续跑失败"
+
+      - name: 12-同步到所有机器/aaa 并等待删除
+        run: |
+          set -e
+          echo "===== 12-同步备份并等待远端删除 ====="
+          if [ "$HAS_CASAOS_PEERS" != "true" ]; then
+            echo "ℹ️ 无内网机器，跳过同步"
+            exit 0
+          fi
+          if [ -z "$SSH_PASS" ]; then
+            echo "❌ SSH_PASS 未配置"
+            exit 1
+          fi
+
           while IFS= read -r host; do
-            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$host" "sudo mkdir -p $REMOTE_BACKUP_BASE"
-            sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no "$BACKUP_FILE" "$SSH_USER@$host:$REMOTE_BACKUP_BASE/$SNAP_NAME"
-            echo "✅ 已同步到 $host:$REMOTE_BACKUP_BASE/$SNAP_NAME"
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o CommandTimeout=30 "$SSH_USER@$host" "sudo mkdir -p $REMOTE_BACKUP_BASE" || continue
+            sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o CommandTimeout=60 "$BACKUP_FILE" "$SSH_USER@$host:$REMOTE_BACKUP_BASE/$SNAP_NAME" || continue
+            echo "✅ 已同步到 $host"
           done < /tmp/casaos_peers.txt
-          echo "🔍 等待远程文件被删除..."
+
+          echo "🔍 等待远端文件被删除..."
           while true; do
             FOUND=0
             while IFS= read -r host; do
-              sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$SSH_USER@$host" "ls $REMOTE_BACKUP_BASE/$SNAP_NAME 2>/dev/null" && FOUND=1 && break
+              sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o CommandTimeout=10 "$SSH_USER@$host" "ls $REMOTE_BACKUP_BASE/$SNAP_NAME 2>/dev/null" && FOUND=1 && break
             done < /tmp/casaos_peers.txt
             [ $FOUND -eq 0 ] && break
-            sleep 3
+            sleep 2
           done
-          echo "✅ 检测到文件已删除，进入收尾"
+          echo "✅ 检测到文件已删除"
 
       - name: 13-敏感清理+流程完结
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 13-清理+完结 ====="
-          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* /etc/sudoers.d/roots 2>/dev/null || true
+          echo "===== 13-最终清理 ====="
+          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
+          sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
-          echo "✅ 敏感信息清理完成"
-          echo "🎉 CasaOS 部署+内网备份恢复同步 全流程完成"
+          echo "✅ 清理完成"
+          echo "🎉 全流程正常结束"
