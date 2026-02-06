@@ -22,7 +22,8 @@ jobs:
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
       TARGET_RUN_MINUTES: 15
-      ZSTD_COMPRESS_OPTS: "-19 --long=31 --rm -T0"  # 🔑 zstd高压缩核心参数
+      ZSTD_COMPRESS_OPTS: "-19 --long=31 --rm -T0"
+      ZSTD_DECOMPRESS_OPTS: "--long=31 --memory=2048MB"
 
     steps:
       # ========== 步骤1：系统初始化+全域深度清理（含zstd安装） ==========
@@ -32,7 +33,6 @@ jobs:
           set -e
           echo "WORKFLOW_START_TIME=$(date +%s)" >> "$GITHUB_ENV"
           echo "===== 1-系统初始化+全域深度清理 ====="
-          # 🔑 安装zstd（支持-19高压缩率+--long参数）
           sudo apt update -y -qq
           sudo apt install -y curl wget jq tar gzip rclone lsof ca-certificates gnupg zstd -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
@@ -102,7 +102,6 @@ jobs:
           rclone config create mywebdav webdav url="$WEBDAV_URL" user="$WEBDAV_USER" pass="$ENCRYPTED_PASS" --config /home/runner/.rclone.conf >/dev/null
           sudo chmod 600 /home/runner/.rclone.conf
           rclone mkdir "mywebdav:$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf 2>/dev/null || true
-          # 🔑 精准匹配zstd格式快照（避免旧.tar.gz干扰）
           REMOTE_SNAPSHOTS=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR" --config /home/runner/.rclone.conf | \
             grep 'casaos-full-snapshot.*\.tar\.zst$' | sed 's/^[0-9]\+ //' | sort -r | head -1 | xargs)
           if [ -n "$REMOTE_SNAPSHOTS" ]; then
@@ -116,7 +115,7 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成（zstd格式）"
 
-      # ========== 步骤6：从 WebDAV 恢复历史数据（zstd解压） ==========
+      # ========== 步骤6：从 WebDAV 恢复历史数据（zstd解压）【核心修复+进度优化】 ==========
       - name: 6-恢复历史快照（zstd解压+路径精准还原）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -127,14 +126,31 @@ jobs:
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock 2>/dev/null || true
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
-          # 🔑 zstd流式解压管道：rclone下载 → zstd解压 → tar精准还原（-P保留绝对路径）
-          rclone cat "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf | \
-            zstd -dc | sudo tar -xPf - -C / --overwrite --preserve-permissions $PERSONAL_DATA_DIRS
+          
+          # 🔑 修复1：移除tar命令中错误的$PERSONAL_DATA_DIRS（解包时不应指定目标目录列表）
+          # 🔑 修复2：$EXCLUDE_RULES置于tar命令末尾作为过滤规则
+          # 🔑 优化：rclone cat添加--stats 5s，每5秒输出下载速度（stderr，不影响管道）
+          echo "=== 📥 开始下载快照（5秒刷新速度）==="
+          rclone cat "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" \
+            --config /home/runner/.rclone.conf \
+            --stats 5s | \
+            zstd -dc $ZSTD_DECOMPRESS_OPTS | sudo tar -xPf - -C / --overwrite --preserve-permissions $EXCLUDE_RULES
+          echo "=== ✅ 快照下载完成 ==="
+          
+          # 验证关键目录恢复
+          for check_dir in $PERSONAL_DATA_DIRS; do
+            if [ ! -d "$check_dir" ] || [ -z "$(ls -A "$check_dir" 2>/dev/null)" ]; then
+              echo "❌ 关键目录恢复失败：$check_dir"
+              exit 1
+            fi
+          done
+          
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
+          
           rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf 2>/dev/null || true
-          echo "✅ zstd快照恢复完成（高压缩率无损还原）"
+          echo "✅ zstd快照恢复完成（高压缩率无损还原），关键目录均验证通过"
 
       # ========== 步骤7：启动 Docker & CasaOS 服务 ==========
       - name: 7-启动 Docker & CasaOS 核心服务
@@ -198,7 +214,7 @@ jobs:
           sync && sleep 5
           echo "✅ 服务已安全停止"
 
-      # ========== 步骤11：全量备份（zstd19高压缩） ==========
+      # ========== 步骤11：全量备份（zstd19高压缩）【核心修复+进度优化】 ==========
       - name: 11-全量备份（zstd19高压缩）+清旧备份+触发续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -207,22 +223,34 @@ jobs:
           full_backup() {
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
             SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
-            # 🔑 zstd19高压缩管道：tar流式打包 → zstd高压缩（-19+--long=31+多线程）
-            sudo tar -cPf - $EXCLUDE_RULES $PERSONAL_DATA_DIRS | \
+            
+            # 🔑 修复：$EXCLUDE_RULES 和 --warning 必须放在 $PERSONAL_DATA_DIRS 之前（tar语法要求）
+            sudo tar -cPf - $EXCLUDE_RULES --warning=no-file-changed $PERSONAL_DATA_DIRS | \
               zstd $ZSTD_COMPRESS_OPTS -o "$SNAPSHOT_PATH" || return 1
             
-            # 上传验证
+            echo "=== 📤 开始上传备份（5秒刷新速度）==="
+            # 🔑 优化：rclone copy 添加 --stats 5s，每5秒输出上传速度+ETA（stderr）
             rclone copy "$SNAPSHOT_PATH" "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
-              --config /home/runner/.rclone.conf --transfers 4 --fast-list --retries 3 || { sudo rm -f "$SNAPSHOT_PATH"; return 1; }
-            rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" \
-              --config /home/runner/.rclone.conf >/dev/null || { sudo rm -f "$SNAPSHOT_PATH"; return 1; }
+              --config /home/runner/.rclone.conf \
+              --transfers 4 --fast-list --retries 3 \
+              --stats 5s || { sudo rm -f "$SNAPSHOT_PATH"; return 1; }
+            echo "=== ✅ 上传完成 ==="
+            
+            # 验证文件大小一致性
+            LOCAL_SIZE=$(stat -c%s "$SNAPSHOT_PATH")
+            REMOTE_SIZE=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR/$SNAPSHOT_NAME" --config /home/runner/.rclone.conf | awk '{print $1}')
+            if [ "$LOCAL_SIZE" -ne "$REMOTE_SIZE" ]; then
+              echo "❌ 备份上传大小不匹配，本地$LOCAL_SIZE vs 远程$REMOTE_SIZE"
+              sudo rm -f "$SNAPSHOT_PATH"
+              return 1
+            fi
             sudo rm -f "$SNAPSHOT_PATH"
-            echo "✅ 备份成功：$SNAPSHOT_NAME (zstd19)"
+            echo "✅ 备份成功：$SNAPSHOT_NAME (zstd19)，大小：$((LOCAL_SIZE/1024/1024))MB"
             return 0
           }
           full_backup || { echo "⚠️ 首次失败，10分钟后重试"; sleep 600; full_backup; }
           
-          # 🔑 精准清理：仅处理.tar.zst格式（彻底隔离旧格式风险）
+          # 精准清理旧备份（仅.tar.zst）
           BACKUPS=$(rclone ls "mywebdav:$WEBDAV_SNAPSHOT_DIR" \
             --config /home/runner/.rclone.conf | grep '\.tar\.zst$' | sed 's/^[0-9]\+ //' | sort -r)
           COUNT=$(echo "$BACKUPS" | wc -l)
@@ -230,6 +258,7 @@ jobs:
             echo "$BACKUPS" | tail -n +$((KEEP_BACKUPS + 1)) | while read -r file; do
               rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$file" \
                 --config /home/runner/.rclone.conf 2>/dev/null || true
+              echo "🗑️  删除旧备份：$file"
             done
             echo "✅ 旧备份清理完成，保留最新${KEEP_BACKUPS}份（仅.tar.zst）"
           else
