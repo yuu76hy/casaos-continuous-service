@@ -108,7 +108,7 @@ jobs:
           
           echo "✅ Tailscale 已上线"
 
-      - name: 6-从内网/aaa拉备份→删远程→本地恢复
+      - name: 6-从内网/aaa拉备份→删远程→本地恢复（修复jq解析+同步等待）
         run: |
           set -e
           echo "===== 6-拉取备份并恢复 ====="
@@ -117,9 +117,16 @@ jobs:
             exit 0
           fi
 
-          sudo tailscale status --json | jq -r '.Peer[] | select(.Hostname | contains("CasaOS") and .Online == true) | .Hostname' | sort | uniq > /tmp/current_casaos_peers.txt
+          # 修复：等待Tailscale同步在线机器列表
+          echo "🔄 等待Tailscale同步在线机器信息..."
+          sleep 5
+
+          # 修复：jq容错处理（Peer为null时转为空数组）
+          sudo tailscale status --json | jq -r '.Peer // [] | .[] | select(.Hostname | contains("CasaOS") and .Online == true) | .Hostname' | sort | uniq > /tmp/current_casaos_peers.txt
+
+          # 检查是否有在线机器
           if [ ! -s /tmp/current_casaos_peers.txt ]; then
-            echo "ℹ️ 无在线内网机器，纯净启动"
+            echo "ℹ️ 无在线内网机器（或Hostname不匹配），纯净启动"
             exit 0
           fi
 
