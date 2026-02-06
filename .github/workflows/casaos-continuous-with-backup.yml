@@ -21,7 +21,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 5
+      TARGET_RUN_MINUTES: 15
       ZSTD_COMPRESS_OPTS: "-19 --long=31 --rm -T0"
       ZSTD_DECOMPRESS_OPTS: "--long=31 --memory=2048MB"
 
@@ -115,7 +115,7 @@ jobs:
           echo "WEBDAV_AVAILABLE=true" >> "$GITHUB_ENV"
           echo "✅ WebDAV 初始化完成（zstd格式）"
 
-      # ========== 步骤6：从 WebDAV 恢复历史数据（zstd解压）【核心修复+进度优化】 ==========
+      # ========== 步骤6：从 WebDAV 恢复历史数据（zstd解压）【关键修复】 ==========
       - name: 6-恢复历史快照（zstd解压+路径精准还原）
         if: ${{ env.WEBDAV_AVAILABLE == 'true' && env.HAS_SNAPSHOT == 'true' }}
         run: |
@@ -127,19 +127,19 @@ jobs:
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
           
-          # 🔑 核心修复：解包时移除无效的$EXCLUDE_RULES（tar的--exclude仅在创建包时生效，解包时会被忽略）
-          # 🔑 备份时已通过$EXCLUDE_RULES排除文件，恢复包中已无这些文件，无需再次排除
-          echo "=== 📥 开始下载快照（5秒刷新速度）==="
+          # 🔑 终极修复：移除 rclone cat 的 --stats 参数（避免破坏管道）
+          #   • rclone cat 无法分离进度与数据流，添加参数会导致 zstd 解压失败
+          #   • 恢复阶段优先保证数据完整性，进度可视化非必需
+          echo "=== 📥 开始下载快照（静默恢复，确保管道纯净）==="
           rclone cat "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" \
-            --config /home/runner/.rclone.conf \
-            --stats 5s | \
-            zstd -dc $ZSTD_DECOMPRESS_OPTS | sudo tar -xPf - -C / --overwrite --preserve-permissions
-          echo "=== ✅ 快照下载完成 ==="
+            --config /home/runner/.rclone.conf | \
+            zstd -dc $ZSTD_DECOMPRESS_OPTS | sudo tar -xPf - -C / --overwrite --preserve-permissions $EXCLUDE_RULES
+          echo "=== ✅ 快照恢复完成 ==="
           
-          # 验证关键目录恢复
+          # 验证关键目录恢复（严格校验）
           for check_dir in $PERSONAL_DATA_DIRS; do
             if [ ! -d "$check_dir" ] || [ -z "$(ls -A "$check_dir" 2>/dev/null)" ]; then
-              echo "❌ 关键目录恢复失败：$check_dir"
+              echo "❌ 恢复失败：目录 $check_dir 不存在或为空"
               exit 1
             fi
           done
@@ -149,7 +149,7 @@ jobs:
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
           
           rclone delete "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" --config /home/runner/.rclone.conf 2>/dev/null || true
-          echo "✅ zstd快照恢复完成（高压缩率无损还原），关键目录均验证通过"
+          echo "✅ zstd快照恢复成功（高压缩率无损还原），关键目录验证通过"
 
       # ========== 步骤7：启动 Docker & CasaOS 服务 ==========
       - name: 7-启动 Docker & CasaOS 核心服务
@@ -213,7 +213,7 @@ jobs:
           sync && sleep 5
           echo "✅ 服务已安全停止"
 
-      # ========== 步骤11：全量备份（zstd19高压缩）【核心修复+进度优化】 ==========
+      # ========== 步骤11：全量备份（zstd19高压缩）【精准显示上传速度】 ==========
       - name: 11-全量备份（zstd19高压缩）+清旧备份+触发续跑
         if: ${{ env.WEBDAV_AVAILABLE == 'true' }}
         run: |
@@ -223,12 +223,12 @@ jobs:
             SNAPSHOT_NAME="casaos-full-snapshot-$(date +%Y%m%d-%H%M%S).tar.zst"
             SNAPSHOT_PATH="/tmp/$SNAPSHOT_NAME"
             
-            # 🔑 修复：$EXCLUDE_RULES 和 --warning 必须放在 $PERSONAL_DATA_DIRS 之前（tar语法要求）
+            # 🔑 修复：$EXCLUDE_RULES 必须放在 $PERSONAL_DATA_DIRS 之前（tar 语法要求）
             sudo tar -cPf - $EXCLUDE_RULES --warning=no-file-changed $PERSONAL_DATA_DIRS | \
               zstd $ZSTD_COMPRESS_OPTS -o "$SNAPSHOT_PATH" || return 1
             
-            echo "=== 📤 开始上传备份（5秒刷新速度）==="
-            # 🔑 优化：rclone copy 添加 --stats 5s，每5秒输出上传速度+ETA（stderr）
+            echo "=== 📤 开始上传备份（每5秒刷新速度）==="
+            # 🔑 核心：rclone copy 使用 --stats 5s（安全输出到 stderr，不影响文件传输）
             rclone copy "$SNAPSHOT_PATH" "mywebdav:$WEBDAV_SNAPSHOT_DIR/" \
               --config /home/runner/.rclone.conf \
               --transfers 4 --fast-list --retries 3 \
