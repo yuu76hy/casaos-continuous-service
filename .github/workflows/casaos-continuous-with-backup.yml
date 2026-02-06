@@ -21,7 +21,7 @@ jobs:
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       REPO: ${{ secrets.REPO }}
       KEEP_BACKUPS: 2
-      TARGET_RUN_MINUTES: 15
+      TARGET_RUN_MINUTES: 5
       ZSTD_COMPRESS_OPTS: "-19 --long=31 --rm -T0"
       ZSTD_DECOMPRESS_OPTS: "--long=31 --memory=2048MB"
 
@@ -127,14 +127,13 @@ jobs:
           sync && sleep 2
           sudo mkdir -p $PERSONAL_DATA_DIRS 2>/dev/null || true
           
-          # 🔑 修复1：移除tar命令中错误的$PERSONAL_DATA_DIRS（解包时不应指定目标目录列表）
-          # 🔑 修复2：$EXCLUDE_RULES置于tar命令末尾作为过滤规则
-          # 🔑 优化：rclone cat添加--stats 5s，每5秒输出下载速度（stderr，不影响管道）
+          # 🔑 核心修复：解包时移除无效的$EXCLUDE_RULES（tar的--exclude仅在创建包时生效，解包时会被忽略）
+          # 🔑 备份时已通过$EXCLUDE_RULES排除文件，恢复包中已无这些文件，无需再次排除
           echo "=== 📥 开始下载快照（5秒刷新速度）==="
           rclone cat "mywebdav:$WEBDAV_SNAPSHOT_DIR/$LATEST_SNAPSHOT" \
             --config /home/runner/.rclone.conf \
             --stats 5s | \
-            zstd -dc $ZSTD_DECOMPRESS_OPTS | sudo tar -xPf - -C / --overwrite --preserve-permissions $EXCLUDE_RULES
+            zstd -dc $ZSTD_DECOMPRESS_OPTS | sudo tar -xPf - -C / --overwrite --preserve-permissions
           echo "=== ✅ 快照下载完成 ==="
           
           # 验证关键目录恢复
