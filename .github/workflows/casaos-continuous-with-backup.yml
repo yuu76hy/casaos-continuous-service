@@ -95,7 +95,7 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y tailscale -qq
           sudo systemctl enable --now tailscaled && sleep 2
-          TS_HOSTNAME="CasaOS-$(head -c4 /dev/urandom | xxd -p -c4)"
+          TS_HOSTNAME="casaos-$(head -c4 /dev/urandom | xxd -p -c4)"  # 统一为小写casaos开头
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --accept-routes
 
           # 显示本机IP（物理内网IP + Tailscale IP）
@@ -108,7 +108,7 @@ jobs:
           
           echo "✅ Tailscale 已上线"
 
-      - name: 6-从内网/aaa拉备份→删远程→本地恢复（修复jq解析+同步等待）
+      - name: 6-从内网/aaa拉备份→删远程→本地恢复（修复Hostname大小写+兼容jq）
         run: |
           set -e
           echo "===== 6-拉取备份并恢复 ====="
@@ -117,14 +117,26 @@ jobs:
             exit 0
           fi
 
-          # 修复：等待Tailscale同步在线机器列表
-          echo "🔄 等待Tailscale同步在线机器信息..."
-          sleep 5
+          # 延长同步等待时间（10秒）
+          echo "🔄 等待Tailscale同步在线机器信息（10秒）..."
+          sleep 10
 
-          # 修复：jq容错处理（Peer为null时转为空数组）
-          sudo tailscale status --json | jq -r '.Peer // [] | .[] | select(.Hostname | contains("CasaOS") and .Online == true) | .Hostname' | sort | uniq > /tmp/current_casaos_peers.txt
+          # 打印完整Tailscale状态（调试用）
+          echo "=== 调试：Tailscale完整状态JSON ==="
+          sudo tailscale status --json > /tmp/tailscale_status.json
+          cat /tmp/tailscale_status.json
+          echo "====================================="
 
-          # 检查是否有在线机器
+          # 修复：匹配小写casaos开头的Hostname，兼容旧版jq
+          sudo tailscale status --json | jq -r '
+            if .Peer and type(.Peer) == "array" then
+              .Peer[] | select(.Hostname | contains("casaos") and .Online == true) | .Hostname
+            else
+              empty
+            end
+          ' | sort | uniq > /tmp/current_casaos_peers.txt
+
+          # 检查在线机器列表
           if [ ! -s /tmp/current_casaos_peers.txt ]; then
             echo "ℹ️ 无在线内网机器（或Hostname不匹配），纯净启动"
             exit 0
