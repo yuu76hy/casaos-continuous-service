@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 1
+      TARGET_RUN_MINUTES: 5
 
     steps:
       - name: 1-系统初始化+全域深度清理
@@ -41,6 +41,7 @@ jobs:
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           sudo systemctl enable --now ssh
           echo "✅ 系统初始化+深度清理完成"
+
       - name: 2-官方纯净安装 Docker
         run: |
           set -e
@@ -52,6 +53,7 @@ jobs:
           docker --version || true
           sudo usermod -aG docker runner
           echo "✅ Docker 安装完成，已停止服务"
+
       - name: 3-官方纯净安装 CasaOS
         run: |
           set -e
@@ -60,6 +62,7 @@ jobs:
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
           echo "✅ CasaOS 安装完成，已停止服务"
+
       - name: 4-创建 roots 管理员+SSH密码登录
         run: |
           set -e
@@ -78,6 +81,7 @@ jobs:
           sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null
           sudo systemctl restart ssh
           echo "✅ 管理员用户 & SSH 密码登录配置完成"
+
       - name: 5-Tailscale 组网+上线+显示本机IP地址
         run: |
           set -e
@@ -106,6 +110,7 @@ jobs:
           echo "✅ Tailscale内网IP: $TAILSCALE_IP"
           echo "==================================="
           echo "✅ Tailscale 组网上线完成"
+
       - name: 6-从内网/aaa拉备份→删远程→本地恢复
         run: |
           set -e
@@ -126,14 +131,13 @@ jobs:
           echo "ℹ️ 本机 Tailscale ID: $SELF_ID"
           echo "ℹ️ 本机 Tailscale 主机名: $SELF_HOSTNAME"
 
-          echo -e "\n🔍 筛选条件：connected + 名称 CasaOS-[0-9] + 排除本机"
-          # 筛选：在线(connected)、名称匹配 CasaOS-数字、非本机
+          echo -e "\n🔍 筛选条件：Online=true + 名称包含CasaOS + 排除本机"
+          # 稳定筛选：在线 + 名称含CasaOS + 非本机
           TARGET_LIST=$(echo "$TS_STATUS_JSON" | jq -r --arg self "$SELF_ID" '
             .Peer[] | 
             select(
               .Online == true and 
-              .LastSeen | contains("connected") and 
-              .HostName | test("^CasaOS-[0-9]$") and 
+              .HostName | contains("CasaOS") and 
               .ID != $self
             ) | 
             "\(.HostName)|\(.TailscaleIPs[0])"
@@ -149,21 +153,21 @@ jobs:
             echo "  - $h | $ip"
           done
 
-          # 取第一个节点
+          # 取第一个可用节点
           TARGET_LINE=$(echo "$TARGET_LIST" | head -1)
           TARGET_HOST=$(echo "$TARGET_LINE" | cut -d'|' -f1)
           TARGET_IP=$(echo "$TARGET_LINE" | cut -d'|' -f2)
           echo -e "\n🎯 选中目标节点：$TARGET_HOST ($TARGET_IP)"
 
-          # 停止服务，避免文件占用
+          # 停止服务防止文件占用
           echo -e "\n🛑 停止 Docker / CasaOS 相关服务"
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 -x "casaos" "docker" "containerd" 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
 
-          # 取远程最新备份
-          echo -e "\n📂 查询 $TARGET_IP 上 $REMOTE_BACKUP_BASE 最新备份"
+          # 获取最新备份
+          echo -e "\n📂 查询 $TARGET_IP $REMOTE_BACKUP_BASE 最新备份"
           LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "$SSH_USER@$TARGET_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1")
 
@@ -173,7 +177,7 @@ jobs:
           fi
           echo "✅ 找到备份文件：$LATEST_FILE"
 
-          # 拉取
+          # 拉取备份
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
           echo -e "\n⬇️ 拉取备份到本地：$LOCAL_FILE"
@@ -185,13 +189,14 @@ jobs:
           sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "$SSH_USER@$TARGET_IP" "rm -f '$LATEST_FILE'" || true
 
-          # 恢复
+          # 恢复并修正权限
           echo -e "\n🔧 解压恢复系统目录"
           sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
           sudo chown -R root:root $PERSONAL_DATA_DIRS
           sudo chmod -R 755 /etc/casaos /DATA /root/.config
           sudo chmod -R 700 /var/lib/casaos /var/lib/docker
           echo "✅ 备份恢复 + 权限校正完成"
+
       - name: 7-启动 Docker & CasaOS
         run: |
           set -e
@@ -202,12 +207,14 @@ jobs:
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 4
           echo "✅ Docker & CasaOS 启动完成"
+
       - name: 8-稳定运行满5分钟
         run: |
           set -e
           echo "===== 8-稳定运行 5 分钟 ====="
           sleep 300
           echo "✅ 已稳定运行 5 分钟"
+
       - name: 9-停止所有服务（安全备份）
         run: |
           set -e
@@ -218,6 +225,7 @@ jobs:
           sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || true
           sync && sleep 5
           echo "✅ 所有服务已停止，可安全备份"
+
       - name: 10-本地全量备份
         run: |
           set -e
@@ -252,6 +260,7 @@ jobs:
             echo "❌ 备份失败或文件为空"
             exit 1
           fi
+
       - name: 11-触发下一轮续跑
         run: |
           set -e
@@ -266,6 +275,7 @@ jobs:
             https://api.github.com/repos/$REPO/dispatches \
             -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
           [ $? -eq 0 ] && echo "✅ 续跑触发成功" || echo "⚠️ 续跑触发失败"
+
       - name: 12-移动备份到本机/aaa → 30秒轮询直到文件被删除
         run: |
           set -e
@@ -290,6 +300,7 @@ jobs:
             sleep 30
           done
           echo "✅ 步骤12 完成"
+
       - name: 13-敏感清理+流程完结
         if: ${{ always() }}
         run: |
