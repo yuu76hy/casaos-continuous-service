@@ -11,7 +11,7 @@ jobs:
     env:
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      USER_PAT: ${{ secrets.USER_PAT }}
+      USER_PAT: ${{ secrets.REPO_USER_PAT }}
       REPO: ${{ secrets.REPO }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       SSH_USER: "roots"
@@ -116,10 +116,10 @@ jobs:
           echo "本机名称: $TS_HOSTNAME"
           echo "✅ Tailscale 已启动（全程保持运行）"
 
-      - name: 6-查找在线 casaos[0-9]{2} 并拉取备份（用IP连接）
+      - name: 6-查找所有 casaos[0-9]{2} 设备并逐个尝试连接（不判断在线状态）
         run: |
           set -e
-          echo "===== 6-查找在线设备并拉取备份 ====="
+          echo "===== 6-查找并尝试连接所有 casaos+两位数字设备 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "ℹ️ Tailscale 未配置，纯净启动"
             exit 0
@@ -129,20 +129,20 @@ jobs:
           echo "=== 节点列表调试 ==="
           sudo tailscale status --json
 
-          # 筛选：名称 casaos+两位数字 + 在线 + 取IPv4
+          # 核心修改：不再判断在线状态，只按名称格式筛选所有 casaos+两位数字的设备
           sudo tailscale status --json | jq -r '
             (.Peer // [])[] |
-            select(.Hostname | test("^casaos[0-9]{2}$") and .Online == true) |
+            select(.Hostname | test("^casaos[0-9]{2}$")) |
             .TailscaleIPs[0]
-          ' | grep -v '^$' | sort | uniq > /tmp/casaos_online_ips.txt
+          ' | grep -v '^$' | sort | uniq > /tmp/casaos_all_ips.txt
 
-          if [ ! -s /tmp/casaos_online_ips.txt ]; then
-            echo "ℹ️ 无在线 casaos[00-99] 设备，纯净启动"
+          if [ ! -s /tmp/casaos_all_ips.txt ]; then
+            echo "ℹ️ 未找到任何名称为 casaos+两位数字的设备，纯净启动"
             exit 0
           fi
 
-          echo "✅ 在线IP："
-          cat /tmp/casaos_online_ips.txt
+          echo "✅ 找到所有 casaos+两位数字设备的IP："
+          cat /tmp/casaos_all_ips.txt
 
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sync && sleep 2
@@ -151,23 +151,27 @@ jobs:
           TARGET_IP=""
           while IFS= read -r TS_IP; do
             echo "🔗 尝试连接 $TS_IP"
+            # 尝试连接，不管设备是否在线，只要能回复就用
             FILE=$(sshpass -p "$SSH_PASS" \
               ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=15 -o ConnectionAttempts=3 \
               "$SSH_USER@$TS_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1" || true)
-            if [ -n "$FILE" ]; then
+            if [ -n "$FILE" ] && [ "$FILE" != " " ]; then
               REMOTE_FILE="$FILE"
               TARGET_IP="$TS_IP"
-              echo "✅ 找到备份: $FILE"
+              echo "✅ $TS_IP 有响应，找到备份: $FILE"
               break
+            else
+              echo "⚠️ $TS_IP 无响应或无备份，跳过"
             fi
-          done < /tmp/casaos_online_ips.txt
+          done < /tmp/casaos_all_ips.txt
 
           if [ -z "$REMOTE_FILE" ]; then
-            echo "ℹ️ 无备份，纯净启动"
+            echo "ℹ️ 所有设备都无响应或无备份，纯净启动"
             exit 0
           fi
 
+          echo "🚀 开始从 $TARGET_IP 下载备份..."
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$REMOTE_FILE")"
 
@@ -194,12 +198,12 @@ jobs:
           sudo systemctl enable --now casaos && sleep 4
           echo "✅ CasaOS 正常启动"
 
-      - name: 8-稳定运行满5分钟
+      - name: 8-稳定运行满1分钟
         run: |
           set -e
-          echo "===== 8-延时 5 分钟 ====="
-          sleep 300
-          echo "✅ 已稳定运行 5 分钟"
+          echo "===== 8-延时 1 分钟 ====="
+          sleep 60
+          echo "✅ 已稳定运行 1 分钟"
 
       - name: 9-仅停止业务服务（⚠️ 关键：Tailscale 不停止、不杀死）
         run: |
