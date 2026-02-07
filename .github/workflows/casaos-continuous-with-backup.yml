@@ -2,7 +2,7 @@ name: CasaOS部署备份流转（并行探测IP·Tailscale全程在线）
 on:
   workflow_dispatch:
   repository_dispatch:
-  types: [renew_casaos_snapshot]
+    types: [renew_casaos_snapshot]  # 修复：缩进错误导致的语法问题
 
 jobs:
   casaos-deploy:
