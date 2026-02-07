@@ -108,7 +108,7 @@ jobs:
           
           echo "✅ Tailscale 已上线"
 
-      - name: 6-从内网/aaa拉备份→删远程→本地恢复（修复Hostname大小写+兼容jq）
+      - name: 6-从内网/aaa拉备份→删远程→本地恢复（按Hostname快速定位，不强制检查在线）
         run: |
           set -e
           echo "===== 6-拉取备份并恢复 ====="
@@ -127,10 +127,10 @@ jobs:
           cat /tmp/tailscale_status.json
           echo "====================================="
 
-          # 修复：匹配小写casaos开头的Hostname，兼容旧版jq
+          # 核心修改：只按Hostname包含"casaos"筛选，不检查Online状态
           sudo tailscale status --json | jq -r '
             if .Peer and type(.Peer) == "array" then
-              .Peer[] | select(.Hostname | contains("casaos") and .Online == true) | .Hostname
+              .Peer[] | select(.Hostname | contains("casaos")) | .Hostname
             else
               empty
             end
@@ -138,7 +138,7 @@ jobs:
 
           # 检查在线机器列表
           if [ ! -s /tmp/current_casaos_peers.txt ]; then
-            echo "ℹ️ 无在线内网机器（或Hostname不匹配），纯净启动"
+            echo "ℹ️ 无匹配Hostname的内网机器，纯净启动"
             exit 0
           fi
 
@@ -155,9 +155,10 @@ jobs:
           LATEST_FILE=""
           TARGET_HOST=""
           while IFS= read -r host; do
+            # 尝试连接，连接失败则跳过
             FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@$host" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1")
             if [ $? -ne 0 ]; then
-              echo "⚠️ 连接 $host 失败，跳过"
+              echo "⚠️ 连接 $host 失败（可能离线），跳过"
               continue
             fi
             if [ -n "$FILE" ]; then
@@ -168,7 +169,7 @@ jobs:
           done < /tmp/current_casaos_peers.txt
 
           if [ -z "$LATEST_FILE" ]; then
-            echo "ℹ️ 无备份，纯净启动"
+            echo "ℹ️ 无可用备份，纯净启动"
             exit 0
           fi
 
