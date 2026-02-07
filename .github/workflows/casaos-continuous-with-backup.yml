@@ -76,6 +76,7 @@ step3_check_tailscale_online() {
 step4_make_dirs() {
     STEP="4"
     echo -e "\n===== 【步骤4/12】创建目录结构 ====="
+    # 此步骤与 step1_init_env 功能重复，可保留或删除
     mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_TMP_DIR}"
     echo "✅ 目录创建完成"
 }
@@ -103,7 +104,8 @@ step6_tailscale_ping_download() {
     ts_json=$(tailscale status --json)
 
     # 取出 HostName 匹配 casaosXX + 取第一个 Tailscale IP
-    devices=$(echo "${ts_json}" | jq -r --expr "
+    # 修复：移除了无效的 --expr 选项
+    devices=$(echo "${ts_json}" | jq -r "
         .Peer | to_entries[]
         | select(.value.HostName | test(\"${DEVICE_PATTERN}\"))
         | {name: .value.HostName, ip: .value.TailscaleIPs[0]}
@@ -248,7 +250,7 @@ main() {
     step3_check_tailscale_online
     step4_make_dirs
     step5_clean_old_tmp
-    step6_tailscale_ping_download   # 你要的核心步骤已嵌入
+    step6_tailscale_ping_download
     step7_verify_backup
     step8_stop_service
     step9_restore_files
@@ -259,4 +261,5 @@ main() {
     echo -e "\n✅ 全流程成功结束！"
 }
 
+# 执行主流程
 main
