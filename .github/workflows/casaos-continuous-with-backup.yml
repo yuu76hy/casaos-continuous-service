@@ -177,21 +177,45 @@ jobs:
           fi
           echo "✅ 找到备份：$LATEST_FILE"
 
+          # 修复：确保本地目录权限+可写性检查
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
+          sudo chmod 777 "$LOCAL_BACKUP_DIR"  # 赋予全写入权限
+          if [ ! -w "$LOCAL_BACKUP_DIR" ]; then
+            echo "❌ 本地目录 $LOCAL_BACKUP_DIR 无写入权限"
+            exit 1
+          fi
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
           echo -e "\n⬇️ 拉取备份：$LOCAL_FILE"
+
+          # 修复：SCP拉取加sudo确保写入权限
+          pull_success=0
           for ((i=1; i<=RETRY_TIMES; i++)); do
             echo "第 $i 次尝试拉取..."
-            sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-              "$SSH_USER@$TARGET_IP:$LATEST_FILE" "$LOCAL_FILE" && break
+            if sudo sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+              "$SSH_USER@$TARGET_IP:$LATEST_FILE" "$LOCAL_FILE"; then
+              pull_success=1
+              break
+            fi
             sleep 3
           done
 
+          if [ $pull_success -ne 1 ]; then
+            echo "❌ 拉取备份失败，终止流程"
+            exit 1
+          fi
+          echo "✅ 备份拉取完成"
+
+          # 修复：拉取成功后再删远程文件，加sudo确保权限
           echo -e "\n🗑️ 拉取即删：删除远程源文件"
           sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            "$SSH_USER@$TARGET_IP" "rm -f '$LATEST_FILE'" || true
+            "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST_FILE'" || echo "⚠️ 远程文件删除失败（权限不足）"
 
+          # 修复：解压前检查文件有效性
           echo -e "\n🔧 解压恢复数据"
+          if [ ! -f "$LOCAL_FILE" ] || [ ! -s "$LOCAL_FILE" ]; then
+            echo "❌ 本地备份文件无效，无法解压"
+            exit 1
+          fi
           sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
           for dir in $PERSONAL_DATA_DIRS; do
             [ -d "$dir" ] && sudo chown -R root:root "$dir"
@@ -313,10 +337,10 @@ jobs:
         run: |
           set -e
           echo "===== 13-最终清理 + 关闭Tailscale主网络 ====="
-          # 最终清理时：停止并关闭 Tailscale 主网络
+          # 关闭Tailscale主网络
           sudo systemctl stop tailscaled 2>/dev/null || true
           sudo pkill -9 "tailscaled" 2>/dev/null || true
-          # 原有清理逻辑
+          # 清理临时文件与敏感配置
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
