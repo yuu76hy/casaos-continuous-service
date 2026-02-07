@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 1
+      TARGET_RUN_MINUTES: 5
       MAX_POLL_TIMES: 60
       RETRY_TIMES: 3
 
@@ -131,34 +131,31 @@ jobs:
           echo "ℹ️ 本机 Tailscale ID: $SELF_ID"
           echo "ℹ️ 本机 Tailscale 主机名: $SELF_HOSTNAME"
 
-          echo -e "\n🔍 筛选在线 CasaOS 节点"
+          echo -e "\n🔍 仅从【在线设备】中筛选：含casaos(任意大小写) + 排除本机"
           TARGET_LIST=$(echo "$TS_STATUS_JSON" | jq -r --arg self "$SELF_ID" '
-            .Peer[] | 
-            select(
-              .Online == true and
-              .HostName != null and
-              (.HostName | tostring) | contains("CasaOS") and
-              .ID != $self
-            ) |
-            "\(.HostName)|\(.TailscaleIPs[0])"
+            .Peer[] |
+            select(.Online == true) |
+            select(.ID != $self) |
+            select( (.HostName | tostring | ascii_downcase) | contains("casaos") ) |
+            "\(.HostName // "unknown")|\(.TailscaleIPs[0] // "no-ip")|\(.Online)"
           ' || true)
 
           if [ -z "$TARGET_LIST" ]; then
-            echo "ℹ️ 未找到在线 CasaOS 节点，纯净启动"
+            echo "ℹ️ 未找到【在线且含casaos】的节点，纯净启动"
             exit 0
           fi
 
-          echo -e "\n📋 可用节点："
-          echo "$TARGET_LIST" | while IFS='|' read -r h ip; do
-            echo "  - $h | $ip"
+          echo -e "\n📋 【在线设备清单】(名称 | IP | 在线状态)："
+          echo "$TARGET_LIST" | while IFS='|' read -r h ip online; do
+            echo "  - 设备：$h ｜ IP：$ip ｜ 在线：$online"
           done
 
           TARGET_LINE=$(echo "$TARGET_LIST" | head -1)
           TARGET_HOST=$(echo "$TARGET_LINE" | cut -d'|' -f1)
           TARGET_IP=$(echo "$TARGET_LINE" | cut -d'|' -f2)
-          echo -e "\n🎯 目标节点：$TARGET_HOST ($TARGET_IP)"
+          echo -e "\n🎯 选中第一个在线节点：$TARGET_HOST | $TARGET_IP"
 
-          echo -e "\n🛑 停止相关服务"
+          echo -e "\n🛑 停止 Docker/CasaOS 服务（不影响 Tailscale）"
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 "casaos" "docker" "containerd" 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
@@ -175,7 +172,7 @@ jobs:
           done
 
           if [ -z "$LATEST_FILE" ]; then
-            echo "ℹ️ 无备份，纯净启动"
+            echo "ℹ️ 目标节点无备份，纯净启动"
             exit 0
           fi
           echo "✅ 找到备份：$LATEST_FILE"
@@ -194,7 +191,7 @@ jobs:
           sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             "$SSH_USER@$TARGET_IP" "rm -f '$LATEST_FILE'" || true
 
-          echo -e "\n🔧 解压恢复"
+          echo -e "\n🔧 解压恢复数据"
           sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
           for dir in $PERSONAL_DATA_DIRS; do
             [ -d "$dir" ] && sudo chown -R root:root "$dir"
@@ -224,20 +221,16 @@ jobs:
           sleep $((TARGET_RUN_MINUTES * 60))
           echo "✅ 稳定运行完成"
 
-      # ====================== 【这里是修复后的步骤9】 ======================
-      - name: 9-停止所有服务（安全备份，保留Tailscale组网）
+      - name: 9-停止业务服务（安全备份，保留Tailscale在线）
         run: |
           set -e
-          echo "===== 9-停止业务服务（安全备份，保留Tailscale在线） ====="
-          # 只停止会占用数据目录的服务：casaos、docker、containerd
+          echo "===== 9-停止业务服务（安全备份，保留Tailscale） ====="
           sudo systemctl stop casaos docker containerd 2>/dev/null || true
           sudo pkill -9 "casaos" "docker" "containerd" 2>/dev/null || true
-          
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || true
           sync && sleep 5
-          echo "✅ 业务服务已停止，Tailscale保持在线，可安全备份"
-      # ====================================================================
+          echo "✅ 业务服务已停止，Tailscale保持在线"
 
       - name: 10-本地全量备份
         run: |
@@ -315,14 +308,18 @@ jobs:
           fi
           echo "✅ 步骤12 完成"
 
-      - name: 13-最终清理
+      - name: 13-最终清理+关闭Tailscale主网络
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 13-最终清理 ====="
+          echo "===== 13-最终清理 + 关闭Tailscale主网络 ====="
+          # 最终清理时：停止并关闭 Tailscale 主网络
+          sudo systemctl stop tailscaled 2>/dev/null || true
+          sudo pkill -9 "tailscaled" 2>/dev/null || true
+          # 原有清理逻辑
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
-          echo "✅ 清理完成"
+          echo "✅ 已停止Tailscale主网络 & 临时文件清理完成"
           echo "🎉 全流程正常结束"
