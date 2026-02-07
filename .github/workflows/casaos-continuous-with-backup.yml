@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（Tailscale内网版 /aaa目录 拉取即删 检测删除）
+name: Casaos备份流转（Tailscale全程在线 不停服）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -18,14 +18,13 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 5
 
     steps:
-      - name: 1-系统初始化+全域深度清理
+      - name: 1-系统初始化+清理
         if: ${{ always() }}
         run: |
           set -e
-          echo "===== 1-系统初始化+全域深度清理 ====="
+          echo "===== 1-系统初始化+清理 ====="
           sudo apt update -y -qq
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
@@ -40,35 +39,34 @@ jobs:
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           sudo systemctl enable --now ssh
-          echo "✅ 系统初始化+清理完成"
+          echo "✅ 系统初始化完成"
 
-      - name: 2-官方纯净安装 Docker
+      - name: 2-安装 Docker
         run: |
           set -e
-          echo "===== 2-安装 Docker（官方源） ====="
+          echo "===== 2-安装 Docker ====="
           export DEBIAN_FRONTEND=noninteractive
           curl -fsSL https://get.docker.com | sudo bash
           sudo systemctl enable docker containerd
           sudo systemctl stop docker containerd 2>/dev/null || true
-          docker --version || true
           sudo usermod -aG docker runner
-          echo "✅ Docker 安装完成，已停止"
+          echo "✅ Docker 安装完成"
 
-      - name: 3-官方纯净安装 CasaOS
+      - name: 3-安装 CasaOS
         run: |
           set -e
           echo "===== 3-安装 CasaOS ====="
           curl -fsSL https://get.casaos.io | sudo bash
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
-          echo "✅ CasaOS 安装完成，已停止"
+          echo "✅ CasaOS 安装完成"
 
-      - name: 4-创建 roots 管理员+SSH密码登录
+      - name: 4-创建 roots 用户+SSH
         run: |
           set -e
-          echo "===== 4-配置管理员用户 ====="
+          echo "===== 4-配置管理员 SSH ====="
           if [ -z "$SSH_PASS" ]; then
-            echo "❌ 错误：ROOTS_PASSWORD 未配置"
+            echo "❌ ROOTS_PASSWORD 未配置"
             exit 1
           fi
           USER_NAME="roots"
@@ -77,17 +75,17 @@ jobs:
           echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
           sudo usermod -aG docker "$USER_NAME"
-          sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null
-          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null
+          sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo systemctl restart ssh
-          echo "✅ 管理员配置完成"
+          echo "✅ SSH 配置完成"
 
-      - name: 5-Tailscale 组网+上线+名称=casaos+两位随机数字
+      - name: 5-Tailscale 上线（名称：casaos+两位数字，全程不停止）
         run: |
           set -e
-          echo "===== 5-Tailscale组网 + 生成名称 ====="
+          echo "===== 5-Tailscale 组网上线 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Tailscale未配置"
+            echo "⚠️ Tailscale 未配置"
             exit 0
           fi
           curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
@@ -96,105 +94,80 @@ jobs:
           sudo apt install -y tailscale -qq
           sudo systemctl enable --now tailscaled && sleep 2
 
-          # 固定格式：casaos + 两位数字
+          # 固定：casaos + 两位随机数字
           RANDOM_TWO=$(printf "%02d" $((RANDOM % 100)))
           TS_HOSTNAME="casaos${RANDOM_TWO}"
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --accept-routes --accept-dns
+          sleep 5
 
-          sleep 3
-          echo -e "\n=== 🖥️ 本机信息 ==="
           LOCAL_IP=$(hostname -I | awk '{print $1}')
           TS_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
+          echo -e "\n=== 本机信息 ==="
           echo "物理IP: $LOCAL_IP"
           echo "Tailscale IP: $TS_IP"
           echo "本机名称: $TS_HOSTNAME"
-          echo "===================="
-          echo "✅ Tailscale 上线完成"
+          echo "✅ Tailscale 已启动（全程保持运行）"
 
-      - name: 6-查找在线 casaos[0-9]{2} 设备（取IP）+ 拉取备份（最终修复版）
+      - name: 6-查找在线 casaos[0-9]{2} 并拉取备份（用IP连接）
         run: |
           set -e
           echo "===== 6-查找在线设备并拉取备份 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "ℹ️ Tailscale未配置，纯净启动"
+            echo "ℹ️ Tailscale 未配置，纯净启动"
             exit 0
           fi
 
-          echo "🔄 等待Tailscale同步节点列表（12秒）..."
           sleep 12
-
-          echo "=== 调试：完整节点列表 ==="
+          echo "=== 节点列表调试 ==="
           sudo tailscale status --json
-          echo "==========================="
 
-          # 核心修复：
-          # 1. 匹配名称：^casaos[0-9]{2}$
-          # 2. 只选在线：.Online == true
-          # 3. 取出 Tailscale IPv4（不用Hostname，避免MagicDNS失效）
+          # 筛选：名称 casaos+两位数字 + 在线 + 取IPv4
           sudo tailscale status --json | jq -r '
             (.Peer // [])[] |
-            select(.Hostname | test("^casaos[0-9]{2}$"; "i") and .Online == true) |
+            select(.Hostname | test("^casaos[0-9]{2}$") and .Online == true) |
             .TailscaleIPs[0]
           ' | grep -v '^$' | sort | uniq > /tmp/casaos_online_ips.txt
 
           if [ ! -s /tmp/casaos_online_ips.txt ]; then
-            echo "ℹ️ 未找到任何在线 casaos[00-99] 设备，纯净启动"
+            echo "ℹ️ 无在线 casaos[00-99] 设备，纯净启动"
             exit 0
           fi
 
-          echo "✅ 找到在线设备IP："
+          echo "✅ 在线IP："
           cat /tmp/casaos_online_ips.txt
-
-          if [ -z "$SSH_PASS" ]; then
-            echo "❌ SSH_PASS 未配置"
-            exit 1
-          fi
 
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sync && sleep 2
 
           REMOTE_FILE=""
           TARGET_IP=""
-
           while IFS= read -r TS_IP; do
-            echo "🔗 尝试连接: $TS_IP"
-            # 用IP连接，加长超时，关闭主机检查
+            echo "🔗 尝试连接 $TS_IP"
             FILE=$(sshpass -p "$SSH_PASS" \
               ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -o ConnectTimeout=15 -o ConnectionAttempts=3 \
               "$SSH_USER@$TS_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1" || true)
-
-            if [ -n "$FILE" ] && [ "$FILE" != " " ]; then
+            if [ -n "$FILE" ]; then
               REMOTE_FILE="$FILE"
               TARGET_IP="$TS_IP"
               echo "✅ 找到备份: $FILE"
               break
-            else
-              echo "⚠️ $TS_IP 无备份/连接失败，跳过"
             fi
           done < /tmp/casaos_online_ips.txt
 
           if [ -z "$REMOTE_FILE" ]; then
-            echo "ℹ️ 所有在线设备都无备份，纯净启动"
+            echo "ℹ️ 无备份，纯净启动"
             exit 0
           fi
 
-          echo "🚀 开始从 $TARGET_IP 下载备份..."
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$REMOTE_FILE")"
 
-          sshpass -p "$SSH_PASS" \
-            scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=20 \
+          sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
             "$SSH_USER@$TARGET_IP:$REMOTE_FILE" "$LOCAL_FILE"
 
-          # 下载成功后删除远端文件
-          sshpass -p "$SSH_PASS" \
-            ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=10 \
+          sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
             "$SSH_USER@$TARGET_IP" "rm -f '$REMOTE_FILE'" || true
-
-          echo "✅ 下载完成，远端已清理"
 
           sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
           sudo chown -R root:root $PERSONAL_DATA_DIRS
@@ -206,7 +179,6 @@ jobs:
         run: |
           set -e
           echo "===== 7-启动服务 ====="
-          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
           sudo systemctl daemon-reload
           sudo systemctl enable --now docker containerd && sleep 3
           sudo systemctl enable --now casaos && sleep 5
@@ -218,19 +190,20 @@ jobs:
           sleep 300
           echo "✅ 运行完成"
 
-      - name: 9-安全停止所有服务
+      - name: 9-仅停止业务服务（⚠️ 关键：Tailscale 不停止、不杀死）
         run: |
           set -e
-          echo "===== 9-停止服务 ====="
-          sudo systemctl stop casaos docker containerd tailscaled 2>/dev/null || true
-          sudo pkill -9 casaos docker containerd tailscaled 2>/dev/null || true
-          sync && sleep 5
-          echo "✅ 已停止"
+          echo "===== 9-停止业务服务（保留 Tailscale 运行） ====="
+          # 只停 casaos docker containerd
+          sudo systemctl stop casaos docker containerd 2>/dev/null || true
+          sudo pkill -9 -x "casaos" "docker" "containerd" 2>/dev/null || true
+          sync && sleep 3
+          echo "✅ 业务服务已停止，Tailscale 保持在线"
 
-      - name: 10-生成本地全量备份
+      - name: 10-本地全量备份
         run: |
           set -e
-          echo "===== 10-生成备份 ====="
+          echo "===== 10-生成本地备份 ====="
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           for dir in $PERSONAL_DATA_DIRS; do
             sudo mkdir -p "$dir"
@@ -265,15 +238,16 @@ jobs:
           fi
           curl -s -f -X POST \
             -H "Authorization: token $USER_PAT" \
+           _PAT" \
             -H "Content-Type: application/json" \
             https://api.github.com/repos/$REPO/dispatches \
             -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
           [ $? -eq 0 ] && echo "✅ 续跑触发成功" || echo "⚠️ 续跑失败"
 
-      - name: 12-移动到 /aaa，30秒轮询直到文件被删除
+      - name: 12-移动到 /aaa，30秒轮询删除（⚠️ Tailscale 全程在线）
         run: |
           set -e
-          echo "===== 12-移动备份并等待删除 ====="
+          echo "===== 12-备份放入 /aaa，30秒检测删除（Tailscale 保持运行） ====="
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
             echo "ℹ️ 无备份，跳过"
             exit 0
@@ -284,18 +258,19 @@ jobs:
           TARGET_FILE="$LOCAL_AAA/$SNAP_NAME"
 
           sudo mv -v "$BACKUP_FILE" "$TARGET_FILE"
-          echo "🔄 已移动到 $TARGET_FILE"
+          echo "🔄 备份已移动到: $TARGET_FILE"
 
+          # 30秒轮询，期间 Tailscale 一直在线
           while true; do
             if [ ! -f "$TARGET_FILE" ]; then
-              echo "🎉 文件已删除，步骤结束"
+              echo "🎉 文件已被删除，结束等待"
               break
             fi
-            echo "→ 文件存在，30秒后重试..."
+            echo "→ 文件仍存在，30秒后重新检查（Tailscale 正常在线）"
             sleep 30
           done
 
-      - name: 13-最终清理
+      - name: 13-最终清理（流程结束，系统自动销毁）
         if: ${{ always() }}
         run: |
           set -e
@@ -303,4 +278,4 @@ jobs:
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          echo "✅ 全部完成"
+          echo "✅ 全部流程正常结束"
