@@ -82,10 +82,10 @@ jobs:
           sudo systemctl restart ssh
           echo "✅ 管理员配置完成"
 
-      - name: 5-Tailscale 组网+上线+显示本机IP地址
+      - name: 5-Tailscale 组网+上线+生成casaos+两位数字名称
         run: |
           set -e
-          echo "===== 5-Tailscale组网 + 显示本机IP ====="
+          echo "===== 5-Tailscale组网 + 生成名称 ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "⚠️ Tailscale未配置"
             exit 0
@@ -95,20 +95,23 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y tailscale -qq
           sudo systemctl enable --now tailscaled && sleep 2
-          TS_HOSTNAME="casaos-$(head -c4 /dev/urandom | xxd -p -c4)"  # 统一为小写casaos开头
+          # 生成两位随机数字
+          RANDOM_DIGITS=$(printf "%02d" $((RANDOM % 100)))
+          TS_HOSTNAME="casaos${RANDOM_DIGITS}"
           sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --accept-routes
 
-          # 显示本机IP（物理内网IP + Tailscale IP）
-          echo -e "\n=== 🖥️ 本终端IP地址信息 ==="
+          # 显示本机IP和名称
+          echo -e "\n=== 🖥️ 本终端信息 ==="
           LOCAL_IP=$(hostname -I | awk '{print $1}')
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
           echo "✅ 本机物理内网IP: $LOCAL_IP"
           echo "✅ Tailscale内网IP: $TAILSCALE_IP"
-          echo "==================================="
+          echo "✅ 本机Tailscale名称: $TS_HOSTNAME"
+          echo "====================="
           
           echo "✅ Tailscale 已上线"
 
-      - name: 6-从内网/aaa拉备份→删远程→本地恢复（按Hostname快速定位，不强制检查在线）
+      - name: 6-查找并连接名称为casaos+两位数字的在线设备
         run: |
           set -e
           echo "===== 6-拉取备份并恢复 ====="
@@ -117,7 +120,7 @@ jobs:
             exit 0
           fi
 
-          # 延长同步等待时间（10秒）
+          # 等待Tailscale同步在线机器信息
           echo "🔄 等待Tailscale同步在线机器信息（10秒）..."
           sleep 10
 
@@ -127,18 +130,18 @@ jobs:
           cat /tmp/tailscale_status.json
           echo "====================================="
 
-          # 核心修改：只按Hostname包含"casaos"筛选，不检查Online状态
+          # 核心：精确查找名称为casaos+两位数字的在线设备
           sudo tailscale status --json | jq -r '
             if .Peer and type(.Peer) == "array" then
-              .Peer[] | select(.Hostname | contains("casaos")) | .Hostname
+              .Peer[] | select(.Hostname | test("^casaos[0-9]{2}$") and .Online == true) | .Hostname
             else
               empty
             end
           ' | sort | uniq > /tmp/current_casaos_peers.txt
 
-          # 检查在线机器列表
+          # 检查是否找到在线设备
           if [ ! -s /tmp/current_casaos_peers.txt ]; then
-            echo "ℹ️ 无匹配Hostname的内网机器，纯净启动"
+            echo "ℹ️ 未找到名称为casaos+两位数字的在线内网机器，纯净启动"
             exit 0
           fi
 
@@ -155,10 +158,10 @@ jobs:
           LATEST_FILE=""
           TARGET_HOST=""
           while IFS= read -r host; do
-            # 尝试连接，连接失败则跳过
+            # 尝试连接并查找备份
             FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$SSH_USER@$host" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1")
             if [ $? -ne 0 ]; then
-              echo "⚠️ 连接 $host 失败（可能离线），跳过"
+              echo "⚠️ 连接 $host 失败，跳过"
               continue
             fi
             if [ -n "$FILE" ]; then
