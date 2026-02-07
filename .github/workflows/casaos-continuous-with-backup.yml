@@ -1,301 +1,262 @@
-name: CasaOS部署备份流转（并行探测IP·Tailscale全程在线）
-on:
-  workflow_dispatch:
-  repository_dispatch:
-    types: [renew_casaos_snapshot]  # 修复：缩进错误导致的语法问题
+#!/bin/bash
+set -euo pipefail
+trap 'echo -e "\n❌ 流程在第 ${STEP} 步异常终止！" >&2' ERR
 
-jobs:
-  casaos-deploy:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    env:
-      PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA /root/.config"
-      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
-      USER_PAT: ${{ secrets.USER_PAT }}
-      REPO: ${{ secrets.REPO }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      SSH_USER: "roots"
-      SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
-      REMOTE_BACKUP_BASE: "/aaa"
-      LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
+# ==================== 【全局配置】你只需要改这里 ====================
+export STEP="0"
 
-    steps:
-      - name: 1-系统初始化+全域深度清理
-        if: ${{ always() }}
-        run: |
-          set -e
-          echo "===== 1-系统初始化+深度清理 ====="
-          sudo apt update -y -qq
-          sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server -qq
-          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
-          sudo systemctl stop casaos 2>/dev/null || true
-          sudo systemctl disable casaos 2>/dev/null || true
-          sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
-          sudo systemctl daemon-reload
-          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
-          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
-          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
-          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          sudo systemctl enable --now ssh
-          echo "✅ 系统初始化+清理完成"
+# Tailscale 匹配规则：casaos + 两位数字
+DEVICE_PATTERN="^casaos[0-9]{2}$"
 
-      - name: 2-官方纯净安装 Docker
-        run: |
-          set -e
-          echo "===== 2-安装 Docker（官方源） ====="
-          export DEBIAN_FRONTEND=noninteractive
-          curl -fsSL https://get.docker.com | sudo bash
-          sudo systemctl enable docker containerd
-          sudo systemctl stop docker containerd 2>/dev/null || true
-          docker --version || true
-          sudo usermod -aG docker runner
-          echo "✅ Docker 安装完成，已停止"
+# 并发 ping 配置
+PING_TIMEOUT=1
+MAX_PARALLEL=10
 
-      - name: 3-安装 CasaOS（兼容旧版脚本）
-        run: |
-          set -e
-          echo "===== 3-安装 CasaOS ====="
-          sudo touch /usr/bin/casaos
-          sudo chmod +x /usr/bin/casaos
-          curl -fsSL https://get.casaos.io | sudo bash
-          sudo systemctl stop casaos 2>/dev/null || true
-          sudo systemctl disable casaos 2>/dev/null || true
-          echo "✅ CasaOS 安装完成"
+# 远程要下载的备份文件
+SSH_USER="root"
+REMOTE_BACKUP_FILE="/var/lib/casaos/backup/latest.tar.gz"
 
-      - name: 4-创建 roots 管理员+SSH密码登录
-        run: |
-          set -e
-          echo "===== 4-配置管理员用户 SSH ====="
-          if [ -z "$SSH_PASS" ]; then
-            echo "❌ 错误：ROOTS_PASSWORD 未配置"
+# 本地存放目录
+LOCAL_BASE_DIR="./casaos_recovery"
+LOCAL_BACKUP_DIR="${LOCAL_BASE_DIR}/files"
+LOCAL_TMP_DIR="${LOCAL_BASE_DIR}/tmp"
+
+# 本机恢复目标目录（根据你的实际恢复路径改）
+LOCAL_RESTORE_DIR="/var/lib/casaos"
+
+# 服务名（CasaOS 主服务，按实际修改）
+CASAOS_SERVICE="casaos"
+
+# =====================================================================
+
+# ------------------------------
+# 步骤1：初始化环境与日志
+# ------------------------------
+step1_init_env() {
+    STEP="1"
+    echo -e "\n===== 【步骤1/12】初始化环境 & 日志 ====="
+    mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_TMP_DIR}"
+    echo "工作目录：${LOCAL_BASE_DIR}"
+    echo "备份目录：${LOCAL_BACKUP_DIR}"
+    echo "临时目录：${LOCAL_TMP_DIR}"
+}
+
+# ------------------------------
+# 步骤2：检查依赖是否安装
+# ------------------------------
+step2_check_deps() {
+    STEP="2"
+    echo -e "\n===== 【步骤2/12】检查必备工具 ====="
+    local deps=("tailscale" "jq" "ping" "scp" "curl" "tar")
+    for dep in "${deps[@]}"; do
+        if ! command -v "${dep}" &> /dev/null; then
+            echo "❌ 缺少工具：${dep}，请先安装" >&2
             exit 1
-          fi
-          USER_NAME="roots"
-          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
-          echo "$USER_NAME:$SSH_PASS" | sudo chpasswd
-          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
-          sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
-          sudo usermod -aG docker "$USER_NAME"
-          sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh
-          echo "✅ SSH 配置完成"
+        fi
+    done
+    echo "✅ 所有依赖正常"
+}
 
-      - name: 5-Tailscale 组网+上线（名称：casaos+两位数字，全程不停止）
-        run: |
-          set -e
-          echo "===== 5-Tailscale 组网上线 ====="
-          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "⚠️ Tailscale 未配置"
-            exit 0
-          fi
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt update -y -qq
-          sudo apt install -y tailscale -qq
-          sudo systemctl enable --now tailscaled && sleep 2
+# ------------------------------
+# 步骤3：检查本机已接入 Tailscale
+# ------------------------------
+step3_check_tailscale_online() {
+    STEP="3"
+    echo -e "\n===== 【步骤3/12】检查 Tailscale 在线状态 ====="
+    if ! tailscale status &> /dev/null; then
+        echo "❌ Tailscale 未登录或未启动" >&2
+        exit 1
+    fi
+    echo "✅ Tailscale 已就绪"
+}
 
-          RANDOM_TWO=$(printf "%02d" $((RANDOM % 100)))
-          TS_HOSTNAME="casaos${RANDOM_TWO}"
-          sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --accept-routes --accept-dns
-          sleep 5
+# ------------------------------
+# 步骤4：创建目录结构
+# ------------------------------
+step4_make_dirs() {
+    STEP="4"
+    echo -e "\n===== 【步骤4/12】创建目录结构 ====="
+    mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_TMP_DIR}"
+    echo "✅ 目录创建完成"
+}
 
-          LOCAL_IP=$(hostname -I | awk '{print $1}')
-          TS_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
-          echo -e "\n=== 🖥️ 本机信息 ==="
-          echo "物理IP: $LOCAL_IP"
-          echo "Tailscale IP: $TS_IP"
-          echo "本机名称: $TS_HOSTNAME"
-          echo "✅ Tailscale 已启动（全程保持运行）"
+# ------------------------------
+# 步骤5：清理上一次残留文件
+# ------------------------------
+step5_clean_old_tmp() {
+    STEP="5"
+    echo -e "\n===== 【步骤5/12】清理旧临时/残留文件 ====="
+    rm -rf "${LOCAL_TMP_DIR}"/*
+    find "${LOCAL_BACKUP_DIR}" -type f -mtime +7 -delete  # 清理7天前备份（可选）
+    echo "✅ 清理完成"
+}
 
-      # ===================== 【核心：第6步 并行探测所有IP】=====================
-      - name: 6-并行探测所有 casaos[0-9]{2} 设备，统一等10秒取响应IP
-        run: |
-          set -e
-          echo "===== 6-并行探测 casaos+两位数字 设备（统一等待10秒） ====="
-          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            echo "ℹ️ Tailscale 未配置，纯净启动"
-            exit 0
-          fi
+# ------------------------------
+# 步骤6：【核心】从Tailscale取casaos列表 → 并行ping → 取通的IP → 下载备份
+# ------------------------------
+step6_tailscale_ping_download() {
+    STEP="6"
+    echo -e "\n===== 【步骤6/12】Tailscale 设备探测 + Ping + 下载备份 ====="
 
-          sleep 10
-          sudo tailscale status --json
+    # 6.1 从 tailscale 取设备并筛选 casaosXX
+    echo "📶 从 Tailscale 获取设备列表..."
+    ts_json=$(tailscale status --json)
 
-          # 提取所有 casaos+两位数字：名称 IP
-          sudo tailscale status --json | jq -r '
-            (.Peer // [])[] |
-            select(.HostName | test("^casaos[0-9]{2}$")) |
-            "\(.HostName) \(.TailscaleIPs[0])"
-          ' | grep -v '^$' | sort | uniq > /tmp/casaos_devices.txt
+    # 取出 HostName 匹配 casaosXX + 取第一个 Tailscale IP
+    devices=$(echo "${ts_json}" | jq -r --expr "
+        .Peer | to_entries[]
+        | select(.value.HostName | test(\"${DEVICE_PATTERN}\"))
+        | {name: .value.HostName, ip: .value.TailscaleIPs[0]}
+        | @base64
+    ")
 
-          if [ ! -s /tmp/casaos_devices.txt ]; then
-            echo "ℹ️ 未找到 casaos+两位数字 设备，纯净启动"
-            exit 0
-          fi
+    if [[ -z "${devices}" ]]; then
+        echo "❌ 未找到任何 casaosXX 设备" >&2
+        exit 1
+    fi
 
-          echo -e "\n=== 📋 待探测设备列表 ==="
-          cat /tmp/casaos_devices.txt | awk '{print "📌 名称: " $1 " | IP: " $2}'
+    # 6.2 并行 ping，取第一个通的IP
+    echo "🔍 并行 ping 探测中..."
+    success_ip_file="${LOCAL_TMP_DIR}/ping_success_ip.txt"
+    > "${success_ip_file}"
 
-          # 并行探测：全部后台同时发请求
-          rm -f /tmp/responded.txt /tmp/probe_*.log
-          touch /tmp/responded.txt
+    for dev_b64 in ${devices}; do
+        dev=$(echo "${dev_b64}" | base64 -d)
+        name=$(echo "${dev}" | jq -r '.name')
+        ip=$(echo "${dev}" | jq -r '.ip')
 
-          while IFS=' ' read -r name ip; do
-            (
-              # 后台探测：看/aaa下是否有备份文件
-              result=$(sshpass -p "$SSH_PASS" \
-                ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-                -o ConnectTimeout=8 -o ConnectionAttempts=1 \
-                "$SSH_USER@$ip" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.gz 2>/dev/null | head -1" 2>/dev/null)
-              if [ -n "$result" ] && [[ "$result" != /* ]]; then
-                echo "$name $ip $result" >> /tmp/responded.txt
-              fi
-            ) &
-          done < /tmp/casaos_devices.txt
-
-          # 【关键：统一等待10秒】
-          echo -e "\n⏳ 并行探测中，等待 10 秒收集所有响应..."
-          sleep 10
-
-          # 收集结果
-          if [ ! -s /tmp/responded.txt ]; then
-            echo "❌ 无任何设备响应，纯净启动"
-            exit 0
-          fi
-
-          echo -e "\n=== ✅ 有响应的设备 ==="
-          cat /tmp/responded.txt | awk '{print "✅ 名称: " $1 " | IP: " $2 " | 备份文件: " $3}'
-
-          # 取第一个响应的IP
-          TARGET_INFO=$(head -n1 /tmp/responded.txt)
-          TARGET_NAME=$(echo "$TARGET_INFO" | awk '{print $1}')
-          TARGET_IP=$(echo "$TARGET_INFO" | awk '{print $2}')
-          REMOTE_FILE=$(echo "$TARGET_INFO" | awk '{print $3}')
-
-          echo -e "\n🎉 最终选定：名称=$TARGET_NAME | IP=$TARGET_IP"
-          echo "🚀 开始下载备份..."
-
-          sudo mkdir -p "$LOCAL_BACKUP_DIR"
-          LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$REMOTE_FILE")"
-
-          sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
-            "$SSH_USER@$TARGET_IP:$REMOTE_FILE" "$LOCAL_FILE"
-
-          sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
-            "$SSH_USER@$TARGET_IP" "rm -f '$REMOTE_FILE'" || true
-
-          sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
-          sudo chown -R root:root $PERSONAL_DATA_DIRS
-          sudo chmod -R 755 /etc/casaos /DATA /root/.config
-          sudo chmod -R 700 /var/lib/casaos /var/lib/docker
-          echo "✅ 恢复完成"
-
-      - name: 7-启动 Docker & CasaOS
-        run: |
-          set -e
-          echo "===== 7-启动核心服务 ====="
-          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          sudo mkdir -p /run/docker 2>/dev/null || true
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now docker containerd && sleep 3
-          sudo systemctl enable --now casaos && sleep 4
-          echo "✅ CasaOS 正常启动"
-
-      - name: 8-稳定运行 1 分钟
-        run: |
-          set -e
-          echo "===== 8-延时 1 分钟 ====="
-          sleep 60
-          echo "✅ 已稳定运行 1 分钟"
-
-      - name: 9-仅停止业务服务（Tailscale 保持在线）
-        run: |
-          set -e
-          echo "===== 9-停止业务服务（保留 Tailscale） ====="
-          sudo systemctl stop casaos docker containerd 2>/dev/null || true
-          sudo pkill -9 -x "casaos" "docker" "containerd" 2>/dev/null || true
-          sync && sleep 3
-          echo "✅ 业务服务已停止，Tailscale 保持在线"
-
-      - name: 10-本地全量备份
-        run: |
-          set -e
-          echo "===== 10-生成本地全量备份 ====="
-          sudo mkdir -p "$LOCAL_BACKUP_DIR"
-          for dir in $PERSONAL_DATA_DIRS; do sudo mkdir -p "$dir"; done
-
-          SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.gz"
-          LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
-
-          sudo tar -cz \
-            --ignore-failed-read \
-            --exclude='*.log' --exclude='*.tmp' --exclude='*.cache' \
-            --exclude='/var/lib/docker/tmp' --exclude='/var/lib/docker/containers/*/*.log' \
-            --exclude='/DATA/tmp' --exclude='/DATA/cache' --exclude='/DATA/logs' \
-            -f "$LOCAL_FILE" $PERSONAL_DATA_DIRS
-
-          if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
-            echo "✅ 备份完成：$SNAP_NAME"
-            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
-            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
-          else
-            echo "❌ 备份失败或为空"
-            exit 1
-          fi
-
-      - name: 11-触发下一轮续跑（已修复Secret名称）
-        run: |
-          set -e
-          echo "===== 11-触发续跑 ====="
-          if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-            echo "❌ 错误：USER_PAT 或 REPO 未配置"
-            exit 0
-          fi
-          response=$(curl -s -w "\n%{http_code}" -X POST \
-            -H "Authorization: token $USER_PAT" \
-            -H "Content-Type: application/json" \
-            https://api.github.com/repos/$REPO/dispatches \
-            -d '{"event_type":"renew_casaos_snapshot"}')
-          http_code=$(echo "$response" | tail -n1)
-          if [ "$http_code" -eq 204 ]; then
-            echo "✅ 续跑触发成功 (HTTP 204)"
-          else
-            echo "⚠️ 续跑触发失败，继续执行后续步骤"
-          fi
-
-      - name: 12-移动备份到 /aaa，30秒轮询删除（Tailscale 全程在线）
-        run: |
-          set -e
-          echo "===== 12-本机 /aaa 备份 + 等待删除（Tailscale 保持运行） ====="
-          if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
-            echo "ℹ️ 无备份文件，跳过"
-            exit 0
-          fi
-
-          LOCAL_AAA="/aaa"
-          sudo mkdir -p "$LOCAL_AAA"
-          TARGET_FILE="$LOCAL_AAA/$SNAP_NAME"
-
-          sudo mv -v "$BACKUP_FILE" "$TARGET_FILE"
-          echo "🔄 已移动到 $TARGET_FILE"
-
-          while true; do
-            if [ ! -f "$TARGET_FILE" ]; then
-              echo -e "\n🎉 文件已删除，步骤结束"
-              break
+        # 后台 ping
+        (
+            if ping -c 1 -W "${PING_TIMEOUT}" "${ip}" >/dev/null 2>&1; then
+                echo "${ip}" >> "${success_ip_file}"
+                echo "✅ ${name} (${ip}) 可通"
             fi
-            echo "→ 文件存在，30秒后重试（Tailscale 正常在线）"
-            sleep 30
-          done
+        ) &
 
-      - name: 13-最终清理
-        if: ${{ always() }}
-        run: |
-          set -e
-          echo "===== 13-最终清理 ====="
-          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
-          sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          echo "✅ 全部流程正常结束"
+        # 控制并发
+        while [[ $(jobs -r | wc -l) -ge ${MAX_PARALLEL} ]]; do
+            sleep 0.1
+        done
+    done
+    wait
+
+    target_ip=$(head -n1 "${success_ip_file}")
+    if [[ -z "${target_ip}" ]]; then
+        echo "❌ 所有 casaosXX 设备均 ping 不通" >&2
+        exit 1
+    fi
+    echo -e "\n🎯 选定可用IP：${target_ip}"
+
+    # 6.3 下载备份文件
+    local_backup_path="${LOCAL_BACKUP_DIR}/casaos_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+    echo "📥 从 ${target_ip} 下载：${REMOTE_BACKUP_FILE}"
+    scp -o ConnectTimeout=15 "${SSH_USER}@${target_ip}:${REMOTE_BACKUP_FILE}" "${local_backup_path}"
+
+    if [[ ! -f "${local_backup_path}" ]]; then
+        echo "❌ 备份文件下载失败" >&2
+        exit 1
+    fi
+
+    # 把最终文件路径导出给后续步骤用
+    export RECOVERY_FILE="${local_backup_path}"
+    echo "✅ 备份下载完成：${RECOVERY_FILE}"
+}
+
+# ------------------------------
+# 步骤7：校验备份文件（存在 & 大小）
+# ------------------------------
+step7_verify_backup() {
+    STEP="7"
+    echo -e "\n===== 【步骤7/12】校验备份文件 ====="
+    if [[ ! -s "${RECOVERY_FILE}" ]]; then
+        echo "❌ 备份文件为空或不存在" >&2
+        exit 1
+    fi
+    size=$(du -h "${RECOVERY_FILE}" | cut -f1)
+    echo "✅ 备份有效，大小：${size}"
+}
+
+# ------------------------------
+# 步骤8：停止本机 CasaOS 服务
+# ------------------------------
+step8_stop_service() {
+    STEP="8"
+    echo -e "\n===== 【步骤8/12】停止 CasaOS 服务 ====="
+    if systemctl is-active --quiet "${CASAOS_SERVICE}"; then
+        systemctl stop "${CASAOS_SERVICE}"
+        echo "✅ ${CASAOS_SERVICE} 已停止"
+    else
+        echo "ℹ️ ${CASAOS_SERVICE} 已处于停止状态"
+    fi
+}
+
+# ------------------------------
+# 步骤9：恢复文件到系统目录
+# ------------------------------
+step9_restore_files() {
+    STEP="9"
+    echo -e "\n===== 【步骤9/12】解压恢复文件 ====="
+    tar -zxf "${RECOVERY_FILE}" -C "${LOCAL_RESTORE_DIR}" --overwrite
+    echo "✅ 文件恢复完成：${LOCAL_RESTORE_DIR}"
+}
+
+# ------------------------------
+# 步骤10：启动 CasaOS 服务
+# ------------------------------
+step10_start_service() {
+    STEP="10"
+    echo -e "\n===== 【步骤10/12】启动 CasaOS 服务 ====="
+    systemctl start "${CASAOS_SERVICE}"
+    sleep 3
+    echo "✅ 服务已启动"
+}
+
+# ------------------------------
+# 步骤11：验证服务 & 网络正常
+# ------------------------------
+step11_verify_running() {
+    STEP="11"
+    echo -e "\n===== 【步骤11/12】验证服务运行状态 ====="
+    if systemctl is-active --quiet "${CASAOS_SERVICE}"; then
+        echo "✅ ${CASAOS_SERVICE} 运行正常"
+    else
+        echo "❌ ${CASAOS_SERVICE} 启动失败" >&2
+        exit 1
+    fi
+
+    if tailscale ping "$(hostname)" -c 1 >/dev/null 2>&1; then
+        echo "✅ 本机 Tailscale 正常"
+    fi
+}
+
+# ------------------------------
+# 步骤12：清理临时文件 & 完成总结
+# ------------------------------
+step12_final_clean() {
+    STEP="12"
+    echo -e "\n===== 【步骤12/12】最终清理 & 流程结束 ====="
+    rm -rf "${LOCAL_TMP_DIR}"
+    echo -e "\n🎉 【全部12步执行完成】"
+    echo "备份文件：${RECOVERY_FILE}"
+    echo "恢复目录：${LOCAL_RESTORE_DIR}"
+}
+
+# ==================== 主流程：按 1～12 顺序执行 ====================
+main() {
+    step1_init_env
+    step2_check_deps
+    step3_check_tailscale_online
+    step4_make_dirs
+    step5_clean_old_tmp
+    step6_tailscale_ping_download   # 你要的核心步骤已嵌入
+    step7_verify_backup
+    step8_stop_service
+    step9_restore_files
+    step10_start_service
+    step11_verify_running
+    step12_final_clean
+
+    echo -e "\n✅ 全流程成功结束！"
+}
+
+main
