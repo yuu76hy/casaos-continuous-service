@@ -103,27 +103,18 @@ jobs:
           fi
           echo "✅ 5-Tailscale组网步骤执行完成（错误已记录日志）"
 
-      - name: 5.5-切换 Tailscale 中继为 美国（US）
+      # ===================== 正确：切换 DERP 区域 洛杉矶 LAX =====================
+      - name: 5.5-切换 Tailscale DERP 中继为 洛杉矶(lax)
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5.5-切换 Tailscale 中继为 美国 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5.5-切换 DERP 为 洛杉矶(lax) ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过切换中继"
+            echo "⚠️ Tailscale 未配置，跳过"
           else
-            # 获取所有可用exit-node列表，筛选美国节点
-            EXIT_NODE_US=$(sudo tailscale exit-node list 2>/dev/null | grep -i "USA\|United States" | head -1 | awk '{print $1}')
-            if [[ -z "${EXIT_NODE_US}" ]]; then
-              echo "⚠️ 未找到美国地区的exit-node，跳过切换"
-            else
-              echo "🔧 找到美国exit-node：${EXIT_NODE_US}"
-              sudo tailscale up --exit-node="${EXIT_NODE_US}" --accept-routes --force-reauth || {
-                echo "❌ 切换美国中继失败"
-                exit 0
-              }
-              sleep 3
-              echo "✅ 已切换至 Tailscale 美国中继"
-            fi
+            sudo tailscale up --force-derp-region=lax --accept-routes 2>/dev/null || echo "❌ 切换 lax 中继失败"
+            sleep 2
+            echo "✅ 已切换至 Tailscale DERP: lax (Los Angeles)"
           fi
-          echo "✅ 5.5-美国中继切换完成（错误已记录日志）"
+          echo "✅ 5.5-中继切换完成"
 
       - name: 6-从内网/aaa拉备份→多节点尝试→拉取即删→覆盖恢复
         run: |
@@ -216,27 +207,18 @@ jobs:
           sudo systemctl enable --now casaos && sleep 5 || echo "❌ 启动CasaOS失败"
           echo "✅ 7-核心服务启动步骤执行完成（错误已记录日志）"
 
-      - name: 7.5-切换 Tailscale 中继为 新加坡（SG）
+      # ===================== 正确：切换 DERP 区域 香港 HKG =====================
+      - name: 7.5-切换 Tailscale DERP 中继为 香港(hkg)
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7.5-切换 Tailscale 中继为 新加坡 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7.5-切换 DERP 为 香港(hkg) ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过切换中继"
+            echo "⚠️ Tailscale 未配置，跳过"
           else
-            # 获取所有可用exit-node列表，筛选新加坡节点
-            EXIT_NODE_SG=$(sudo tailscale exit-node list 2>/dev/null | grep -i "Singapore" | head -1 | awk '{print $1}')
-            if [[ -z "${EXIT_NODE_SG}" ]]; then
-              echo "⚠️ 未找到新加坡地区的exit-node，跳过切换"
-            else
-              echo "🔧 找到新加坡exit-node：${EXIT_NODE_SG}"
-              sudo tailscale up --exit-node="${EXIT_NODE_SG}" --accept-routes --force-reauth || {
-                echo "❌ 切换新加坡中继失败"
-                exit 0
-              }
-              sleep 3
-              echo "✅ 已切换至 Tailscale 新加坡中继"
-            fi
+            sudo tailscale up --force-derp-region=hkg --accept-routes 2>/dev/null || echo "❌ 切换 hkg 中继失败"
+            sleep 2
+            echo "✅ 已切换至 Tailscale DERP: hkg (Hong Kong)"
           fi
-          echo "✅ 7.5-新加坡中继切换完成（错误已记录日志）"
+          echo "✅ 7.5-中继切换完成"
 
       - name: 8-稳定运行5分钟
         run: |
@@ -294,27 +276,18 @@ jobs:
           fi
           echo "✅ 11-续跑触发步骤执行完成（错误已记录日志）"
 
-      - name: 11.5-切换 Tailscale 中继为 美国（US）
+      # ===================== 正确：切回 DERP 洛杉矶 LAX =====================
+      - name: 11.5-切换 Tailscale DERP 中继为 洛杉矶(lax)
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11.5-切换 Tailscale 中继为 美国 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11.5-切换 DERP 为 洛杉矶(lax) ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过切换中继"
+            echo "⚠️ Tailscale 未配置，跳过"
           else
-            # 获取所有可用exit-node列表，筛选美国节点
-            EXIT_NODE_US=$(sudo tailscale exit-node list 2>/dev/null | grep -i "USA\|United States" | head -1 | awk '{print $1}')
-            if [[ -z "${EXIT_NODE_US}" ]]; then
-              echo "⚠️ 未找到美国地区的exit-node，跳过切换"
-            else
-              echo "🔧 找到美国exit-node：${EXIT_NODE_US}"
-              sudo tailscale up --exit-node="${EXIT_NODE_US}" --accept-routes --force-reauth || {
-                echo "❌ 切换美国中继失败"
-                exit 0
-              }
-              sleep 3
-              echo "✅ 已切换至 Tailscale 美国中继"
-            fi
+            sudo tailscale up --force-derp-region=lax --accept-routes 2>/dev/null || echo "❌ 切换 lax 中继失败"
+            sleep 2
+            echo "✅ 已切换至 Tailscale DERP: lax (Los Angeles)"
           fi
-          echo "✅ 11.5-美国中继切换完成（错误已记录日志）"
+          echo "✅ 11.5-中继切换完成"
 
       - name: 12-移入/aaa并无限轮询检测删除
         run: |
@@ -332,7 +305,6 @@ jobs:
             sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}" || echo "❌ 备份文件移入/aaa失败"
             echo -e "\n⌛ 每1分钟检测文件是否被删除（最多${MAX_POLL_TIMES}次）"
             poll_count=0
-            echo "调试：初始poll_count=${poll_count}, MAX_POLL_TIMES=${MAX_POLL_TIMES}, TARGET_FILE=${TARGET_FILE}"
             while true; do
               if [[ ! -f "${TARGET_FILE}" ]]; then
                 echo "🎉 文件已删除，退出轮询"
@@ -340,7 +312,7 @@ jobs:
               fi
               ((poll_count++)) || true
               if [[ -z "${MAX_POLL_TIMES}" ]]; then
-                echo "⚠️ MAX_POLL_TIMES未配置，默认设为360"
+                echo "⚠️ MAX_POLL_TIMES未配置，默认设为 360"
                 MAX_POLL_TIMES=360
               fi
               if [[ ${poll_count} -ge ${MAX_POLL_TIMES} ]]; then
