@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 4-配置管理员用户 roots ====="
-          if [[ -z "${SSH_PASS}" ]]; then
+          if [[ -z "${SSH_PASS:-}" ]]; then
             echo "❌ 错误：ROOTS_PASSWORD 未配置"
             exit 1
           fi
@@ -90,7 +90,7 @@ jobs:
           sudo chmod 0440 /etc/sudoers.d/"${USER_NAME}"
           sudo usermod -aG docker "${USER_NAME}"
 
-          sudo sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          # 仅开启密码认证，不开 root 登录（更安全）
           sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo systemctl restart ssh
           echo "✅ 管理员用户 & SSH 密码登录配置完成"
@@ -99,7 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5-Tailscale组网 + 显示本机信息 ====="
-          if [[ -z "${TAILSCALE_AUTH_KEY}" ]]; then
+          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "⚠️ Tailscale 未配置，跳过组网"
             exit 0
           fi
@@ -109,7 +109,7 @@ jobs:
 
           sudo systemctl enable --now tailscaled && sleep 2
 
-          TS_SUFFIX=$((RANDOM % 1000))
+          TS_SUFFIX=$((RANDOM % 10000))
           TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
           echo "🔖 本次 Tailscale 主机名：${TS_HOSTNAME}"
 
@@ -127,11 +127,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 6-拉取备份+拉取即删+覆盖恢复 ====="
-          if [[ -z "${TAILSCALE_AUTH_KEY}" ]]; then
+          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "ℹ️ Tailscale 未配置，纯净启动"
             exit 0
           fi
-          if [[ -z "${SSH_PASS}" ]]; then
+          if [[ -z "${SSH_PASS:-}" ]]; then
             echo "❌ 错误：SSH_PASS 未配置"
             exit 1
           fi
@@ -154,9 +154,8 @@ jobs:
           fi
 
           echo -e "\n🛑 停止 Docker/CasaOS 确保无文件占用"
-          sudo systemctl stop docker containerd casaos 2>/dev/null || true
-          sudo pkill -9 "casaos" "docker" "containerd" 2>/dev/null || true
-          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
+          sudo systemctl stop casaos 2>/dev/null
+          sudo systemctl stop docker containerd 2>/dev/null
           sync && sleep 2
 
           sudo mkdir -p "${LOCAL_BACKUP_DIR}"
@@ -231,23 +230,23 @@ jobs:
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
           sudo mkdir -p /run/docker 2>/dev/null || true
           sudo systemctl daemon-reload
-          sudo systemctl enable --now docker containerd && sleep 3
-          sudo systemctl enable --now casaos && sleep 4
+          sudo systemctl enable --now docker containerd && sleep 5
+          sudo systemctl enable --now casaos && sleep 5
           echo "✅ Docker & CasaOS 启动完成"
 
       - name: 8-稳定运行60分钟
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行 ${TARGET_RUN_MINUTES} 分钟 ====="
-          sleep $((TARGET_RUN_MINUTES * 60))
+          sleep 3600
           echo "✅ 稳定运行结束"
 
       - name: 9-安全停止业务服务（保留Tailscale）
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 9-停止业务服务 ====="
-          sudo systemctl stop casaos docker containerd 2>/dev/null || true
-          sudo pkill -9 "casaos" "docker" "containerd" 2>/dev/null || true
+          sudo systemctl stop casaos 2>/dev/null
+          sudo systemctl stop docker containerd 2>/dev/null
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || true
           sync && sleep 5
@@ -266,8 +265,8 @@ jobs:
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="${LOCAL_BACKUP_DIR}/${SNAP_NAME}"
 
-          # 关键修改：--zstd=-13 指定压缩级别 13（更高压缩比）
-          sudo tar --zstd=-13 -cf "${LOCAL_FILE}" --ignore-failed-read "${DIR_ARRAY[@]}"
+          # 修复：改用管道方式指定zstd压缩级别（适配Ubuntu 24.04的GNU tar）
+          sudo tar -cf - --ignore-failed-read "${DIR_ARRAY[@]}" | sudo zstd -13 -o "${LOCAL_FILE}"
 
           if [[ -f "${LOCAL_FILE}" && -s "${LOCAL_FILE}" ]]; then
             echo "✅ 备份完成：${SNAP_NAME}"
@@ -282,11 +281,12 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11-触发下一轮续跑 ====="
-          if [[ -z "${USER_PAT}" || -z "${REPO}" ]]; then
+          if [[ -z "${USER_PAT:-}" || -z "${REPO:-}" ]]; then
             echo "⚠️ 未配置 PAT/REPO，跳过"
             exit 0
           fi
           response=$(curl -s -w "%{http_code}" -o /dev/null -X POST \
+            --connect-timeout 10 --max-time 15 \
             -H "Authorization: token ${USER_PAT}" \
             -H "Content-Type: application/json" \
             https://api.github.com/repos/${REPO}/dispatches \
@@ -294,7 +294,7 @@ jobs:
           if [[ "${response}" == "204" ]]; then
             echo "✅ 续跑触发成功"
           else
-            echo "⚠️ 续跑触发失败"
+            echo "⚠️ 续跑触发失败，HTTP code: ${response}"
           fi
 
       - name: 12-移入/aaa并无限轮询检测删除
@@ -311,7 +311,7 @@ jobs:
           TARGET_FILE="${LOCAL_AAA}/${SNAP_NAME}"
           sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}"
 
-          echo -e "\n⌛ 每1分钟检测文件是否被删除（最多360次）"
+          echo -e "\n⌛ 每1分钟检测文件是否被删除（最多${MAX_POLL_TIMES}次）"
           poll_count=0
           while true; do
             if [[ ! -f "${TARGET_FILE}" ]]; then
@@ -333,8 +333,7 @@ jobs:
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 13-最终清理 + 关闭Tailscale ====="
           sudo systemctl stop tailscaled 2>/dev/null || true
-          sudo pkill -9 "tailscaled" 2>/dev/null || true
-          sudo rm -rf "${LOCAL_BACKUP_DIR}" /tmp/* 2>/dev/null || true
+          sudo rm -rf "${LOCAL_BACKUP_DIR:-}" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
