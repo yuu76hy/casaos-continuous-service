@@ -31,10 +31,7 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq
 
-          # 先卸载所有冲突的docker/containerd/moby包（彻底清理）
-          sudo apt remove -y --purge docker* containerd* runc* moby* 2>/dev/null || true
-          # 强制删除残留的containerd文件（避免后续冲突）
-          sudo rm -f /usr/bin/containerd /usr/bin/containerd-shim* 2>/dev/null || true
+          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
 
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -54,30 +51,17 @@ jobs:
           sudo systemctl enable --now ssh
           echo "✅ 系统初始化+深度清理完成"
 
-      - name: 2-安装 Ubuntu 官方稳定版 Moby/Docker（解决containerd冲突）
+      - name: 2-官方纯净安装 Docker
         run: |
           set -euo pipefail
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装 Ubuntu 官方稳定版 Docker ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装 Docker（官方源） ====="
           export DEBIAN_FRONTEND=noninteractive
-
-          # 1. 先卸载系统自带的containerd（核心：解决文件冲突）
-          sudo apt remove -y --purge containerd 2>/dev/null || true
-          sudo apt autoremove --purge -y
-
-          # 2. 安装moby核心套件（仅安装无冲突的包，moby-engine已内置containerd）
-          sudo apt update -qq
-          sudo apt install -y --fix-broken  # 修复可能的dpkg依赖问题
-          sudo apt install -y moby-engine moby-cli moby-compose -y --allow-downgrades --allow-remove-essential
-
-          # 3. 确保docker命令可用（moby和docker-ce完全兼容）
-          sudo ln -sf /usr/bin/moby /usr/bin/docker 2>/dev/null || true
-
-          # 4. 验证安装并配置服务
+          curl -fsSL https://get.docker.com | sudo bash
           sudo systemctl enable docker containerd
           sudo systemctl stop docker containerd 2>/dev/null || true
-          docker --version  # 验证安装成功
+          docker --version
           sudo usermod -aG docker runner
-          echo "✅ Ubuntu 官方 Docker (moby-engine) 安装完成，已停止服务"
+          echo "✅ Docker 安装完成，已停止服务"
 
       - name: 3-官方纯净安装 CasaOS
         run: |
@@ -218,7 +202,7 @@ jobs:
               "${SSH_USER}@${TARGET_IP}" "sudo rm -f '${LATEST_FILE}'" || echo "⚠️ 远程删除失败，继续恢复"
 
             echo -e "\n🔧 解压恢复到根目录 / → 覆盖模式"
-            sudo tar --zstd=-13 -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions
+            sudo tar --zstd -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions
 
             echo -e "\n🔐 修复目录权限"
             for dir in ${PERSONAL_DATA_DIRS}; do
@@ -269,7 +253,7 @@ jobs:
           sync && sleep 5
           echo "✅ 业务服务已停止"
 
-      - name: 10-本地全量备份（tar.zst 压缩级别 13）
+      - name: 10-本地全量备份（仅4个目录，tar.zst 压缩级别13）
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 10-生成本地全量备份 ====="
@@ -282,7 +266,7 @@ jobs:
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="${LOCAL_BACKUP_DIR}/${SNAP_NAME}"
 
-          # 高压缩比：zstd -13
+          # 关键修改：--zstd=-13 指定压缩级别 13（更高压缩比）
           sudo tar --zstd=-13 -cf "${LOCAL_FILE}" --ignore-failed-read "${DIR_ARRAY[@]}"
 
           if [[ -f "${LOCAL_FILE}" && -s "${LOCAL_FILE}" ]]; then
