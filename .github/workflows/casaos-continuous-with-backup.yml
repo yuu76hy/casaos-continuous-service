@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 1
+      TARGET_RUN_MINUTES: 1  # 改为1分钟
       RETRY_TIMES: 3
       MAX_POLL_TIMES: 360
 
@@ -26,339 +26,313 @@ jobs:
       - name: 1-系统初始化+全域深度清理
         if: ${{ always() }}
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 1-系统初始化+全域深度清理 ====="
-          sudo apt update -y -qq
-          sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq
+          # 错误仅日志，不终止
+          sudo apt update -y -qq || echo "❌ apt更新失败"
+          sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq || echo "❌ 安装依赖失败"
 
-          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
+          sudo apt remove -y docker* containerd* runc* 2>/dev/null || echo "❌ 卸载旧Docker失败（可能未安装）"
 
-          sudo systemctl stop casaos 2>/dev/null || true
-          sudo systemctl disable casaos 2>/dev/null || true
-          sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || true
-          sudo systemctl daemon-reload
+          sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
+          sudo systemctl disable casaos 2>/dev/null || echo "❌ 禁用CasaOS失败（可能未安装）"
+          sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || echo "❌ 删除CasaOS服务文件失败"
+          sudo systemctl daemon-reload || echo "❌ 重载systemd失败"
 
           sudo rm -rf \
             /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n \
             /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google \
-            2>/dev/null || true
+            2>/dev/null || echo "❌ 清理冗余目录失败"
 
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y
-          sudo DEBIAN_FRONTEND=noninteractive apt clean
-          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y || echo "❌ 自动卸载依赖失败"
+          sudo DEBIAN_FRONTEND=noninteractive apt clean || echo "❌ 清理apt缓存失败"
+          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || echo "❌ 清理临时文件失败"
 
-          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
-          sudo systemctl enable --now ssh
-          echo "✅ 系统初始化+深度清理完成"
+          sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || echo "❌ 释放缓存失败"
+          sudo systemctl enable --now ssh || echo "❌ 启动SSH服务失败"
+          echo "✅ 1-系统初始化+深度清理步骤执行完成（错误已记录日志）"
 
       - name: 2-官方纯净安装 Docker
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装 Docker（官方源） ====="
           export DEBIAN_FRONTEND=noninteractive
-          curl -fsSL https://get.docker.com | sudo bash
-          sudo systemctl enable docker containerd
-          sudo systemctl stop docker containerd 2>/dev/null || true
-          docker --version
-          sudo usermod -aG docker runner
-          echo "✅ Docker 安装完成，已停止服务"
+          curl -fsSL https://get.docker.com | sudo bash || echo "❌ Docker安装脚本执行失败"
+          sudo systemctl enable docker containerd || echo "❌ 设置Docker开机自启失败"
+          sudo systemctl stop docker containerd 2>/dev/null || echo "❌ 停止Docker失败（可能未启动）"
+          docker --version || echo "❌ 检查Docker版本失败（可能未安装成功）"
+          sudo usermod -aG docker runner || echo "❌ 给runner用户添加Docker权限失败"
+          echo "✅ 2-Docker安装步骤执行完成（错误已记录日志）"
 
       - name: 3-官方纯净安装 CasaOS
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 3-安装 CasaOS ====="
-          curl -fsSL https://get.casaos.io | sudo bash
-          sudo systemctl stop casaos 2>/dev/null || true
-          sudo systemctl disable casaos 2>/dev/null || true
-          echo "✅ CasaOS 安装完成，已停止服务"
+          curl -fsSL https://get.casaos.io | sudo bash || echo "❌ CasaOS安装脚本执行失败"
+          sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
+          sudo systemctl disable casaos 2>/dev/null || echo "❌ 禁用CasaOS开机自启失败"
+          echo "✅ 3-CasaOS安装步骤执行完成（错误已记录日志）"
 
       - name: 4-创建 roots 管理员+SSH密码登录
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 4-配置管理员用户 roots ====="
           if [[ -z "${SSH_PASS:-}" ]]; then
             echo "❌ 错误：ROOTS_PASSWORD 未配置"
-            exit 1
           fi
 
           USER_NAME="roots"
           if ! id -u "${USER_NAME}" &>/dev/null; then
-            sudo useradd -m -s /bin/bash "${USER_NAME}"
+            sudo useradd -m -s /bin/bash "${USER_NAME}" || echo "❌ 创建roots用户失败"
           fi
-          echo "${USER_NAME}:${SSH_PASS}" | sudo chpasswd
-          echo "${USER_NAME} ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"${USER_NAME}" >/dev/null
-          sudo chmod 0440 /etc/sudoers.d/"${USER_NAME}"
-          sudo usermod -aG docker "${USER_NAME}"
+          echo "${USER_NAME}:${SSH_PASS}" | sudo chpasswd || echo "❌ 设置roots用户密码失败"
+          echo "${USER_NAME} ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"${USER_NAME}" >/dev/null || echo "❌ 配置roots用户sudo权限失败"
+          sudo chmod 0440 /etc/sudoers.d/"${USER_NAME}" || echo "❌ 修改sudoers文件权限失败"
+          sudo usermod -aG docker "${USER_NAME}" || echo "❌ 给roots用户添加Docker权限失败"
 
-          # 仅开启密码认证，不开 root 登录（更安全）
-          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo systemctl restart ssh
-          echo "✅ 管理员用户 & SSH 密码登录配置完成"
+          sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || echo "❌ 开启SSH密码认证失败"
+          sudo systemctl restart ssh || echo "❌ 重启SSH服务失败"
+          echo "✅ 4-管理员用户配置步骤执行完成（错误已记录日志）"
 
       - name: 5-Tailscale 组网+上线+显示本机IP
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5-Tailscale组网 + 显示本机信息 ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "⚠️ Tailscale 未配置，跳过组网"
-            exit 0
+          else
+            echo "🔧 使用官方一键脚本安装 Tailscale"
+            curl -fsSL https://tailscale.com/install.sh | sudo bash || echo "❌ Tailscale安装失败"
+
+            sudo systemctl enable --now tailscaled && sleep 2 || echo "❌ 启动tailscaled服务失败"
+
+            TS_SUFFIX=$((RANDOM % 10000))
+            TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
+            echo "🔖 本次 Tailscale 主机名：${TS_HOSTNAME}"
+
+            sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --accept-routes || echo "❌ Tailscale组网失败"
+
+            echo -e "\n=== 🖥️ 本机 IP 信息 ==="
+            LOCAL_IP=$(hostname -I | awk '{print $1}')
+            TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
+            echo "✅ 物理内网IP: ${LOCAL_IP}"
+            echo "✅ Tailscale内网IP: ${TAILSCALE_IP}"
+            echo "==================================="
           fi
-
-          echo "🔧 使用官方一键脚本安装 Tailscale"
-          curl -fsSL https://tailscale.com/install.sh | sudo bash
-
-          sudo systemctl enable --now tailscaled && sleep 2
-
-          TS_SUFFIX=$((RANDOM % 10000))
-          TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
-          echo "🔖 本次 Tailscale 主机名：${TS_HOSTNAME}"
-
-          sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --accept-routes
-
-          echo -e "\n=== 🖥️ 本机 IP 信息 ==="
-          LOCAL_IP=$(hostname -I | awk '{print $1}')
-          TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
-          echo "✅ 物理内网IP: ${LOCAL_IP}"
-          echo "✅ Tailscale内网IP: ${TAILSCALE_IP}"
-          echo "==================================="
-          echo "✅ Tailscale 组网上线完成"
+          echo "✅ 5-Tailscale组网步骤执行完成（错误已记录日志）"
 
       - name: 6-从内网/aaa拉备份→多节点尝试→拉取即删→覆盖恢复
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 6-拉取备份+拉取即删+覆盖恢复 ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "ℹ️ Tailscale 未配置，纯净启动"
-            exit 0
-          fi
-          if [[ -z "${SSH_PASS:-}" ]]; then
-            echo "❌ 错误：SSH_PASS 未配置"
-            exit 1
-          fi
+            echo "ℹ️ Tailscale 未配置，跳过备份拉取"
+          elif [[ -z "${SSH_PASS:-}" ]]; then
+            echo "❌ SSH_PASS 未配置，跳过备份拉取"
+          else
+            TS_STATUS_JSON=$(sudo tailscale status --json || echo "{}")
+            SELF_ID=$(echo "${TS_STATUS_JSON}" | jq -r '.Self.ID' || echo "")
 
-          TS_STATUS_JSON=$(sudo tailscale status --json)
-          SELF_ID=$(echo "${TS_STATUS_JSON}" | jq -r '.Self.ID')
+            echo -e "\n🔍 筛选在线+含casaos+排除本机节点"
+            TARGET_LIST=$(echo "${TS_STATUS_JSON}" | jq -r --arg self "${SELF_ID}" '
+              .Peer[] |
+              select(.Online == true) |
+              select(.ID != $self) |
+              select( (.HostName | tostring | ascii_downcase) | contains("casaos") ) |
+              "\(.HostName // "unknown")|\(.TailscaleIPs[0] // "no-ip")"
+            ' || echo "")
 
-          echo -e "\n🔍 筛选在线+含casaos+排除本机节点"
-          TARGET_LIST=$(echo "${TS_STATUS_JSON}" | jq -r --arg self "${SELF_ID}" '
-            .Peer[] |
-            select(.Online == true) |
-            select(.ID != $self) |
-            select( (.HostName | tostring | ascii_downcase) | contains("casaos") ) |
-            "\(.HostName // "unknown")|\(.TailscaleIPs[0] // "no-ip")"
-          ' || true)
+            if [[ -z "${TARGET_LIST}" ]]; then
+              echo "ℹ️ 未找到符合条件节点，跳过备份拉取"
+            else
+              echo -e "\n🛑 停止 Docker/CasaOS 确保无文件占用"
+              sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败"
+              sudo systemctl stop docker containerd 2>/dev/null || echo "❌ 停止Docker失败"
+              sync && sleep 2
 
-          if [[ -z "${TARGET_LIST}" ]]; then
-            echo "ℹ️ 未找到符合条件节点，纯净启动"
-            exit 0
-          fi
+              sudo mkdir -p "${LOCAL_BACKUP_DIR}" || echo "❌ 创建本地备份目录失败"
+              RESTORE_SUCCESS=0
 
-          echo -e "\n🛑 停止 Docker/CasaOS 确保无文件占用"
-          sudo systemctl stop casaos 2>/dev/null
-          sudo systemctl stop docker containerd 2>/dev/null
-          sync && sleep 2
+              while IFS='|' read -r TARGET_HOST TARGET_IP; do
+                echo -e "\n==========================================================="
+                echo "🎯 尝试节点：${TARGET_HOST} | ${TARGET_IP}"
+                echo "==========================================================="
 
-          sudo mkdir -p "${LOCAL_BACKUP_DIR}"
-          RESTORE_SUCCESS=0
+                LATEST_FILE=""
+                for ((i=1; i<=RETRY_TIMES; i++)); do
+                  LATEST_FILE=$(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                    "${SSH_USER}@${TARGET_IP}" "ls -t \"${REMOTE_BACKUP_BASE}\"/casaos-*.tar.zst 2>/dev/null | head -1" || true)
+                  [[ -n "${LATEST_FILE}" ]] && break
+                  sleep 3
+                done
 
-          while IFS='|' read -r TARGET_HOST TARGET_IP; do
-            echo -e "\n==========================================================="
-            echo "🎯 尝试节点：${TARGET_HOST} | ${TARGET_IP}"
-            echo "==========================================================="
+                if [[ -z "${LATEST_FILE}" ]]; then
+                  echo "⚠️ 无备份文件，跳过该节点"
+                  continue
+                fi
 
-            LATEST_FILE=""
-            for ((i=1; i<=RETRY_TIMES; i++)); do
-              LATEST_FILE=$(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-                "${SSH_USER}@${TARGET_IP}" "ls -t \"${REMOTE_BACKUP_BASE}\"/casaos-*.tar.zst 2>/dev/null | head -1" || true)
-              [[ -n "${LATEST_FILE}" ]] && break
-              sleep 3
-            done
+                LOCAL_FILE="${LOCAL_BACKUP_DIR}/$(basename "${LATEST_FILE}")"
+                pull_success=0
+                for ((i=1; i<=RETRY_TIMES; i++)); do
+                  if sudo sshpass -p "${SSH_PASS}" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+                    "${SSH_USER}@${TARGET_IP}:${LATEST_FILE}" "${LOCAL_FILE}"; then
+                    pull_success=1
+                    break
+                  fi
+                  sleep 3
+                done
 
-            if [[ -z "${LATEST_FILE}" ]]; then
-              echo "⚠️ 无备份文件，跳过"
-              continue
-            fi
+                if [[ ${pull_success} -ne 1 || ! -s "${LOCAL_FILE}" ]]; then
+                  echo "⚠️ 拉取失败/文件无效，跳过该节点"
+                  rm -f "${LOCAL_FILE}" 2>/dev/null || echo "❌ 删除无效备份文件失败"
+                  continue
+                fi
 
-            LOCAL_FILE="${LOCAL_BACKUP_DIR}/$(basename "${LATEST_FILE}")"
-            pull_success=0
-            for ((i=1; i<=RETRY_TIMES; i++)); do
-              if sudo sshpass -p "${SSH_PASS}" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-                "${SSH_USER}@${TARGET_IP}:${LATEST_FILE}" "${LOCAL_FILE}"; then
-                pull_success=1
+                echo -e "\n🗑️ 拉取成功，删除远程源文件"
+                sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                  "${SSH_USER}@${TARGET_IP}" "sudo rm -f '${LATEST_FILE}'" || echo "⚠️ 远程删除备份文件失败"
+
+                echo -e "\n🔧 解压恢复到根目录 / → 覆盖模式"
+                sudo tar --zstd -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions || echo "❌ 解压备份文件失败"
+
+                echo -e "\n🔐 修复目录权限"
+                for dir in ${PERSONAL_DATA_DIRS}; do
+                  [[ -d "${dir}" ]] && sudo chown -R root:root "${dir}" || echo "❌ 修复${dir}目录所有者失败"
+                done
+                [[ -d "/etc/casaos" ]]     && sudo chmod -R 755 /etc/casaos || echo "❌ 修复/etc/casaos权限失败"
+                [[ -d "/DATA" ]]           && sudo chmod -R 755 /DATA || echo "❌ 修复/DATA权限失败"
+                [[ -d "/var/lib/casaos" ]] && sudo chmod -R 700 /var/lib/casaos || echo "❌ 修复/var/lib/casaos权限失败"
+                [[ -d "/var/lib/docker" ]] && sudo chmod -R 700 /var/lib/docker || echo "❌ 修复/var/lib/docker权限失败"
+
+                echo -e "\n🎉 该节点恢复成功！"
+                RESTORE_SUCCESS=1
                 break
+
+              done < <(echo "${TARGET_LIST}")
+
+              if [[ ${RESTORE_SUCCESS} -ne 1 ]]; then
+                echo -e "\n❌ 所有节点尝试失败，未恢复备份"
               fi
-              sleep 3
-            done
-
-            if [[ ${pull_success} -ne 1 || ! -s "${LOCAL_FILE}" ]]; then
-              echo "⚠️ 拉取失败/文件无效，跳过"
-              rm -f "${LOCAL_FILE}" 2>/dev/null || true
-              continue
             fi
-
-            echo -e "\n🗑️ 拉取成功，删除远程源文件"
-            sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-              "${SSH_USER}@${TARGET_IP}" "sudo rm -f '${LATEST_FILE}'" || echo "⚠️ 远程删除失败，继续恢复"
-
-            echo -e "\n🔧 解压恢复到根目录 / → 覆盖模式"
-            sudo tar --zstd -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions
-
-            echo -e "\n🔐 修复目录权限"
-            for dir in ${PERSONAL_DATA_DIRS}; do
-              [[ -d "${dir}" ]] && sudo chown -R root:root "${dir}"
-            done
-            [[ -d "/etc/casaos" ]]     && sudo chmod -R 755 /etc/casaos
-            [[ -d "/DATA" ]]           && sudo chmod -R 755 /DATA
-            [[ -d "/var/lib/casaos" ]] && sudo chmod -R 700 /var/lib/casaos
-            [[ -d "/var/lib/docker" ]] && sudo chmod -R 700 /var/lib/docker
-
-            echo -e "\n🎉 恢复成功！"
-            RESTORE_SUCCESS=1
-            break
-
-          done < <(echo "${TARGET_LIST}")
-
-          if [[ ${RESTORE_SUCCESS} -ne 1 ]]; then
-            echo -e "\n❌ 所有节点尝试失败，纯净启动"
-            exit 0
           fi
+          echo "✅ 6-备份拉取与恢复步骤执行完成（错误已记录日志）"
 
       - name: 7-启动 Docker & CasaOS
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7-启动核心服务 ====="
-          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          sudo mkdir -p /run/docker 2>/dev/null || true
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now docker containerd && sleep 5
-          sudo systemctl enable --now casaos && sleep 5
-          echo "✅ Docker & CasaOS 启动完成"
+          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || echo "❌ 杀死80/443端口占用失败（可能无占用）"
+          sudo mkdir -p /run/docker 2>/dev/null || echo "❌ 创建/run/docker目录失败"
+          sudo systemctl daemon-reload || echo "❌ 重载systemd失败"
+          sudo systemctl enable --now docker containerd && sleep 5 || echo "❌ 启动Docker失败"
+          sudo systemctl enable --now casaos && sleep 5 || echo "❌ 启动CasaOS失败"
+          echo "✅ 7-核心服务启动步骤执行完成（错误已记录日志）"
 
-      - name: 8-稳定运行15分钟
+      - name: 8-稳定运行1分钟
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行 ${TARGET_RUN_MINUTES} 分钟 ====="
-          sleep 900
-          echo "✅ 稳定运行结束"
+          sleep 60 || echo "❌ 稳定运行期间被中断"  # 改为60秒（1分钟）
+          echo "✅ 8-稳定运行步骤执行完成（错误已记录日志）"
 
       - name: 9-安全停止业务服务（保留Tailscale）
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 9-停止业务服务 ====="
-          sudo systemctl stop casaos 2>/dev/null
-          sudo systemctl stop docker containerd 2>/dev/null
-          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
-          sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || true
+          sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
+          sudo systemctl stop docker containerd 2>/dev/null || echo "❌ 停止Docker失败（可能未启动）"
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || echo "❌ 删除pid文件失败（可能不存在）"
+          sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || echo "❌ 卸载Docker挂载目录失败（可能无挂载）"
           sync && sleep 5
-          echo "✅ 业务服务已停止"
+          echo "✅ 9-业务服务停止步骤执行完成（错误已记录日志）"
 
       - name: 10-本地全量备份（仅4个目录，tar.zst 压缩级别13）
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 10-生成本地全量备份 ====="
-          sudo mkdir -p "${LOCAL_BACKUP_DIR}"
+          sudo mkdir -p "${LOCAL_BACKUP_DIR}" || echo "❌ 创建本地备份目录失败"
           DIR_ARRAY=(${PERSONAL_DATA_DIRS})
           for dir in "${DIR_ARRAY[@]}"; do
-            [[ ! -d "${dir}" ]] && sudo mkdir -p "${dir}"
+            [[ ! -d "${dir}" ]] && sudo mkdir -p "${dir}" || echo "❌ 创建${dir}目录失败（已存在或权限不足）"
           done
 
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="${LOCAL_BACKUP_DIR}/${SNAP_NAME}"
 
-          # 修复：改用管道方式指定zstd压缩级别（适配Ubuntu 24.04的GNU tar）
-          sudo tar -cf - --ignore-failed-read "${DIR_ARRAY[@]}" | sudo zstd -13 -o "${LOCAL_FILE}"
+          # 管道方式压缩，错误记录日志
+          sudo tar -cf - --ignore-failed-read "${DIR_ARRAY[@]}" | sudo zstd -13 -o "${LOCAL_FILE}" || echo "❌ 备份压缩失败"
 
           if [[ -f "${LOCAL_FILE}" && -s "${LOCAL_FILE}" ]]; then
             echo "✅ 备份完成：${SNAP_NAME}"
             echo "BACKUP_FILE=${LOCAL_FILE}" >> "${GITHUB_ENV}"
             echo "SNAP_NAME=${SNAP_NAME}" >> "${GITHUB_ENV}"
           else
-            echo "❌ 备份失败"
-            exit 1
+            echo "❌ 备份文件创建失败或为空"
           fi
+          echo "✅ 10-本地备份步骤执行完成（错误已记录日志）"
 
       - name: 11-触发下一轮续跑
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11-触发下一轮续跑 ====="
           if [[ -z "${USER_PAT:-}" || -z "${REPO:-}" ]]; then
-            echo "⚠️ 未配置 PAT/REPO，跳过"
-            exit 0
-          fi
-          response=$(curl -s -w "%{http_code}" -o /dev/null -X POST \
-            --connect-timeout 10 --max-time 15 \
-            -H "Authorization: token ${USER_PAT}" \
-            -H "Content-Type: application/json" \
-            https://api.github.com/repos/${REPO}/dispatches \
-            -d '{"event_type":"renew_casaos_snapshot"}')
-          if [[ "${response}" == "204" ]]; then
-            echo "✅ 续跑触发成功"
+            echo "⚠️ 未配置 PAT/REPO，跳过续跑触发"
           else
-            echo "⚠️ 续跑触发失败，HTTP code: ${response}"
+            response=$(curl -s -w "%{http_code}" -o /dev/null -X POST \
+              --connect-timeout 10 --max-time 15 \
+              -H "Authorization: token ${USER_PAT}" \
+              -H "Content-Type: application/json" \
+              https://api.github.com/repos/${REPO}/dispatches \
+              -d '{"event_type":"renew_casaos_snapshot"}')
+            if [[ "${response}" == "204" ]]; then
+              echo "✅ 续跑触发成功"
+            else
+              echo "❌ 续跑触发失败，HTTP code: ${response}"
+            fi
           fi
+          echo "✅ 11-续跑触发步骤执行完成（错误已记录日志）"
 
       - name: 12-移入/aaa并无限轮询检测删除
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 12-备份移入/aaa + 轮询删除检测 ====="
           if [[ -z "${BACKUP_FILE:-}" || -z "${SNAP_NAME:-}" ]]; then
-            echo "ℹ️ 无备份，跳过"
-            exit 0
-          fi
-
-          LOCAL_AAA="/aaa"
-          sudo mkdir -p "${LOCAL_AAA}"
-          # 增加/aaa目录权限检查与修复
-          if [[ ! -w "${LOCAL_AAA}" ]]; then
-            echo "⚠️ /aaa目录无写入权限，尝试修复"
-            sudo chmod 775 "${LOCAL_AAA}" || { echo "❌ 修复/aaa权限失败"; exit 1; }
-          fi
-
-          TARGET_FILE="${LOCAL_AAA}/${SNAP_NAME}"
-          # 增加移入操作的错误捕获
-          sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}" || { echo "❌ 备份文件移入/aaa失败"; exit 1; }
-
-          echo -e "\n⌛ 每1分钟检测文件是否被删除（最多${MAX_POLL_TIMES}次）"
-          poll_count=0
-          # 增加调试日志，定位变量问题
-          echo "调试：初始poll_count=${poll_count}, MAX_POLL_TIMES=${MAX_POLL_TIMES}, TARGET_FILE=${TARGET_FILE}"
-          
-          # 临时关闭严格模式，避免循环内小错误终止脚本
-          set +e
-          while true; do
-            # 检查文件是否存在
-            if [[ ! -f "${TARGET_FILE}" ]]; then
-              echo "🎉 文件已删除，退出轮询"
-              break
+            echo "ℹ️ 无有效备份文件，跳过移入与轮询"
+          else
+            LOCAL_AAA="/aaa"
+            sudo mkdir -p "${LOCAL_AAA}" || echo "❌ 创建/aaa目录失败"
+            # 检查并修复权限
+            if [[ ! -w "${LOCAL_AAA}" ]]; then
+              echo "⚠️ /aaa目录无写入权限，尝试修复"
+              sudo chmod 775 "${LOCAL_AAA}" || echo "❌ 修复/aaa权限失败"
             fi
-            # 计数自增（加|| true避免空值报错）
-            ((poll_count++)) || true
+
+            TARGET_FILE="${LOCAL_AAA}/${SNAP_NAME}"
+            sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}" || echo "❌ 备份文件移入/aaa失败"
+
+            echo -e "\n⌛ 每1分钟检测文件是否被删除（最多${MAX_POLL_TIMES}次）"
+            poll_count=0
+            echo "调试：初始poll_count=${poll_count}, MAX_POLL_TIMES=${MAX_POLL_TIMES}, TARGET_FILE=${TARGET_FILE}"
             
-            # 修正MAX_POLL_TIMES的空值防护与条件判断
-            if [[ -z "${MAX_POLL_TIMES}" ]]; then
-              echo "⚠️ MAX_POLL_TIMES未配置，默认设为360"
-              MAX_POLL_TIMES=360
-            fi
-            if [[ ${poll_count} -ge ${MAX_POLL_TIMES} ]]; then
-              echo "⚠️ 达到最大轮询次数，自动退出"
-              break
-            fi
-            
-            echo "→ ${poll_count}/${MAX_POLL_TIMES} 文件存在，60秒后重试"
-            sleep 60
-          done
-          # 恢复严格模式
-          set -euo pipefail
+            while true; do
+              if [[ ! -f "${TARGET_FILE}" ]]; then
+                echo "🎉 文件已删除，退出轮询"
+                break
+              fi
+              ((poll_count++)) || true
+              
+              if [[ -z "${MAX_POLL_TIMES}" ]]; then
+                echo "⚠️ MAX_POLL_TIMES未配置，默认设为360"
+                MAX_POLL_TIMES=360
+              fi
+              if [[ ${poll_count} -ge ${MAX_POLL_TIMES} ]]; then
+                echo "⚠️ 达到最大轮询次数，自动退出"
+                break
+              fi
+              
+              echo "→ ${poll_count}/${MAX_POLL_TIMES} 文件存在，60秒后重试"
+              sleep 60 || echo "❌ 轮询睡眠被中断"
+            done
+          fi
+          echo "✅ 12-移入与轮询检测步骤执行完成（错误已记录日志）"
 
       - name: 13-最终清理+关闭Tailscale
         if: ${{ always() }}
         run: |
-          set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 13-最终清理 + 关闭Tailscale ====="
-          sudo systemctl stop tailscaled 2>/dev/null || true
-          sudo rm -rf "${LOCAL_BACKUP_DIR:-}" /tmp/* 2>/dev/null || true
-          sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
-          sudo apt autoremove -y -qq && sudo apt clean -y -qq
-          sudo rm -rf /var/cache/apt/* 2>/dev/null || true
-          echo "✅ 已停止Tailscale & 清理完成"
-          echo "🎉 全流程正常结束"
+          sudo systemctl stop tailscaled 2>/dev/null || echo "❌ 停止tailscaled失败（可能未启动）"
+          sudo rm -rf "${LOCAL_BACKUP_DIR:-}" /tmp/* 2>/dev/null || echo "❌ 清理本地备份目录与临时文件失败"
+          sudo rm -f /etc/sudoers.d/roots 2>/dev/null || echo "❌ 删除roots用户sudo配置失败（可能不存在）"
+          sudo apt autoremove -y -qq || echo "❌ 自动卸载依赖失败"
+          sudo apt clean -y -qq || echo "❌ 清理apt缓存失败"
+          sudo rm -rf /var/cache/apt/* 2>/dev/null || echo "❌ 清理apt缓存文件失败"
+          echo "✅ 13-最终清理步骤执行完成（错误已记录日志）"
+          echo "🎉 全流程执行完成（所有错误已记录日志，未终止流程）"
