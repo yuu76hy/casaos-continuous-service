@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 300
+      TARGET_RUN_MINUTES: 5
       RETRY_TIMES: 3
 
     steps:
@@ -83,7 +83,7 @@ jobs:
           sudo systemctl restart ssh
           echo "✅ 管理员用户 & SSH 密码登录配置完成"
 
-      - name: 5-Tailscale 组网+上线+显示本机IP地址
+      - name: 5-Tailscale 组网+上线+显示本机IP地址（官方一键安装）
         run: |
           set -e
           echo "===== 5-Tailscale组网 + 显示本机信息 ====="
@@ -91,10 +91,11 @@ jobs:
             echo "⚠️ Tailscale 未配置，跳过组网"
             exit 0
           fi
-          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
-          sudo apt update -y -qq
-          sudo apt install -y tailscale -qq
+
+          # 👇 这里改成【官方一键安装命令】
+          echo "🔧 使用官方一键脚本安装 Tailscale"
+          curl -fsSL https://tailscale.com/install.sh | sudo bash
+
           sudo systemctl enable --now tailscaled && sleep 2
 
           TS_SUFFIX=$((RANDOM % 10))
@@ -149,7 +150,6 @@ jobs:
             echo "  - 设备：$h ｜ IP：$ip ｜ 在线：$online"
           done
 
-          # 停服务（只停Docker/CasaOS，不影响Tailscale）
           echo -e "\n🛑 停止 Docker/CasaOS 服务，准备恢复"
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 "casaos" "docker" "containerd" 2>/dev/null || true
@@ -159,7 +159,6 @@ jobs:
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           sudo chmod 777 "$LOCAL_BACKUP_DIR" || true
 
-          # 多节点逐个尝试
           RESTORE_SUCCESS=0
           echo -e "\n==================== 开始逐个节点尝试 ===================="
           while IFS='|' read -r TARGET_HOST TARGET_IP TARGET_ONLINE; do
@@ -167,12 +166,11 @@ jobs:
             echo "🎯 尝试节点：$TARGET_HOST | $TARGET_IP"
             echo "==========================================================="
 
-            # 1. 尝试获取最新备份
             LATEST_FILE=""
             for ((i=1; i<=RETRY_TIMES; i++)); do
               echo "第 $i 次尝试获取备份文件..."
               LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-                "$SSH_USER@$TARGET_IP" "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.gz 2>/dev/null | head -1" || true)
+                "$SSH_USER@$TARGET_IP" "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.zst 2>/dev/null | head -1" || true)
               [ -n "$LATEST_FILE" ] && break
               sleep 3
             done
@@ -186,7 +184,6 @@ jobs:
             LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
             echo "⬇️ 准备拉取到：$LOCAL_FILE"
 
-            # 2. 尝试拉取
             pull_success=0
             for ((i=1; i<=RETRY_TIMES; i++)); do
               echo "第 $i 次尝试拉取..."
@@ -203,7 +200,6 @@ jobs:
               continue
             fi
 
-            # 3. 校验文件有效才删远程 & 恢复
             if [ ! -f "$LOCAL_FILE" ] || [ ! -s "$LOCAL_FILE" ]; then
               echo "⚠️ 拉取文件无效，跳过此节点"
               rm -f "$LOCAL_FILE" 2>/dev/null || true
@@ -214,8 +210,9 @@ jobs:
             sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
               "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST_FILE'" || echo "⚠️ 远程删除失败，继续恢复"
 
-            echo -e "\n🔧 开始解压恢复数据"
-            sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
+            echo -e "\n🔧 开始解压恢复数据（zstd 格式）"
+            sudo tar --zstd -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
+
             for dir in $PERSONAL_DATA_DIRS; do
               [ -d "$dir" ] && sudo chown -R root:root "$dir"
             done
@@ -227,7 +224,7 @@ jobs:
 
             echo -e "\n🎉 节点 $TARGET_HOST 恢复成功！"
             RESTORE_SUCCESS=1
-            break  # 成功即退出多节点循环
+            break
 
           done < <(echo "$TARGET_LIST")
 
@@ -267,26 +264,22 @@ jobs:
           sync && sleep 5
           echo "✅ 业务服务已停止，Tailscale保持在线"
 
-      - name: 10-本地全量备份
+      - name: 10-本地全量备份（.tar.zst 无排除规则）
         run: |
           set -e
-          echo "===== 10-生成本地全量备份 ====="
+          echo "===== 10-生成本地全量备份（zstd 压缩，无任何排除） ====="
           sudo mkdir -p "$LOCAL_BACKUP_DIR"
           IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
           for dir in "${DIR_ARRAY[@]}"; do
             [ ! -d "$dir" ] && { echo "⚠️ 创建 $dir"; sudo mkdir -p "$dir"; }
           done
 
-          SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.gz"
+          SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
-          sudo tar -cz \
+
+          sudo tar --zstd -cf "$LOCAL_FILE" \
             --ignore-failed-read \
-            --exclude='*.log' --exclude='*.tmp' --exclude='*.cache' \
-            --exclude='/var/lib/docker/tmp' \
-            --exclude='/var/lib/docker/containers/*/*.log' \
-            --exclude='/var/lib/docker/overlay2/*/tmp' \
-            --exclude='/DATA/tmp' --exclude='/DATA/cache' --exclude='/DATA/logs' \
-            -f "$LOCAL_FILE" "${DIR_ARRAY[@]}"
+            "${DIR_ARRAY[@]}"
 
           if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
             echo "✅ 备份完成：$SNAP_NAME"
