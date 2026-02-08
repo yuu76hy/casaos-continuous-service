@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 15  # 改为15分钟
+      TARGET_RUN_MINUTES: 1
       RETRY_TIMES: 3
       MAX_POLL_TIMES: 360
 
@@ -238,7 +238,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行 ${TARGET_RUN_MINUTES} 分钟 ====="
-          sleep 900  # 15分钟=900秒
+          sleep 900
           echo "✅ 稳定运行结束"
 
       - name: 9-安全停止业务服务（保留Tailscale）
@@ -323,12 +323,16 @@ jobs:
           # 增加调试日志，定位变量问题
           echo "调试：初始poll_count=${poll_count}, MAX_POLL_TIMES=${MAX_POLL_TIMES}, TARGET_FILE=${TARGET_FILE}"
           
+          # 临时关闭严格模式，避免循环内小错误终止脚本
+          set +e
           while true; do
+            # 检查文件是否存在
             if [[ ! -f "${TARGET_FILE}" ]]; then
               echo "🎉 文件已删除，退出轮询"
               break
             fi
-            ((poll_count++))
+            # 计数自增（加|| true避免空值报错）
+            ((poll_count++)) || true
             
             # 修正MAX_POLL_TIMES的空值防护与条件判断
             if [[ -z "${MAX_POLL_TIMES}" ]]; then
@@ -343,6 +347,8 @@ jobs:
             echo "→ ${poll_count}/${MAX_POLL_TIMES} 文件存在，60秒后重试"
             sleep 60
           done
+          # 恢复严格模式
+          set -euo pipefail
 
       - name: 13-最终清理+关闭Tailscale
         if: ${{ always() }}
