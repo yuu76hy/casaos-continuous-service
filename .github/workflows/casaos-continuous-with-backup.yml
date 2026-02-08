@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 60
+      TARGET_RUN_MINUTES: 5
       RETRY_TIMES: 3
       MAX_POLL_TIMES: 360
 
