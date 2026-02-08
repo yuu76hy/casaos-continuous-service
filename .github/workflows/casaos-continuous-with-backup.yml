@@ -18,11 +18,9 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 10
+      TARGET_RUN_MINUTES: 60
       RETRY_TIMES: 3
       MAX_POLL_TIMES: 360
-      # 👇 长期稳定版 Docker 24.0.9 (LTS 稳定，适配所有 CasaOS 插件)
-      DOCKER_VERSION: "5:24.0.9-1~ubuntu.24.04~noble"
 
     steps:
       - name: 1-系统初始化+全域深度清理
@@ -33,7 +31,8 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq
 
-          sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
+          # 卸载旧的docker/moby相关包
+          sudo apt remove -y docker* containerd* runc* moby* 2>/dev/null || true
 
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -53,41 +52,24 @@ jobs:
           sudo systemctl enable --now ssh
           echo "✅ 系统初始化+深度清理完成"
 
-      - name: 2-固定长期稳定版安装 Docker（官方源）
+      - name: 2-安装 Ubuntu 官方稳定版 Moby/Docker（替代docker-ce）
         run: |
           set -euo pipefail
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-固定长期稳定版 Docker ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装 Ubuntu 官方稳定版 Docker ====="
           export DEBIAN_FRONTEND=noninteractive
 
-          # 卸载旧版本
-          sudo apt remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
-          sudo apt autoremove --purge -y
-
-          # 安装依赖
-          sudo apt install -y ca-certificates curl gnupg lsb-release
-
-          # 添加 Docker 官方 GPG
-          sudo install -m 0755 -d /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          sudo chmod a+r /etc/apt/keyrings/docker.gpg
-
-          # 添加 Docker 官方源
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-
+          # 安装Ubuntu官方源的moby-engine（替代docker-ce，无版本缺失问题）
           sudo apt update -qq
+          sudo apt install -y moby-engine moby-cli moby-compose containerd -y
 
-          # 安装固定长期版本
-          sudo apt install -y \
-            docker-ce=${DOCKER_VERSION} \
-            docker-ce-cli=${DOCKER_VERSION} \
-            containerd.io \
-            docker-compose-plugin
+          # 确保docker命令可用（moby和docker-ce完全兼容）
+          sudo ln -sf /usr/bin/moby /usr/bin/docker 2>/dev/null || true
 
           sudo systemctl enable docker containerd
           sudo systemctl stop docker containerd 2>/dev/null || true
-          docker --version
+          docker --version  # 验证安装成功
           sudo usermod -aG docker runner
-          echo "✅ Docker 长期稳定版安装完成，已停止服务"
+          echo "✅ Ubuntu 官方 Docker (moby-engine) 安装完成，已停止服务"
 
       - name: 3-官方纯净安装 CasaOS
         run: |
