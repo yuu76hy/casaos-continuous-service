@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 5  # 已改为 5 分钟
+      TARGET_RUN_MINUTES: 5
       RETRY_TIMES: 3
       MAX_POLL_TIMES: 360
 
@@ -109,9 +109,19 @@ jobs:
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "⚠️ Tailscale 未配置，跳过切换中继"
           else
-            sudo tailscale up --exit-node=us --accept-routes --force-reauth || echo "❌ 切换美国中继失败"
-            sleep 3
-            echo "✅ 已切换至 Tailscale 美国中继"
+            # 获取所有可用exit-node列表，筛选美国节点
+            EXIT_NODE_US=$(sudo tailscale exit-node list 2>/dev/null | grep -i "USA\|United States" | head -1 | awk '{print $1}')
+            if [[ -z "${EXIT_NODE_US}" ]]; then
+              echo "⚠️ 未找到美国地区的exit-node，跳过切换"
+            else
+              echo "🔧 找到美国exit-node：${EXIT_NODE_US}"
+              sudo tailscale up --exit-node="${EXIT_NODE_US}" --accept-routes --force-reauth || {
+                echo "❌ 切换美国中继失败"
+                exit 0
+              }
+              sleep 3
+              echo "✅ 已切换至 Tailscale 美国中继"
+            fi
           fi
           echo "✅ 5.5-美国中继切换完成（错误已记录日志）"
 
@@ -212,16 +222,26 @@ jobs:
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "⚠️ Tailscale 未配置，跳过切换中继"
           else
-            sudo tailscale up --exit-node=sg --accept-routes --force-reauth || echo "❌ 切换新加坡中继失败"
-            sleep 3
-            echo "✅ 已切换至 Tailscale 新加坡中继"
+            # 获取所有可用exit-node列表，筛选新加坡节点
+            EXIT_NODE_SG=$(sudo tailscale exit-node list 2>/dev/null | grep -i "Singapore" | head -1 | awk '{print $1}')
+            if [[ -z "${EXIT_NODE_SG}" ]]; then
+              echo "⚠️ 未找到新加坡地区的exit-node，跳过切换"
+            else
+              echo "🔧 找到新加坡exit-node：${EXIT_NODE_SG}"
+              sudo tailscale up --exit-node="${EXIT_NODE_SG}" --accept-routes --force-reauth || {
+                echo "❌ 切换新加坡中继失败"
+                exit 0
+              }
+              sleep 3
+              echo "✅ 已切换至 Tailscale 新加坡中继"
+            fi
           fi
           echo "✅ 7.5-新加坡中继切换完成（错误已记录日志）"
 
       - name: 8-稳定运行5分钟
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行 ${TARGET_RUN_MINUTES} 分钟 ====="
-          sleep 300 || echo "❌ 稳定运行期间被中断"  # 已改为 300 秒（5分钟）
+          sleep 300 || echo "❌ 稳定运行期间被中断"
           echo "✅ 8-稳定运行步骤执行完成（错误已记录日志）"
 
       - name: 9-安全停止业务服务（保留Tailscale）
@@ -280,9 +300,19 @@ jobs:
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "⚠️ Tailscale 未配置，跳过切换中继"
           else
-            sudo tailscale up --exit-node=us --accept-routes --force-reauth || echo "❌ 切换美国中继失败"
-            sleep 3
-            echo "✅ 已切换至 Tailscale 美国中继"
+            # 获取所有可用exit-node列表，筛选美国节点
+            EXIT_NODE_US=$(sudo tailscale exit-node list 2>/dev/null | grep -i "USA\|United States" | head -1 | awk '{print $1}')
+            if [[ -z "${EXIT_NODE_US}" ]]; then
+              echo "⚠️ 未找到美国地区的exit-node，跳过切换"
+            else
+              echo "🔧 找到美国exit-node：${EXIT_NODE_US}"
+              sudo tailscale up --exit-node="${EXIT_NODE_US}" --accept-routes --force-reauth || {
+                echo "❌ 切换美国中继失败"
+                exit 0
+              }
+              sleep 3
+              echo "✅ 已切换至 Tailscale 美国中继"
+            fi
           fi
           echo "✅ 11.5-美国中继切换完成（错误已记录日志）"
 
