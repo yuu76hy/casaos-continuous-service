@@ -31,8 +31,10 @@ jobs:
           sudo apt update -y -qq
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq
 
-          # 卸载旧的docker/moby相关包
-          sudo apt remove -y docker* containerd* runc* moby* 2>/dev/null || true
+          # 先卸载所有冲突的docker/containerd/moby包（彻底清理）
+          sudo apt remove -y --purge docker* containerd* runc* moby* 2>/dev/null || true
+          # 强制删除残留的containerd文件（避免后续冲突）
+          sudo rm -f /usr/bin/containerd /usr/bin/containerd-shim* 2>/dev/null || true
 
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -52,19 +54,25 @@ jobs:
           sudo systemctl enable --now ssh
           echo "✅ 系统初始化+深度清理完成"
 
-      - name: 2-安装 Ubuntu 官方稳定版 Moby/Docker（替代docker-ce）
+      - name: 2-安装 Ubuntu 官方稳定版 Moby/Docker（解决containerd冲突）
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装 Ubuntu 官方稳定版 Docker ====="
           export DEBIAN_FRONTEND=noninteractive
 
-          # 安装Ubuntu官方源的moby-engine（替代docker-ce，无版本缺失问题）
-          sudo apt update -qq
-          sudo apt install -y moby-engine moby-cli moby-compose containerd -y
+          # 1. 先卸载系统自带的containerd（核心：解决文件冲突）
+          sudo apt remove -y --purge containerd 2>/dev/null || true
+          sudo apt autoremove --purge -y
 
-          # 确保docker命令可用（moby和docker-ce完全兼容）
+          # 2. 安装moby核心套件（仅安装无冲突的包，moby-engine已内置containerd）
+          sudo apt update -qq
+          sudo apt install -y --fix-broken  # 修复可能的dpkg依赖问题
+          sudo apt install -y moby-engine moby-cli moby-compose -y --allow-downgrades --allow-remove-essential
+
+          # 3. 确保docker命令可用（moby和docker-ce完全兼容）
           sudo ln -sf /usr/bin/moby /usr/bin/docker 2>/dev/null || true
 
+          # 4. 验证安装并配置服务
           sudo systemctl enable docker containerd
           sudo systemctl stop docker containerd 2>/dev/null || true
           docker --version  # 验证安装成功
