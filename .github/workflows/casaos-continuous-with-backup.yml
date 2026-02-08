@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（Tailscale内网版 /aaa目录 拉取即删 检测删除）
+name: CasaOS纯净部署（Tailscale内网版 /aaa目录 拉取即删 无限检测删除）
 on:
   workflow_dispatch:
   repository_dispatch:
@@ -18,8 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 5
-      MAX_POLL_TIMES: 60
+      TARGET_RUN_MINUTES: 1
       RETRY_TIMES: 3
 
     steps:
@@ -29,7 +28,7 @@ jobs:
           set -e
           echo "===== 1-系统初始化+全域深度清理 ====="
           sudo apt update -y -qq
-          sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server -qq
+          sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || true
           sudo systemctl stop casaos 2>/dev/null || true
           sudo systemctl disable casaos 2>/dev/null || true
@@ -112,10 +111,10 @@ jobs:
           echo "==================================="
           echo "✅ Tailscale 组网上线完成"
 
-      - name: 6-从内网/aaa拉备份→删远程→本地恢复
+      - name: 6-从内网/aaa拉备份→多节点逐个尝试→删远程→本地恢复
         run: |
           set -e
-          echo "===== 6-拉取备份并恢复（Tailscale 在线节点） ====="
+          echo "===== 6-多节点逐个尝试拉取备份（Tailscale 在线节点） ====="
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "ℹ️ Tailscale 未配置，纯净启动"
             exit 0
@@ -131,7 +130,7 @@ jobs:
           echo "ℹ️ 本机 Tailscale ID: $SELF_ID"
           echo "ℹ️ 本机 Tailscale 主机名: $SELF_HOSTNAME"
 
-          echo -e "\n🔍 仅从【在线设备】中筛选：含casaos(任意大小写) + 排除本机"
+          echo -e "\n🔍 筛选【在线+含casaos+排除本机】的所有节点"
           TARGET_LIST=$(echo "$TS_STATUS_JSON" | jq -r --arg self "$SELF_ID" '
             .Peer[] |
             select(.Online == true) |
@@ -141,91 +140,103 @@ jobs:
           ' || true)
 
           if [ -z "$TARGET_LIST" ]; then
-            echo "ℹ️ 未找到【在线且含casaos】的节点，纯净启动"
+            echo "ℹ️ 未找到符合条件节点，纯净启动"
             exit 0
           fi
 
-          echo -e "\n📋 【在线设备清单】(名称 | IP | 在线状态)："
+          echo -e "\n📋 符合条件节点清单（共 $(echo "$TARGET_LIST" | wc -l) 个）："
           echo "$TARGET_LIST" | while IFS='|' read -r h ip online; do
             echo "  - 设备：$h ｜ IP：$ip ｜ 在线：$online"
           done
 
-          TARGET_LINE=$(echo "$TARGET_LIST" | head -1)
-          TARGET_HOST=$(echo "$TARGET_LINE" | cut -d'|' -f1)
-          TARGET_IP=$(echo "$TARGET_LINE" | cut -d'|' -f2)
-          echo -e "\n🎯 选中第一个在线节点：$TARGET_HOST | $TARGET_IP"
-
-          echo -e "\n🛑 停止 Docker/CasaOS 服务（不影响 Tailscale）"
+          # 停服务（只停Docker/CasaOS，不影响Tailscale）
+          echo -e "\n🛑 停止 Docker/CasaOS 服务，准备恢复"
           sudo systemctl stop docker containerd casaos 2>/dev/null || true
           sudo pkill -9 "casaos" "docker" "containerd" 2>/dev/null || true
           sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
 
-          echo -e "\n📂 获取远程最新备份"
-          LATEST_FILE=""
-          for ((i=1; i<=RETRY_TIMES; i++)); do
-            echo "第 $i 次尝试获取备份文件..."
-            LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-              "$SSH_USER@$TARGET_IP" "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.gz 2>/dev/null | head -1")
-            [ -n "$LATEST_FILE" ] && break
-            sleep 3
-          done
+          sudo mkdir -p "$LOCAL_BACKUP_DIR"
+          sudo chmod 777 "$LOCAL_BACKUP_DIR" || true
 
-          if [ -z "$LATEST_FILE" ]; then
-            echo "ℹ️ 目标节点无备份，纯净启动"
+          # 多节点逐个尝试
+          RESTORE_SUCCESS=0
+          echo -e "\n==================== 开始逐个节点尝试 ===================="
+          while IFS='|' read -r TARGET_HOST TARGET_IP TARGET_ONLINE; do
+            echo -e "\n==========================================================="
+            echo "🎯 尝试节点：$TARGET_HOST | $TARGET_IP"
+            echo "==========================================================="
+
+            # 1. 尝试获取最新备份
+            LATEST_FILE=""
+            for ((i=1; i<=RETRY_TIMES; i++)); do
+              echo "第 $i 次尝试获取备份文件..."
+              LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                "$SSH_USER@$TARGET_IP" "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.gz 2>/dev/null | head -1" || true)
+              [ -n "$LATEST_FILE" ] && break
+              sleep 3
+            done
+
+            if [ -z "$LATEST_FILE" ]; then
+              echo "⚠️ 该节点无备份文件，跳过此节点"
+              continue
+            fi
+            echo "✅ 节点 $TARGET_HOST 找到备份：$LATEST_FILE"
+
+            LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
+            echo "⬇️ 准备拉取到：$LOCAL_FILE"
+
+            # 2. 尝试拉取
+            pull_success=0
+            for ((i=1; i<=RETRY_TIMES; i++)); do
+              echo "第 $i 次尝试拉取..."
+              if sudo sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+                "$SSH_USER@$TARGET_IP:$LATEST_FILE" "$LOCAL_FILE"; then
+                pull_success=1
+                break
+              fi
+              sleep 3
+            done
+
+            if [ $pull_success -ne 1 ]; then
+              echo "⚠️ 拉取失败，跳过此节点"
+              continue
+            fi
+
+            # 3. 校验文件有效才删远程 & 恢复
+            if [ ! -f "$LOCAL_FILE" ] || [ ! -s "$LOCAL_FILE" ]; then
+              echo "⚠️ 拉取文件无效，跳过此节点"
+              rm -f "$LOCAL_FILE" 2>/dev/null || true
+              continue
+            fi
+
+            echo -e "\n🗑️ 拉取成功，删除远程源文件（拉取即删）"
+            sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST_FILE'" || echo "⚠️ 远程删除失败，继续恢复"
+
+            echo -e "\n🔧 开始解压恢复数据"
+            sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
+            for dir in $PERSONAL_DATA_DIRS; do
+              [ -d "$dir" ] && sudo chown -R root:root "$dir"
+            done
+            [ -d "/etc/casaos" ]     && sudo chmod -R 755 /etc/casaos
+            [ -d "/DATA" ]           && sudo chmod -R 755 /DATA
+            [ -d "/root/.config" ]   && sudo chmod -R 755 /root/.config
+            [ -d "/var/lib/casaos" ] && sudo chmod -R 700 /var/lib/casaos
+            [ -d "/var/lib/docker" ] && sudo chmod -R 700 /var/lib/docker
+
+            echo -e "\n🎉 节点 $TARGET_HOST 恢复成功！"
+            RESTORE_SUCCESS=1
+            break  # 成功即退出多节点循环
+
+          done < <(echo "$TARGET_LIST")
+
+          if [ $RESTORE_SUCCESS -ne 1 ]; then
+            echo -e "\n❌ 所有节点均尝试失败，进入纯净启动"
             exit 0
           fi
-          echo "✅ 找到备份：$LATEST_FILE"
 
-          # 修复：确保本地目录权限+可写性检查
-          sudo mkdir -p "$LOCAL_BACKUP_DIR"
-          sudo chmod 777 "$LOCAL_BACKUP_DIR"  # 赋予全写入权限
-          if [ ! -w "$LOCAL_BACKUP_DIR" ]; then
-            echo "❌ 本地目录 $LOCAL_BACKUP_DIR 无写入权限"
-            exit 1
-          fi
-          LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
-          echo -e "\n⬇️ 拉取备份：$LOCAL_FILE"
-
-          # 修复：SCP拉取加sudo确保写入权限
-          pull_success=0
-          for ((i=1; i<=RETRY_TIMES; i++)); do
-            echo "第 $i 次尝试拉取..."
-            if sudo sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-              "$SSH_USER@$TARGET_IP:$LATEST_FILE" "$LOCAL_FILE"; then
-              pull_success=1
-              break
-            fi
-            sleep 3
-          done
-
-          if [ $pull_success -ne 1 ]; then
-            echo "❌ 拉取备份失败，终止流程"
-            exit 1
-          fi
-          echo "✅ 备份拉取完成"
-
-          # 修复：拉取成功后再删远程文件，加sudo确保权限
-          echo -e "\n🗑️ 拉取即删：删除远程源文件"
-          sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-            "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST_FILE'" || echo "⚠️ 远程文件删除失败（权限不足）"
-
-          # 修复：解压前检查文件有效性
-          echo -e "\n🔧 解压恢复数据"
-          if [ ! -f "$LOCAL_FILE" ] || [ ! -s "$LOCAL_FILE" ]; then
-            echo "❌ 本地备份文件无效，无法解压"
-            exit 1
-          fi
-          sudo tar -xzf "$LOCAL_FILE" -C / --overwrite --preserve-permissions
-          for dir in $PERSONAL_DATA_DIRS; do
-            [ -d "$dir" ] && sudo chown -R root:root "$dir"
-          done
-          [ -d "/etc/casaos" ]     && sudo chmod -R 755 /etc/casaos
-          [ -d "/DATA" ]           && sudo chmod -R 755 /DATA
-          [ -d "/root/.config" ]   && sudo chmod -R 755 /root/.config
-          [ -d "/var/lib/casaos" ] && sudo chmod -R 700 /var/lib/casaos
-          [ -d "/var/lib/docker" ] && sudo chmod -R 700 /var/lib/docker
-          echo "✅ 恢复与权限校正完成"
+          echo -e "\n✅ 全部恢复流程完成"
 
       - name: 7-启动 Docker & CasaOS
         run: |
@@ -301,10 +312,10 @@ jobs:
             -d '{"event_type":"renew_casaos_snapshot"}' >/dev/null 2>&1
           [ $? -eq 0 ] && echo "✅ 续跑触发成功" || echo "⚠️ 续跑触发失败"
 
-      - name: 12-移入/aaa并轮询删除
+      - name: 12-移入/aaa并无限轮询检测删除（1分钟/次，无上限）
         run: |
           set -e
-          echo "===== 12-备份移入 /aaa + 等待删除 ====="
+          echo "===== 12-备份移入 /aaa + 无限轮询检测删除（1分钟/次） ====="
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
             echo "ℹ️ 无备份，跳过"
             exit 0
@@ -315,21 +326,16 @@ jobs:
           TARGET_FILE="$LOCAL_AAA/$SNAP_NAME"
           sudo mv -v "$BACKUP_FILE" "$TARGET_FILE"
 
-          echo -e "\n⌛ 每30秒检查是否被删除（最多 $MAX_POLL_TIMES 次）"
-          poll_count=0
-          while [ $poll_count -lt $MAX_POLL_TIMES ]; do
+          echo -e "\n⌛ 无限轮询：每 1 分钟检查一次文件是否被删除"
+          while true; do
             if [ ! -f "$TARGET_FILE" ]; then
-              echo "🎉 文件已删除"
+              echo "🎉 文件已删除，退出轮询"
               break
             fi
-            poll_count=$((poll_count + 1))
-            echo "→ 第 $poll_count/$MAX_POLL_TIMES 次，等待30秒..."
-            sleep 30
+            echo "→ 文件仍存在，等待 60 秒后再次检查..."
+            sleep 60
           done
 
-          if [ $poll_count -ge $MAX_POLL_TIMES ]; then
-            echo "⚠️ 达到最大轮询次数，自动退出"
-          fi
           echo "✅ 步骤12 完成"
 
       - name: 13-最终清理+关闭Tailscale主网络
@@ -337,10 +343,8 @@ jobs:
         run: |
           set -e
           echo "===== 13-最终清理 + 关闭Tailscale主网络 ====="
-          # 关闭Tailscale主网络
           sudo systemctl stop tailscaled 2>/dev/null || true
           sudo pkill -9 "tailscaled" 2>/dev/null || true
-          # 清理临时文件与敏感配置
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/roots 2>/dev/null || true
           sudo apt autoremove -y -qq && sudo apt clean -y -qq
