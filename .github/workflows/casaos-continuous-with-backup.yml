@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 5
+      TARGET_RUN_MINUTES: 15  # 改为15分钟
       RETRY_TIMES: 3
       MAX_POLL_TIMES: 360
 
@@ -234,11 +234,11 @@ jobs:
           sudo systemctl enable --now casaos && sleep 5
           echo "✅ Docker & CasaOS 启动完成"
 
-      - name: 8-稳定运行60分钟
+      - name: 8-稳定运行15分钟
         run: |
           set -euo pipefail
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行 ${TARGET_RUN_MINUTES} 分钟 ====="
-          sleep 3600
+          sleep 900  # 15分钟=900秒
           echo "✅ 稳定运行结束"
 
       - name: 9-安全停止业务服务（保留Tailscale）
@@ -308,21 +308,38 @@ jobs:
 
           LOCAL_AAA="/aaa"
           sudo mkdir -p "${LOCAL_AAA}"
+          # 增加/aaa目录权限检查与修复
+          if [[ ! -w "${LOCAL_AAA}" ]]; then
+            echo "⚠️ /aaa目录无写入权限，尝试修复"
+            sudo chmod 775 "${LOCAL_AAA}" || { echo "❌ 修复/aaa权限失败"; exit 1; }
+          fi
+
           TARGET_FILE="${LOCAL_AAA}/${SNAP_NAME}"
-          sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}"
+          # 增加移入操作的错误捕获
+          sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}" || { echo "❌ 备份文件移入/aaa失败"; exit 1; }
 
           echo -e "\n⌛ 每1分钟检测文件是否被删除（最多${MAX_POLL_TIMES}次）"
           poll_count=0
+          # 增加调试日志，定位变量问题
+          echo "调试：初始poll_count=${poll_count}, MAX_POLL_TIMES=${MAX_POLL_TIMES}, TARGET_FILE=${TARGET_FILE}"
+          
           while true; do
             if [[ ! -f "${TARGET_FILE}" ]]; then
               echo "🎉 文件已删除，退出轮询"
               break
             fi
             ((poll_count++))
+            
+            # 修正MAX_POLL_TIMES的空值防护与条件判断
+            if [[ -z "${MAX_POLL_TIMES}" ]]; then
+              echo "⚠️ MAX_POLL_TIMES未配置，默认设为360"
+              MAX_POLL_TIMES=360
+            fi
             if [[ ${poll_count} -ge ${MAX_POLL_TIMES} ]]; then
               echo "⚠️ 达到最大轮询次数，自动退出"
               break
             fi
+            
             echo "→ ${poll_count}/${MAX_POLL_TIMES} 文件存在，60秒后重试"
             sleep 60
           done
