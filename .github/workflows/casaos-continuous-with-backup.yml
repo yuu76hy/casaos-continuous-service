@@ -1,39 +1,49 @@
 name: CasaOS纯净部署（Tailscale内网版 /aaa目录 拉取即删 无限检测删除）
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 手动触发
   repository_dispatch:
-    types: [renew_casaos_snapshot]
+    types: [renew_casaos_snapshot]  # 续跑触发
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 360  # 任务超时6小时
     env:
+      # 核心备份目录
       PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
+      # 敏感信息（需在仓库Secrets中配置）
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
       REPO: ${{ secrets.REPO }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       SSH_USER: "roots"
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
+      # 备份路径配置
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 5
-      RETRY_TIMES: 3
-      MAX_POLL_TIMES: 360
+      # 运行参数
+      TARGET_RUN_MINUTES: 5  # 服务稳定运行5分钟
+      RETRY_TIMES: 3  # 关键操作重试次数
+      MAX_POLL_TIMES: 360  # 备份文件轮询检测最大次数（6小时）
 
     steps:
+      # 步骤1：系统初始化+全域深度清理
       - name: 1-系统初始化+全域深度清理
         if: ${{ always() }}
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 1-系统初始化+全域深度清理 ====="
+          # 安装基础依赖
           sudo apt update -y -qq || echo "❌ apt更新失败"
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq || echo "❌ 安装依赖失败"
+          
+          # 清理旧服务
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || echo "❌ 卸载旧Docker失败（可能未安装）"
           sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
           sudo systemctl disable casaos 2>/dev/null || echo "❌ 禁用CasaOS失败（可能未安装）"
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || echo "❌ 删除CasaOS服务文件失败"
           sudo systemctl daemon-reload || echo "❌ 重载systemd失败"
+          
+          # 清理冗余目录&缓存
           sudo rm -rf \
             /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n \
             /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google \
@@ -41,112 +51,146 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y || echo "❌ 自动卸载依赖失败"
           sudo DEBIAN_FRONTEND=noninteractive apt clean || echo "❌ 清理apt缓存失败"
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || echo "❌ 清理临时文件失败"
+          
+          # 释放系统资源
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || echo "❌ 释放缓存失败"
           sudo systemctl enable --now ssh || echo "❌ 启动SSH服务失败"
-          echo "✅ 1-系统初始化+深度清理步骤执行完成（错误已记录日志）"
+          echo "✅ 1-系统初始化+深度清理完成"
 
-      - name: 2-官方纯净安装 Docker
+      # 步骤2：安装官方纯净Docker
+      - name: 2-安装Docker（官方源）
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装 Docker（官方源） ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 2-安装Docker ====="
           export DEBIAN_FRONTEND=noninteractive
           curl -fsSL https://get.docker.com | sudo bash || echo "❌ Docker安装脚本执行失败"
           sudo systemctl enable docker containerd || echo "❌ 设置Docker开机自启失败"
           sudo systemctl stop docker containerd 2>/dev/null || echo "❌ 停止Docker失败（可能未启动）"
-          docker --version || echo "❌ 检查Docker版本失败（可能未安装成功）"
+          docker --version || echo "❌ 检查Docker版本失败"
           sudo usermod -aG docker runner || echo "❌ 给runner用户添加Docker权限失败"
-          echo "✅ 2-Docker安装步骤执行完成（错误已记录日志）"
+          echo "✅ 2-Docker安装完成"
 
-      - name: 3-官方纯净安装 CasaOS
+      # 步骤3：安装官方纯净CasaOS
+      - name: 3-安装CasaOS
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 3-安装 CasaOS ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 3-安装CasaOS ====="
           curl -fsSL https://get.casaos.io | sudo bash || echo "❌ CasaOS安装脚本执行失败"
           sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
           sudo systemctl disable casaos 2>/dev/null || echo "❌ 禁用CasaOS开机自启失败"
-          echo "✅ 3-CasaOS安装步骤执行完成（错误已记录日志）"
+          echo "✅ 3-CasaOS安装完成"
 
-      - name: 4-创建 roots 管理员+SSH密码登录
+      # 步骤4：配置roots管理员用户+SSH密码登录
+      - name: 4-配置roots管理员用户
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 4-配置管理员用户 roots ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 4-配置roots管理员 ====="
           if [[ -z "${SSH_PASS:-}" ]]; then
-            echo "❌ 错误：ROOTS_PASSWORD 未配置"
+            echo "❌ 错误：ROOTS_PASSWORD未配置"
           fi
+          
           USER_NAME="roots"
+          # 创建用户（不存在时）
           if ! id -u "${USER_NAME}" &>/dev/null; then
             sudo useradd -m -s /bin/bash "${USER_NAME}" || echo "❌ 创建roots用户失败"
           fi
+          # 设置密码
           echo "${USER_NAME}:${SSH_PASS}" | sudo chpasswd || echo "❌ 设置roots用户密码失败"
-          echo "${USER_NAME} ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"${USER_NAME}" >/dev/null || echo "❌ 配置roots用户sudo权限失败"
+          # 配置sudo免密
+          echo "${USER_NAME} ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"${USER_NAME}" >/dev/null || echo "❌ 配置roots sudo权限失败"
           sudo chmod 0440 /etc/sudoers.d/"${USER_NAME}" || echo "❌ 修改sudoers文件权限失败"
+          # 添加Docker权限
           sudo usermod -aG docker "${USER_NAME}" || echo "❌ 给roots用户添加Docker权限失败"
+          
+          # 开启SSH密码登录
           sudo sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || echo "❌ 开启SSH密码认证失败"
           sudo systemctl restart ssh || echo "❌ 重启SSH服务失败"
-          echo "✅ 4-管理员用户配置步骤执行完成（错误已记录日志）"
+          echo "✅ 4-roots管理员配置完成"
 
-      - name: 5-Tailscale 组网+上线+显示本机IP
+      # 步骤5：Tailscale组网+显示IP
+      - name: 5-Tailscale组网+显示本机IP
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5-Tailscale组网 + 显示本机信息 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5-Tailscale组网 ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过组网"
+            echo "⚠️ Tailscale未配置，跳过组网"
           else
+            # 安装Tailscale
             curl -fsSL https://tailscale.com/install.sh | sudo bash || echo "❌ Tailscale安装失败"
             sudo systemctl enable --now tailscaled && sleep 2 || echo "❌ 启动tailscaled服务失败"
+            
+            # 组网（随机主机名避免冲突）
             TS_SUFFIX=$((RANDOM % 10000))
             TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
-            echo "🔖 本次 Tailscale 主机名：${TS_HOSTNAME}"
+            echo "🔖 本次Tailscale主机名：${TS_HOSTNAME}"
             sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --accept-routes || echo "❌ Tailscale组网失败"
-            echo -e "\n=== 🖥️ 本机 IP 信息 ==="
+            
+            # 显示IP信息
+            echo -e "\n=== 🖥️ 本机IP信息 ==="
             LOCAL_IP=$(hostname -I | awk '{print $1}')
             TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
             echo "✅ 物理内网IP: ${LOCAL_IP}"
             echo "✅ Tailscale内网IP: ${TAILSCALE_IP}"
             echo "==================================="
           fi
-          echo "✅ 5-Tailscale组网步骤执行完成（错误已记录日志）"
+          echo "✅ 5-Tailscale组网完成"
 
-      # ===================== 正确：切换 DERP 区域 洛杉矶 LAX =====================
-      - name: 5.5-切换 Tailscale DERP 中继为 洛杉矶(lax)
+      # 步骤5.5：切换DERP中继为洛杉矶（lax）+状态校验
+      - name: 5.5-切换DERP中继为洛杉矶(lax)
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5.5-切换 DERP 为 洛杉矶(lax) ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5.5-切换DERP为洛杉矶(lax) ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过"
+            echo "⚠️ Tailscale未配置，跳过"
           else
-            sudo tailscale up --force-derp-region=lax --accept-routes 2>/dev/null || echo "❌ 切换 lax 中继失败"
+            # 执行切换命令
+            sudo tailscale up --force-derp-region=lax --accept-routes
             sleep 2
-            echo "✅ 已切换至 Tailscale DERP: lax (Los Angeles)"
+            
+            # 校验实际DERP区域
+            CURRENT_REGION=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DERPRegion')
+            if [[ "${CURRENT_REGION}" == "lax" ]]; then
+              echo "✅ 已切换至Tailscale DERP: lax (Los Angeles)"
+            else
+              echo "❌ 切换lax中继失败，当前区域：${CURRENT_REGION}"
+            fi
           fi
-          echo "✅ 5.5-中继切换完成"
+          echo "✅ 5.5-中继切换步骤完成"
 
-      - name: 6-从内网/aaa拉备份→多节点尝试→拉取即删→覆盖恢复
+      # 步骤6：从内网/aaa拉取备份（拉取即删）+恢复
+      - name: 6-拉取备份+拉取即删+覆盖恢复
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 6-拉取备份+拉取即删+覆盖恢复 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 6-拉取备份+恢复 ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "ℹ️ Tailscale 未配置，跳过备份拉取"
+            echo "ℹ️ Tailscale未配置，跳过备份拉取"
           elif [[ -z "${SSH_PASS:-}" ]]; then
-            echo "❌ SSH_PASS 未配置，跳过备份拉取"
+            echo "❌ SSH_PASS未配置，跳过备份拉取"
           else
-            TS_STATUS_JSON=$(sudo tailscale status --json || echo "{}")
-            SELF_ID=$(echo "${TS_STATUS_JSON}" | jq -r '.Self.ID' || echo "")
-            echo -e "\n🔍 筛选在线+含casaos+排除本机节点"
+            # 获取Tailscale节点列表（在线、含casaos、排除本机）
+            TS_STATUS_JSON=$(sudo tailscale status --json 2>/dev/null || echo "{}")
+            SELF_ID=$(echo "${TS_STATUS_JSON}" | jq -r '.Self.ID' 2>/dev/null || echo "")
             TARGET_LIST=$(echo "${TS_STATUS_JSON}" | jq -r --arg self "${SELF_ID}" '
               .Peer[] |
               select(.Online == true) |
               select(.ID != $self) |
               select( (.HostName | tostring | ascii_downcase) | contains("casaos") ) |
               "\(.HostName // "unknown")|\(.TailscaleIPs[0] // "no-ip")"
-            ' || echo "")
+            ' 2>/dev/null || echo "")
+            
             if [[ -z "${TARGET_LIST}" ]]; then
-              echo "ℹ️ 未找到符合条件节点，跳过备份拉取"
+              echo "ℹ️ 未找到符合条件的节点，跳过备份拉取"
             else
-              echo -e "\n🛑 停止 Docker/CasaOS 确保无文件占用"
+              # 停止服务避免文件占用
               sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败"
               sudo systemctl stop docker containerd 2>/dev/null || echo "❌ 停止Docker失败"
               sync && sleep 2
+              
+              # 创建本地备份目录
               sudo mkdir -p "${LOCAL_BACKUP_DIR}" || echo "❌ 创建本地备份目录失败"
               RESTORE_SUCCESS=0
+              
+              # 遍历目标节点尝试拉取
               while IFS='|' read -r TARGET_HOST TARGET_IP; do
                 echo -e "\n==========================================================="
                 echo "🎯 尝试节点：${TARGET_HOST} | ${TARGET_IP}"
                 echo "==========================================================="
+                
+                # 重试拉取最新备份文件
                 LATEST_FILE=""
                 for ((i=1; i<=RETRY_TIMES; i++)); do
                   LATEST_FILE=$(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
@@ -154,10 +198,13 @@ jobs:
                   [[ -n "${LATEST_FILE}" ]] && break
                   sleep 3
                 done
+                
                 if [[ -z "${LATEST_FILE}" ]]; then
-                  echo "⚠️ 无备份文件，跳过该节点"
+                  echo "⚠️ 该节点无备份文件，跳过"
                   continue
                 fi
+                
+                # 拉取备份文件
                 LOCAL_FILE="${LOCAL_BACKUP_DIR}/$(basename "${LATEST_FILE}")"
                 pull_success=0
                 for ((i=1; i<=RETRY_TIMES; i++)); do
@@ -168,85 +215,109 @@ jobs:
                   fi
                   sleep 3
                 done
+                
                 if [[ ${pull_success} -ne 1 || ! -s "${LOCAL_FILE}" ]]; then
                   echo "⚠️ 拉取失败/文件无效，跳过该节点"
-                  rm -f "${LOCAL_FILE}" 2>/dev/null || echo "❌ 删除无效备份文件失败"
+                  rm -f "${LOCAL_FILE}" 2>/dev/null || echo "❌ 删除无效文件失败"
                   continue
                 fi
+                
+                # 拉取成功后删除远程源文件（拉取即删）
                 echo -e "\n🗑️ 拉取成功，删除远程源文件"
                 sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
                   "${SSH_USER}@${TARGET_IP}" "sudo rm -f '${LATEST_FILE}'" || echo "⚠️ 远程删除备份文件失败"
-                echo -e "\n🔧 解压恢复到根目录 / → 覆盖模式"
-                sudo tar --zstd -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions || echo "❌ 解压备份文件失败"
+                
+                # 解压恢复（覆盖模式）
+                echo -e "\n🔧 解压恢复到根目录"
+                sudo tar --zstd -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions || echo "❌ 解压备份失败"
+                
+                # 修复目录权限
                 echo -e "\n🔐 修复目录权限"
                 for dir in ${PERSONAL_DATA_DIRS}; do
-                  [[ -d "${dir}" ]] && sudo chown -R root:root "${dir}" || echo "❌ 修复${dir}目录所有者失败"
+                  [[ -d "${dir}" ]] && sudo chown -R root:root "${dir}" || echo "❌ 修复${dir}所有者失败"
                 done
                 [[ -d "/etc/casaos" ]]     && sudo chmod -R 755 /etc/casaos || echo "❌ 修复/etc/casaos权限失败"
                 [[ -d "/DATA" ]]           && sudo chmod -R 755 /DATA || echo "❌ 修复/DATA权限失败"
                 [[ -d "/var/lib/casaos" ]] && sudo chmod -R 700 /var/lib/casaos || echo "❌ 修复/var/lib/casaos权限失败"
                 [[ -d "/var/lib/docker" ]] && sudo chmod -R 700 /var/lib/docker || echo "❌ 修复/var/lib/docker权限失败"
+                
                 echo -e "\n🎉 该节点恢复成功！"
                 RESTORE_SUCCESS=1
                 break
               done < <(echo "${TARGET_LIST}")
+              
               if [[ ${RESTORE_SUCCESS} -ne 1 ]]; then
                 echo -e "\n❌ 所有节点尝试失败，未恢复备份"
               fi
             fi
           fi
-          echo "✅ 6-备份拉取与恢复步骤执行完成（错误已记录日志）"
+          echo "✅ 6-备份拉取与恢复完成"
 
-      - name: 7-启动 Docker & CasaOS
+      # 步骤7：启动Docker & CasaOS
+      - name: 7-启动核心服务
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7-启动核心服务 ====="
-          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || echo "❌ 杀死80/443端口占用失败（可能无占用）"
+          # 查杀端口占用
+          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || echo "❌ 查杀80/443端口占用失败（可能无占用）"
+          # 启动服务
           sudo mkdir -p /run/docker 2>/dev/null || echo "❌ 创建/run/docker目录失败"
           sudo systemctl daemon-reload || echo "❌ 重载systemd失败"
           sudo systemctl enable --now docker containerd && sleep 5 || echo "❌ 启动Docker失败"
           sudo systemctl enable --now casaos && sleep 5 || echo "❌ 启动CasaOS失败"
-          echo "✅ 7-核心服务启动步骤执行完成（错误已记录日志）"
+          echo "✅ 7-核心服务启动完成"
 
-      # ===================== 正确：切换 DERP 区域 香港 HKG =====================
-      - name: 7.5-切换 Tailscale DERP 中继为 香港(hkg)
+      # 步骤7.5：切换DERP中继为香港（hkg）+状态校验
+      - name: 7.5-切换DERP中继为香港(hkg)
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7.5-切换 DERP 为 香港(hkg) ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7.5-切换DERP为香港(hkg) ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过"
+            echo "⚠️ Tailscale未配置，跳过"
           else
-            sudo tailscale up --force-derp-region=hkg --accept-routes 2>/dev/null || echo "❌ 切换 hkg 中继失败"
+            # 执行切换命令
+            sudo tailscale up --force-derp-region=hkg --accept-routes
             sleep 2
-            echo "✅ 已切换至 Tailscale DERP: hkg (Hong Kong)"
+            
+            # 校验实际DERP区域
+            CURRENT_REGION=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DERPRegion')
+            if [[ "${CURRENT_REGION}" == "hkg" ]]; then
+              echo "✅ 已切换至Tailscale DERP: hkg (Hong Kong)"
+            else
+              echo "❌ 切换hkg中继失败，当前区域：${CURRENT_REGION}"
+            fi
           fi
-          echo "✅ 7.5-中继切换完成"
+          echo "✅ 7.5-中继切换步骤完成"
 
+      # 步骤8：稳定运行5分钟
       - name: 8-稳定运行5分钟
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行 ${TARGET_RUN_MINUTES} 分钟 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行5分钟 ====="
           sleep 300 || echo "❌ 稳定运行期间被中断"
-          echo "✅ 8-稳定运行步骤执行完成（错误已记录日志）"
+          echo "✅ 8-稳定运行完成"
 
-      - name: 9-安全停止业务服务（保留Tailscale）
+      # 步骤9：安全停止业务服务
+      - name: 9-停止业务服务
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 9-停止业务服务 ====="
           sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
           sudo systemctl stop docker containerd 2>/dev/null || echo "❌ 停止Docker失败（可能未启动）"
-          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || echo "❌ 删除pid文件失败（可能不存在）"
-          sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || echo "❌ 卸载Docker挂载目录失败（可能无挂载）"
+          # 清理残留进程文件
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || echo "❌ 删除pid文件失败"
+          sudo umount /var/lib/docker/overlay2/*/merged 2>/dev/null || echo "❌ 卸载Docker挂载目录失败"
           sync && sleep 5
-          echo "✅ 9-业务服务停止步骤执行完成（错误已记录日志）"
+          echo "✅ 9-业务服务停止完成"
 
-      - name: 10-本地全量备份（仅4个目录，tar.zst 压缩级别13）
+      # 步骤10：生成本地全量备份（zstd压缩）- 已移除创建目录功能
+      - name: 10-生成本地全量备份
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 10-生成本地全量备份 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 10-生成本地备份 ====="
           sudo mkdir -p "${LOCAL_BACKUP_DIR}" || echo "❌ 创建本地备份目录失败"
-          DIR_ARRAY=(${PERSONAL_DATA_DIRS})
-          for dir in "${DIR_ARRAY[@]}"; do
-            [[ ! -d "${dir}" ]] && sudo mkdir -p "${dir}" || echo "❌ 创建${dir}目录失败（已存在或权限不足）"
-          done
+          
+          # 压缩备份（zstd级别13，高压缩率）- 直接备份现有目录，不创建新目录
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="${LOCAL_BACKUP_DIR}/${SNAP_NAME}"
-          sudo tar -cf - --ignore-failed-read "${DIR_ARRAY[@]}" | sudo zstd -13 -o "${LOCAL_FILE}" || echo "❌ 备份压缩失败"
+          sudo tar -cf - --ignore-failed-read ${PERSONAL_DATA_DIRS} | sudo zstd -13 -o "${LOCAL_FILE}" || echo "❌ 备份压缩失败"
+          
+          # 验证备份文件
           if [[ -f "${LOCAL_FILE}" && -s "${LOCAL_FILE}" ]]; then
             echo "✅ 备份完成：${SNAP_NAME}"
             echo "BACKUP_FILE=${LOCAL_FILE}" >> "${GITHUB_ENV}"
@@ -254,86 +325,104 @@ jobs:
           else
             echo "❌ 备份文件创建失败或为空"
           fi
-          echo "✅ 10-本地备份步骤执行完成（错误已记录日志）"
+          echo "✅ 10-本地备份完成"
 
+      # 步骤11：触发下一轮续跑
       - name: 11-触发下一轮续跑
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11-触发下一轮续跑 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11-触发续跑 ====="
           if [[ -z "${USER_PAT:-}" || -z "${REPO:-}" ]]; then
-            echo "⚠️ 未配置 PAT/REPO，跳过续跑触发"
+            echo "⚠️ 未配置PAT/REPO，跳过续跑触发"
           else
+            # 调用GitHub API触发续跑
             response=$(curl -s -w "%{http_code}" -o /dev/null -X POST \
               --connect-timeout 10 --max-time 15 \
               -H "Authorization: token ${USER_PAT}" \
               -H "Content-Type: application/json" \
               https://api.github.com/repos/${REPO}/dispatches \
               -d '{"event_type":"renew_casaos_snapshot"}')
+            
             if [[ "${response}" == "204" ]]; then
               echo "✅ 续跑触发成功"
             else
-              echo "❌ 续跑触发失败，HTTP code: ${response}"
+              echo "❌ 续跑触发失败，HTTP状态码：${response}"
             fi
           fi
-          echo "✅ 11-续跑触发步骤执行完成（错误已记录日志）"
+          echo "✅ 11-续跑触发步骤完成"
 
-      # ===================== 正确：切回 DERP 洛杉矶 LAX =====================
-      - name: 11.5-切换 Tailscale DERP 中继为 洛杉矶(lax)
+      # 步骤11.5：切换DERP中继为洛杉矶（lax）+状态校验
+      - name: 11.5-切换DERP中继为洛杉矶(lax)
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11.5-切换 DERP 为 洛杉矶(lax) ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11.5-切换DERP为洛杉矶(lax) ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale 未配置，跳过"
+            echo "⚠️ Tailscale未配置，跳过"
           else
-            sudo tailscale up --force-derp-region=lax --accept-routes 2>/dev/null || echo "❌ 切换 lax 中继失败"
+            # 执行切换命令
+            sudo tailscale up --force-derp-region=lax --accept-routes
             sleep 2
-            echo "✅ 已切换至 Tailscale DERP: lax (Los Angeles)"
+            
+            # 校验实际DERP区域
+            CURRENT_REGION=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DERPRegion')
+            if [[ "${CURRENT_REGION}" == "lax" ]]; then
+              echo "✅ 已切换至Tailscale DERP: lax (Los Angeles)"
+            else
+              echo "❌ 切换lax中继失败，当前区域：${CURRENT_REGION}"
+            fi
           fi
-          echo "✅ 11.5-中继切换完成"
+          echo "✅ 11.5-中继切换步骤完成"
 
-      - name: 12-移入/aaa并无限轮询检测删除
+      # 步骤12：备份移入/aaa+轮询检测删除
+      - name: 12-备份移入/aaa+轮询检测删除
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 12-备份移入/aaa + 轮询删除检测 ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 12-备份移入/aaa+轮询检测 ====="
           if [[ -z "${BACKUP_FILE:-}" || -z "${SNAP_NAME:-}" ]]; then
-            echo "ℹ️ 无有效备份文件，跳过移入与轮询"
+            echo "ℹ️ 无有效备份文件，跳过"
           else
+            # 准备/aaa目录
             LOCAL_AAA="/aaa"
             sudo mkdir -p "${LOCAL_AAA}" || echo "❌ 创建/aaa目录失败"
             if [[ ! -w "${LOCAL_AAA}" ]]; then
-              echo "⚠️ /aaa目录无写入权限，尝试修复"
-              sudo chmod 775 "${LOCAL_AAA}" || echo "❌ 修复/aaa权限失败"
+              sudo chmod 775 "${LOCAL_AAA}" || echo "❌ 修复/aaa目录权限失败"
             fi
+            
+            # 移动备份文件到/aaa
             TARGET_FILE="${LOCAL_AAA}/${SNAP_NAME}"
             sudo mv -v "${BACKUP_FILE}" "${TARGET_FILE}" || echo "❌ 备份文件移入/aaa失败"
+            
+            # 轮询检测文件是否被删除（每1分钟一次，最多360次）
             echo -e "\n⌛ 每1分钟检测文件是否被删除（最多${MAX_POLL_TIMES}次）"
             poll_count=0
             while true; do
               if [[ ! -f "${TARGET_FILE}" ]]; then
-                echo "🎉 文件已删除，退出轮询"
+                echo "🎉 文件已被删除，退出轮询"
                 break
               fi
-              ((poll_count++)) || true
-              if [[ -z "${MAX_POLL_TIMES}" ]]; then
-                echo "⚠️ MAX_POLL_TIMES未配置，默认设为 360"
-                MAX_POLL_TIMES=360
-              fi
+              
+              ((poll_count++))
               if [[ ${poll_count} -ge ${MAX_POLL_TIMES} ]]; then
                 echo "⚠️ 达到最大轮询次数，自动退出"
                 break
               fi
+              
               echo "→ ${poll_count}/${MAX_POLL_TIMES} 文件存在，60秒后重试"
-              sleep 60 || echo "❌ 轮询睡眠被中断"
+              sleep 60
             done
           fi
-          echo "✅ 12-移入与轮询检测步骤执行完成（错误已记录日志）"
+          echo "✅ 12-移入与轮询检测完成"
 
+      # 步骤13：最终清理+关闭Tailscale
       - name: 13-最终清理+关闭Tailscale
         if: ${{ always() }}
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 13-最终清理 + 关闭Tailscale ====="
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 13-最终清理 ====="
+          # 停止Tailscale
           sudo systemctl stop tailscaled 2>/dev/null || echo "❌ 停止tailscaled失败（可能未启动）"
-          sudo rm -rf "${LOCAL_BACKUP_DIR:-}" /tmp/* 2>/dev/null || echo "❌ 清理本地备份目录与临时文件失败"
-          sudo rm -f /etc/sudoers.d/roots 2>/dev/null || echo "❌ 删除roots用户sudo配置失败（可能不存在）"
+          # 清理临时文件
+          sudo rm -rf "${LOCAL_BACKUP_DIR:-}" /tmp/* 2>/dev/null || echo "❌ 清理临时文件失败"
+          # 清理roots用户sudo配置
+          sudo rm -f /etc/sudoers.d/roots 2>/dev/null || echo "❌ 删除roots sudo配置失败"
+          # 清理系统依赖缓存
           sudo apt autoremove -y -qq || echo "❌ 自动卸载依赖失败"
           sudo apt clean -y -qq || echo "❌ 清理apt缓存失败"
-          sudo rm -rf /var/cache/apt/* 2>/dev/null || echo "❌ 清理apt缓存文件失败"
-          echo "✅ 13-最终清理步骤执行完成（错误已记录日志）"
-          echo "🎉 全流程执行完成（所有错误已记录日志，未终止流程）"
+          echo "✅ 13-最终清理完成"
+          echo "🎉 全流程执行完成"
