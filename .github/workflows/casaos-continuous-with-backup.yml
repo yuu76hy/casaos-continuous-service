@@ -21,10 +21,11 @@ jobs:
       # 备份路径配置
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      # 运行参数
-      TARGET_RUN_MINUTES: 5  # 服务稳定运行5分钟
+      # 运行参数（已改为10分钟）
+      TARGET_RUN_MINUTES: 10  # 服务稳定运行10分钟
       RETRY_TIMES: 3  # 关键操作重试次数
       MAX_POLL_TIMES: 360  # 备份文件轮询检测最大次数（6小时）
+      TAILSCALED_WAIT_SECONDS: 10  # tailscaled启动等待时间
 
     steps:
       # 步骤1：系统初始化+全域深度清理
@@ -36,11 +37,14 @@ jobs:
           sudo apt update -y -qq || echo "❌ apt更新失败"
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq || echo "❌ 安装依赖失败"
           
-          # 清理旧服务
+          # 清理旧服务（重点清理tailscaled残留）
+          sudo systemctl stop tailscaled 2>/dev/null || echo "❌ 停止旧tailscaled失败（可能未启动）"
+          sudo apt remove -y tailscale 2>/dev/null || echo "❌ 卸载旧Tailscale失败（可能未安装）"
           sudo apt remove -y docker* containerd* runc* 2>/dev/null || echo "❌ 卸载旧Docker失败（可能未安装）"
           sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败（可能未启动）"
           sudo systemctl disable casaos 2>/dev/null || echo "❌ 禁用CasaOS失败（可能未安装）"
           sudo rm -f /etc/systemd/system/casaos.service /usr/lib/systemd/system/casaos.service 2>/dev/null || echo "❌ 删除CasaOS服务文件失败"
+          sudo rm -rf /var/lib/tailscale /etc/tailscale 2>/dev/null || echo "❌ 清理Tailscale残留配置失败"
           sudo systemctl daemon-reload || echo "❌ 重载systemd失败"
           
           # 清理冗余目录&缓存
@@ -50,7 +54,7 @@ jobs:
             2>/dev/null || echo "❌ 清理冗余目录失败"
           sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y || echo "❌ 自动卸载依赖失败"
           sudo DEBIAN_FRONTEND=noninteractive apt clean || echo "❌ 清理apt缓存失败"
-          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/*/* /root/.cache/* /var/cache/apt/* 2>/dev/null || echo "❌ 清理临时文件失败"
+          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || echo "❌ 清理临时文件失败"
           
           # 释放系统资源
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || echo "❌ 释放缓存失败"
@@ -104,22 +108,49 @@ jobs:
           sudo systemctl restart ssh || echo "❌ 重启SSH服务失败"
           echo "✅ 4-roots管理员配置完成"
 
-      # 步骤5：Tailscale组网+显示IP（强制升级到最新版本）
+      # 步骤5：Tailscale组网+显示IP（仅基础组网，无中继切换）
       - name: 5-Tailscale组网+显示本机IP
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5-Tailscale组网 ====="
           if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
             echo "⚠️ Tailscale未配置，跳过组网"
           else
-            # 强制升级并安装最新版Tailscale（解决参数兼容问题）
-            curl -fsSL https://tailscale.com/install.sh | sudo bash -s -- --upgrade || echo "❌ Tailscale安装/升级失败"
-            sudo systemctl enable --now tailscaled && sleep 2 || echo "❌ 启动tailscaled服务失败"
+            # 强制升级并安装最新版Tailscale
+            curl -fsSL https://tailscale.com/install.sh | sudo bash -s -- --upgrade || {
+              echo "❌ Tailscale安装/升级失败"
+              exit 0
+            }
             
-            # 组网（随机主机名避免冲突）
+            # 清理残留进程，确保服务干净启动
+            sudo pkill -f tailscaled 2>/dev/null || true
+            sudo rm -f /var/run/tailscaled.pid 2>/dev/null || true
+            
+            # 启动tailscaled服务（带重试）
+            for ((i=1; i<=RETRY_TIMES; i++)); do
+              sudo systemctl enable --now tailscaled && sleep ${TAILSCALED_WAIT_SECONDS}
+              if sudo systemctl is-active --quiet tailscaled; then
+                echo "✅ tailscaled服务启动成功"
+                break
+              fi
+              echo "⚠️ tailscaled启动失败，第${i}次重试..."
+              sleep 3
+            done
+            
+            # 若服务仍未启动，跳过组网
+            if ! sudo systemctl is-active --quiet tailscaled; then
+              echo "❌ tailscaled服务启动失败，跳过组网"
+              echo "✅ 5-Tailscale组网步骤完成（跳过）"
+              exit 0
+            fi
+            
+            # 基础组网（无中继切换）
             TS_SUFFIX=$((RANDOM % 10000))
             TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
             echo "🔖 本次Tailscale主机名：${TS_HOSTNAME}"
-            sudo tailscale up --reset --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --accept-routes || echo "❌ Tailscale组网失败"
+            sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="${TS_HOSTNAME}" --accept-routes || {
+              echo "❌ Tailscale组网失败"
+              exit 0
+            }
             
             # 显示IP信息
             echo -e "\n=== 🖥️ 本机IP信息 ==="
@@ -131,35 +162,18 @@ jobs:
           fi
           echo "✅ 5-Tailscale组网完成"
 
-      # 步骤5.5：切换DERP中继为洛杉矶（lax）+状态校验（修复参数冲突）
-      - name: 5.5-切换DERP中继为洛杉矶(lax)
-        run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 5.5-切换DERP为洛杉矶(lax) ====="
-          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale未配置，跳过"
-          else
-            # 执行切换命令（加--reset避免旧配置冲突）
-            sudo tailscale up --reset --force-derp-region=lax --accept-routes
-            sleep 2
-            
-            # 校验实际DERP区域
-            CURRENT_REGION=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DERPRegion')
-            if [[ "${CURRENT_REGION}" == "lax" ]]; then
-              echo "✅ 已切换至Tailscale DERP: lax (Los Angeles)"
-            else
-              echo "❌ 切换lax中继失败，当前区域：${CURRENT_REGION}"
-            fi
-          fi
-          echo "✅ 5.5-中继切换步骤完成"
-
       # 步骤6：从内网/aaa拉取备份（拉取即删）+恢复
       - name: 6-拉取备份+拉取即删+覆盖恢复
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 6-拉取备份+恢复 ====="
-          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "ℹ️ Tailscale未配置，跳过备份拉取"
+          if [[ -z "${TAILSCALE_AUTH_KEY:-}" || ! sudo systemctl is-active --quiet tailscaled ]]; then
+            echo "ℹ️ Tailscale未配置或服务未启动，跳过备份拉取"
+            echo "✅ 6-备份拉取与恢复完成（跳过）"
+            exit 0
           elif [[ -z "${SSH_PASS:-}" ]]; then
             echo "❌ SSH_PASS未配置，跳过备份拉取"
+            echo "✅ 6-备份拉取与恢复完成（跳过）"
+            exit 0
           else
             # 获取Tailscale节点列表（在线、含casaos、排除本机）
             TS_STATUS_JSON=$(sudo tailscale status --json 2>/dev/null || echo "{}")
@@ -174,6 +188,8 @@ jobs:
             
             if [[ -z "${TARGET_LIST}" ]]; then
               echo "ℹ️ 未找到符合条件的节点，跳过备份拉取"
+              echo "✅ 6-备份拉取与恢复完成（跳过）"
+              exit 0
             else
               # 停止服务避免文件占用
               sudo systemctl stop casaos 2>/dev/null || echo "❌ 停止CasaOS失败"
@@ -266,32 +282,11 @@ jobs:
           sudo systemctl enable --now casaos && sleep 5 || echo "❌ 启动CasaOS失败"
           echo "✅ 7-核心服务启动完成"
 
-      # 步骤7.5：切换DERP中继为香港（hkg）+状态校验（修复参数冲突）
-      - name: 7.5-切换DERP中继为香港(hkg)
+      # 步骤8：稳定运行10分钟（已修改）
+      - name: 8-稳定运行10分钟
         run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 7.5-切换DERP为香港(hkg) ====="
-          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale未配置，跳过"
-          else
-            # 执行切换命令（加--reset避免旧配置冲突）
-            sudo tailscale up --reset --force-derp-region=hkg --accept-routes
-            sleep 2
-            
-            # 校验实际DERP区域
-            CURRENT_REGION=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DERPRegion')
-            if [[ "${CURRENT_REGION}" == "hkg" ]]; then
-              echo "✅ 已切换至Tailscale DERP: hkg (Hong Kong)"
-            else
-              echo "❌ 切换hkg中继失败，当前区域：${CURRENT_REGION}"
-            fi
-          fi
-          echo "✅ 7.5-中继切换步骤完成"
-
-      # 步骤8：稳定运行5分钟
-      - name: 8-稳定运行5分钟
-        run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行5分钟 ====="
-          sleep 300 || echo "❌ 稳定运行期间被中断"
+          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 8-稳定运行10分钟 ====="
+          sleep 600 || echo "❌ 稳定运行期间被中断"  # 10分钟=600秒
           echo "✅ 8-稳定运行完成"
 
       # 步骤9：安全停止业务服务
@@ -350,27 +345,6 @@ jobs:
           fi
           echo "✅ 11-续跑触发步骤完成"
 
-      # 步骤11.5：切换DERP中继为洛杉矶（lax）+状态校验（修复参数冲突）
-      - name: 11.5-切换DERP中继为洛杉矶(lax)
-        run: |
-          echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 11.5-切换DERP为洛杉矶(lax) ====="
-          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
-            echo "⚠️ Tailscale未配置，跳过"
-          else
-            # 执行切换命令（加--reset避免旧配置冲突）
-            sudo tailscale up --reset --force-derp-region=lax --accept-routes
-            sleep 2
-            
-            # 校验实际DERP区域
-            CURRENT_REGION=$(sudo tailscale status --json 2>/dev/null | jq -r '.Self.DERPRegion')
-            if [[ "${CURRENT_REGION}" == "lax" ]]; then
-              echo "✅ 已切换至Tailscale DERP: lax (Los Angeles)"
-            else
-              echo "❌ 切换lax中继失败，当前区域：${CURRENT_REGION}"
-            fi
-          fi
-          echo "✅ 11.5-中继切换步骤完成"
-
       # 步骤12：备份移入/aaa+轮询检测删除
       - name: 12-备份移入/aaa+轮询检测删除
         run: |
@@ -415,7 +389,7 @@ jobs:
         if: ${{ always() }}
         run: |
           echo "===== [$(date '+%Y-%m-%d %H:%M:%S')] 13-最终清理 ====="
-          # 停止Tailscale
+          # 停止Tailscale服务
           sudo systemctl stop tailscaled 2>/dev/null || echo "❌ 停止tailscaled失败（可能未启动）"
           # 清理临时文件
           sudo rm -rf "${LOCAL_BACKUP_DIR:-}" /tmp/* 2>/dev/null || echo "❌ 清理临时文件失败"
