@@ -20,7 +20,7 @@ jobs:
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
       TARGET_RUN_MINUTES: 300
       RETRY_TIMES: 3
-      ZSTD_COMPRESS_LEVEL: 19
+      ZSTD_COMPRESS_LEVEL: 12
 
     steps:
       - name: 1-系统初始化+全域深度清理（无Docker/CasaOS卸载）
