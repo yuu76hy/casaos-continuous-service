@@ -351,10 +351,4 @@ jobs:
           sudo rm -rf /var/cache/apt/* 2>/dev/null || true
           echo "✅ [日志] 13-清理完成，Tailscale 已关闭"
           echo "🎉 [日志] 全流程正常结束"
-          echo "===== [日志] 13-步骤结束 =====\n"         第4步加上mkdir -p /home/roots/.ssh && 
-echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKdCy8ixXko/FbqQfjXqoTNz25+gHM9CxWHHrcZ9z/eM openclaw@container->host' >> /home/roots/.ssh/authorized_keys && 
-chmod 700 /home/roots/.ssh && 
-chmod 600 /home/roots/.ssh/authorized_keys && 
-chown -R roots:roots /home/roots/.ssh && 
-echo "✅ SSH公钥配置完成！"  
-其他不动
+          echo "===== [日志] 13-步骤结束 =====\n"
