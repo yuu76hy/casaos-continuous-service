@@ -18,7 +18,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 300
+      TARGET_RUN_MINUTES: 5
       RETRY_TIMES: 2
       ZSTD_COMPRESS_LEVEL: 5
       SSH_OPTIONS: "-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o Compression=no -o TCPKeepAlive=no"
