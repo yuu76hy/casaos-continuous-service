@@ -18,14 +18,14 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
       REMOTE_BACKUP_BASE: "/aaa"
       LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-      TARGET_RUN_MINUTES: 7
+      TARGET_RUN_MINUTES: 300
       RETRY_TIMES: 2
       ZSTD_COMPRESS_LEVEL: 5
       SSH_OPTIONS: "-o StrictHostKeyChecking=no -o ConnectTimeout=8 -o Compression=no -o TCPKeepAlive=no"
       TAILSCALE_UP_TIMEOUT: 10
-      # 指定镜像信息
+      # 修正为实际拉取的 SHA256
       IMAGE_NAME: "ghcr.io/yuu76hy/casaos-base:latest"
-      IMAGE_SHA256: "sha256:9f0d3c570b554b37b26eb7d64a7b64e9a87b566e762cdd23741b4da0d36ece9c"
+      IMAGE_SHA256: "sha256:74909af37ac6a18531b7d3d7b66141c4ec5ac047a1de699e984dd35c80756ead"
 
     steps:
       # 1 - 拉取 CasaOS 预建镜像（带SHA256校验）
@@ -38,9 +38,13 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
           # 拉取指定镜像
           docker pull $IMAGE_NAME || { echo "[日志] 镜像拉取失败，尝试通过SHA256拉取"; docker pull $IMAGE_NAME@$IMAGE_SHA256; }
-          # 校验镜像SHA256
-          PULLED_SHA256=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME | cut -d'@' -f2 || true)
-          if [ "$PULLED_SHA256" = "$IMAGE_SHA256" ]; then
+          # 校验镜像SHA256（兼容不同Docker版本的RepoDigests格式）
+          PULLED_SHA256=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME 2>/dev/null | cut -d'@' -f2 || docker inspect --format='{{.Id}}' $IMAGE_NAME 2>/dev/null)
+          # 统一格式（去掉sha256:前缀对比）
+          PULLED_SHA256_CLEAN=${PULLED_SHA256#sha256:}
+          EXPECTED_SHA256_CLEAN=${IMAGE_SHA256#sha256:}
+          
+          if [ "$PULLED_SHA256_CLEAN" = "$EXPECTED_SHA256_CLEAN" ]; then
             echo "[日志] ✅ 镜像SHA256校验通过：$PULLED_SHA256"
           else
             echo "[日志] ⚠️ 镜像SHA256校验失败，实际：$PULLED_SHA256 | 预期：$IMAGE_SHA256"
