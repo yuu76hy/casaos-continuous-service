@@ -21,49 +21,43 @@ jobs:
       TARGET_RUN_MINUTES: 300
       RETRY_TIMES: 3
       ZSTD_COMPRESS_LEVEL: 8
-
-    steps:
-      - name: 1-系统初始化+全域深度清理（无Docker/CasaOS卸载）
-        if: ${{ always() }}  # 确保始终执行，​忽略前序错误
+ steps:
+      # ──────────────────────────────────────────────────────────────────────
+      # 0-拉取预建 CasaOS 镜像（新增）
+      # ──────────────────────────────────────────────────────────────────────
+      - name: 0-拉取 CasaOS 预建镜像
+        if: ${{ always() }}
         run: |
-          set +e  # 开启容错模式，​单个命令失败不退出脚本
-          echo "===== [日志] 1-系统初始化+全域深度清理 开始 ====="
+          set +e
+          echo "===== [日志] 0-拉取预建镜像 开始 ====="
+          # 登录 GHCR
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
+          # 拉取镜像
+          docker pull ghcr.io/yuu76hy/casaos-base:latest || echo "[日志] 拉取失败，将继续纯净模式"
+          # 显示镜像信息
+          docker images | grep casaos-base || true
+          echo "✅ [日志] 0-镜像准备完成"
+          echo "===== [日志] 0-步骤结束 =====\n"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 1-系统初始化 + 工具安装（简化版，无需清理 Docker/CasaOS）
+      # ──────────────────────────────────────────────────────────────────────
+      - name: 1-系统初始化 + 工具安装（简化版）
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 1-系统初始化 + 工具安装 开始 ====="
           sudo apt update -y -qq || true
+          # 只安装必要工具，Docker/CasaOS 已预装
           sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq || true
-          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n 2>/dev/null || true
-          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
-          sudo DEBIAN_FRONTEND=noninteractive apt clean 2>/dev/null || true
+          # 清理缓存
           sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y 2>/dev/null || true
           sync && sudo sysctl -w vm.drop_caches=3 2>/dev/null || true
           sudo systemctl enable --now ssh || true
-          echo "✅ [日志] 1-系统初始化+深度清理完成"
+          echo "✅ [日志] 1-系统初始化完成"
           echo "===== [日志] 1-步骤结束 =====\n"
-      
-      - name: 2-官方纯净安装 Docker
-        if: ${{ always() }}  # 确保始终执行，​忽略前序错误
-        run: |
-          set +e  # 开启容错模式
-          echo "===== [日志] 2-安装 Docker（官方源） 开始 ====="
-          export DEBIAN_FRONTEND=noninteractive
-          curl -fsSL https://get.docker.com | sudo bash || true
-          sudo systemctl enable docker containerd || true
-          sudo systemctl stop docker containerd 2>/dev/null || true
-          docker --version || true
-          sudo usermod -aG docker runner || true
-          echo "✅ [日志] 2-Docker 安装完成"
-          echo "===== [日志] 2-步骤结束 =====\n"
-      
-      - name: 3-官方纯净安装 CasaOS
-        if: ${{ always() }}  # 确保始终执行，​忽略前序错误
-        run: |
-          set +e  # 开启容错模式
-          echo "===== [日志] 3-安装 CasaOS 开始 ====="
-          curl -fsSL https://get.casaos.io | sudo bash || true
-          sudo systemctl stop casaos 2>/dev/null || true
-          sudo systemctl disable casaos 2>/dev/null || true
-          echo "✅ [日志] 3-CasaOS 安装完成"
-          echo "===== [日志] 3-步骤结束 =====\n"
+    
       
       - name: 4-创建 roots 管理员+SSH密码登录
         if: ${{ always() }}  # 确保始终执行，​忽略前序错误
