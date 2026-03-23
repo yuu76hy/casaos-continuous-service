@@ -185,7 +185,7 @@ jobs:
 
           echo ""
           echo "$LOG_PREFIX === 本机 IP 信息 ==="
-          LOCAL_IP=$(hostname -I | awk '{print \$1}')
+          LOCAL_IP=$(hostname -I | cut -d' ' -f1)
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
           echo "$LOG_PREFIX 物理内网IP: $LOCAL_IP"
           echo "$LOG_PREFIX Tailscale内网IP: $TAILSCALE_IP"
@@ -417,7 +417,7 @@ jobs:
       # ============================================================
       - name: 8-稳定运行指定分钟
         if: ${{ always() }}
-        timeout-minutes: ${{ env.TARGET_RUN_MINUTES }}
+        timeout-minutes: 360
         run: |
           set -e
           echo "$LOG_STEP_DIVIDER [日志] 8-稳定运行 $TARGET_RUN_MINUTES 分钟 开始 $LOG_STEP_DIVIDER"
@@ -526,7 +526,7 @@ jobs:
           TOTAL_SIZE=0
           for dir in "${DIR_ARRAY[@]}"; do
             if [ -d "$dir" ]; then
-              DIR_SIZE=$(sudo du -sb "$dir" 2>/dev/null | awk '{print \$1}' || echo "0")
+              DIR_SIZE=$(sudo du -sb "$dir" 2>/dev/null | cut -f1 || echo "0")
               TOTAL_SIZE=$((TOTAL_SIZE + DIR_SIZE))
               echo "$LOG_PREFIX $dir: $(numfmt --to=iec $DIR_SIZE 2>/dev/null || echo "$DIR_SIZE bytes")"
             fi
@@ -546,7 +546,7 @@ jobs:
             FILE_SIZE=$(du -h "$LOCAL_FILE" | cut -f1)
             echo "$LOG_PREFIX 备份文件已创建 (大小: $FILE_SIZE)"
 
-            local backup_size=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo "0")
+            backup_size=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo "0")
             if [ "$backup_size" -lt 1024 ]; then
               echo "$LOG_PREFIX 文件过小: $backup_size bytes"
             else
@@ -605,7 +605,7 @@ jobs:
               "https://api.github.com/repos/$REPO/actions/runs?per_page=3" \
               | jq -r '.workflow_runs[0] | "\(.status) \(.workflow_id) \(.name)"' 2>/dev/null || echo "error error unknown")
 
-            WF_STATUS=$(echo "$WF_RUN" | awk '{print \$1}')
+            WF_STATUS=$(echo "$WF_RUN" | cut -d' ' -f1)
             echo "$LOG_PREFIX 最新运行状态: $WF_STATUS"
 
             if [ "$WF_STATUS" = "queued" ] || [ "$WF_STATUS" = "in_progress" ]; then
