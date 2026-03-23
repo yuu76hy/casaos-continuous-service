@@ -9,13 +9,13 @@ env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 3
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 10  # 稳定运行10分钟
+  TARGET_RUN_MINUTES: 10
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
   LOCAL_AAA_DIR: "/aaa"
   SSH_USER: "root"
-  LOG_PREFIX="[日志]"
+  LOG_PREFIX: "[日志]"
 
 jobs:
   casaos-deploy:
@@ -29,12 +29,8 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
 
     steps:
-      # ============================================================
-      # 修复版：先串行初始化(避免APT锁冲突)，再并行3个任务
-      # ============================================================
       - name: 系统初始化(串行) + Docker/CasaOS/管理员(并行)
         run: |
-          # 任务1：系统初始化+清理（必须串行，独占APT锁）
           task1_init() {
             echo "$LOG_PREFIX === 系统初始化开始 ==="
             sudo apt update -y -qq || true
@@ -47,7 +43,6 @@ jobs:
             echo "$LOG_PREFIX === 系统初始化完成 ==="
           }
 
-          # 任务2：安装 Docker
           task2_docker() {
             echo "$LOG_PREFIX === 安装Docker开始 ==="
             export DEBIAN_FRONTEND=noninteractive
@@ -62,7 +57,6 @@ jobs:
             echo "$LOG_PREFIX === Docker安装完成 ==="
           }
 
-          # 任务3：安装 CasaOS（加重试+强校验）
           task3_casaos() {
             echo "$LOG_PREFIX === 安装CasaOS开始 ==="
             for i in 1 2 3; do
@@ -82,7 +76,6 @@ jobs:
             echo "$LOG_PREFIX === CasaOS安装完成 ==="
           }
 
-          # 任务4：配置管理员用户
           task4_admin() {
             echo "$LOG_PREFIX === 配置管理员开始 ==="
             if [ -z "$SSH_PASS" ]; then
@@ -105,7 +98,6 @@ jobs:
             echo "$LOG_PREFIX === 管理员配置完成 ==="
           }
 
-          # ==================== 执行逻辑 ====================
           echo "$LOG_PREFIX 第一步：串行执行系统初始化（避免APT锁冲突）"
           task1_init
 
@@ -117,9 +109,6 @@ jobs:
 
           echo "$LOG_PREFIX ✅ 所有初始化任务全部完成"
 
-      # ============================================================
-      # Step 5: Tailscale组网
-      # ============================================================
       - name: 5-Tailscale组网
         run: |
           TS_SUFFIX=$((RANDOM % 1000))
@@ -149,9 +138,6 @@ jobs:
           fi
           echo "$LOG_PREFIX 5-Tailscale组网完成"
 
-      # ============================================================
-      # Step 6: 拉取备份恢复
-      # ============================================================
       - name: 6-拉取备份恢复
         run: |
           echo "$LOG_PREFIX === 6-拉取备份开始 ==="
@@ -209,9 +195,6 @@ jobs:
           fi
           echo "$LOG_PREFIX 6-拉取备份完成"
 
-      # ============================================================
-      # Step 7: 启动服务
-      # ============================================================
       - name: 7-启动服务
         run: |
           echo "$LOG_PREFIX === 7-启动服务开始 ==="
@@ -225,9 +208,6 @@ jobs:
           echo "$LOG_PREFIX CasaOS状态: $(systemctl is-active casaos 2>/dev/null || echo 'unknown')"
           echo "$LOG_PREFIX 7-启动服务完成"
 
-      # ============================================================
-      # Step 8: 稳定运行 10分钟
-      # ============================================================
       - name: 8-稳定运行
         timeout-minutes: 360
         run: |
@@ -243,24 +223,16 @@ jobs:
           done
           echo "$LOG_PREFIX 8-稳定运行完成"
 
-      # ============================================================
-      # Step 9: 停止服务（保留Tailscale正常运行）
-      # ============================================================
       - name: 9-停止服务
         run: |
           echo "$LOG_PREFIX === 9-停止服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          # 仅停止核心服务，不操作Tailscale
           sudo systemctl stop casaos docker containerd 2>/dev/null || true
-          # 精准查杀进程，不影响tailscaled
           sudo pkill -9 -f "casaos" 2>/dev/null || true
           sudo pkill -9 -f "docker" 2>/dev/null || true
           sudo pkill -9 -f "containerd" 2>/dev/null || true
           echo "$LOG_PREFIX 9-停止服务完成"
 
-      # ============================================================
-      # Step 10: 本地备份
-      # ============================================================
       - name: 10-本地备份
         run: |
           echo "$LOG_PREFIX === 10-本地备份开始 ==="
@@ -286,9 +258,6 @@ jobs:
           fi
           echo "$LOG_PREFIX 10-本地备份完成"
 
-      # ============================================================
-      # Step 11: 触发下一轮
-      # ============================================================
       - name: 11-触发下一轮
         run: |
           echo "$LOG_PREFIX === 11-触发下一轮 ==="
@@ -304,9 +273,6 @@ jobs:
           fi
           echo "$LOG_PREFIX 11-触发下一轮完成"
 
-      # ============================================================
-      # Step 12: 轮询等待删除
-      # ============================================================
       - name: 12-轮询等待删除
         timeout-minutes: 1440
         run: |
@@ -336,13 +302,9 @@ jobs:
           fi
           echo "$LOG_PREFIX 12-轮询删除完成"
 
-      # ============================================================
-      # Step 13: 最终清理（全程保留Tailscale运行）
-      # ============================================================
       - name: 13-最终清理
         run: |
           echo "$LOG_PREFIX === 13-最终清理 ==="
-          # 保留Tailscale，不执行任何停止/查杀操作
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/root 2>/dev/null || true
           sudo apt autoremove -y -qq 2>/dev/null || true
