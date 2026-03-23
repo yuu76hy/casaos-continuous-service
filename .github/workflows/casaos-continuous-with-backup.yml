@@ -223,7 +223,7 @@ jobs:
           done
           echo "$LOG_PREFIX 8-稳定运行完成"
 
-      - name: 9-停止服务
+      - name: 9-停止服务（保留Tailscale）
         run: |
           echo "$LOG_PREFIX === 9-停止服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
@@ -273,25 +273,26 @@ jobs:
           fi
           echo "$LOG_PREFIX 11-触发下一轮完成"
 
-      - name: 12-轮询等待删除
+      - name: 12-轮询等待删除（权限修复版）
         timeout-minutes: 1440
         run: |
           echo "$LOG_PREFIX === 12-轮询删除开始 ==="
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
             echo "$LOG_PREFIX 无备份文件，跳过"
           else
-            mkdir -p "$LOCAL_AAA_DIR" || true
+            sudo mkdir -p "$LOCAL_AAA_DIR" || true
+            sudo chown runner:runner "$LOCAL_AAA_DIR" || true
             TARGET_FILE="$LOCAL_AAA_DIR/$SNAP_NAME"
-            mv -v "$BACKUP_FILE" "$TARGET_FILE" 2>/dev/null || true
+            sudo mv -v "$BACKUP_FILE" "$TARGET_FILE" 2>/dev/null || true
             
             if [ -f "$TARGET_FILE" ]; then
-              FILE_SIZE=$(stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
+              FILE_SIZE=$(sudo stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
               echo "$LOG_PREFIX 监控文件: $SNAP_NAME ($(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE bytes"))"
               echo "$LOG_PREFIX 无限轮询等待删除..."
               
               POLL_COUNT=0
               while [ -f "$TARGET_FILE" ]; do
-                CURRENT_SIZE=$(stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
+                CURRENT_SIZE=$(sudo stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
                 [ "$CURRENT_SIZE" != "$FILE_SIZE" ] && echo "$LOG_PREFIX 文件变化" && FILE_SIZE=$CURRENT_SIZE
                 echo "$LOG_PREFIX 等待中... ($POLL_COUNT)"
                 sleep $POLL_INTERVAL
@@ -302,7 +303,7 @@ jobs:
           fi
           echo "$LOG_PREFIX 12-轮询删除完成"
 
-      - name: 13-最终清理
+      - name: 13-最终清理（保留Tailscale）
         run: |
           echo "$LOG_PREFIX === 13-最终清理 ==="
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
