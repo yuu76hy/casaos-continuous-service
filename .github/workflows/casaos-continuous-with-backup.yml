@@ -51,40 +51,23 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 10
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 1-系统初始化+全域深度清理 开始 $LOG_STEP_DIVIDER"
 
-          log_step "1-系统初始化+全域深度清理 开始"
+          sudo apt update -y -qq || true
+          sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq || true
 
-          # 安装必要工具
-          safe_run sudo apt update -y -qq &
-          APT_PID=$!
-          safe_run sudo apt install -y \
-            curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq &
-          INSTALL_PID=$!
-          wait $APT_PID $INSTALL_PID
+          sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n || true
+          sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google || true
+          sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* || true
 
-          # 清理缓存和临时文件
-          safe_run sudo rm -rf \
-            /usr/local/lib /usr/local/.ghcup /usr/local/julia* \
-            /usr/local/aws-* /usr/local/n \
-            /opt/hostedtoolcache /opt/actionarchivecache \
-            /opt/runner-cache /opt/microsoft /opt/google &
+          sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y || true
+          sudo DEBIAN_FRONTEND=noninteractive apt clean || true
 
-          safe_run sudo rm -rf /tmp/* /var/tmp/* \
-            ~/.cache/* /root/.cache/* /var/cache/apt/* &
-          wait
+          sudo systemctl enable --now ssh || true
 
-          # 清理apt
-          safe_run sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y
-          safe_run sudo DEBIAN_FRONTEND=noninteractive apt clean
-
-          # 启用SSH
-          safe_run sudo systemctl enable --now ssh
-
-          log_info "✅ 1-系统初始化+深度清理完成"
-          log_step "1-步骤结束"
+          echo "$LOG_PREFIX 1-系统初始化+深度清理完成"
+          echo "$LOG_STEP_DIVIDER [日志] 1-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤2: 安装Docker
@@ -93,23 +76,20 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 15
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
-
-          log_step "2-安装 Docker（官方源） 开始"
-
+          set -e
           export DEBIAN_FRONTEND=noninteractive
-          safe_run curl -fsSL https://get.docker.com | sudo bash
-          safe_run sudo systemctl enable docker containerd
-          safe_run sudo systemctl stop docker containerd
+          echo "$LOG_STEP_DIVIDER [日志] 2-安装 Docker（官方源） 开始 $LOG_STEP_DIVIDER"
+
+          curl -fsSL https://get.docker.com | sudo bash || true
+          sudo systemctl enable docker containerd || true
+          sudo systemctl stop docker containerd || true
 
           DOCKER_VER=$(docker --version 2>/dev/null || echo "未安装")
-          log_info "Docker 版本: $DOCKER_VER"
-          safe_run sudo usermod -aG docker runner
+          echo "$LOG_PREFIX Docker 版本: $DOCKER_VER"
+          sudo usermod -aG docker runner || true
 
-          log_info "✅ 2-Docker 安装完成"
-          log_step "2-步骤结束"
+          echo "$LOG_PREFIX 2-Docker 安装完成"
+          echo "$LOG_STEP_DIVIDER [日志] 2-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤3: 安装CasaOS
@@ -118,18 +98,15 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 10
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 3-安装 CasaOS 开始 $LOG_STEP_DIVIDER"
 
-          log_step "3-安装 CasaOS 开始"
+          curl -fsSL https://get.casaos.io | sudo bash || true
+          sudo systemctl stop casaos || true
+          sudo systemctl disable casaos || true
 
-          safe_run curl -fsSL https://get.casaos.io | sudo bash
-          safe_run sudo systemctl stop casaos
-          safe_run sudo systemctl disable casaos
-
-          log_info "✅ 3-CasaOS 安装完成"
-          log_step "3-步骤结束"
+          echo "$LOG_PREFIX 3-CasaOS 安装完成"
+          echo "$LOG_STEP_DIVIDER [日志] 3-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤4: 配置管理员用户
@@ -138,34 +115,32 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
+          set -e
           USER_NAME="$SSH_USER"
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          die() { echo "$LOG_PREFIX ❌ \$1"; exit 0; }
-
-          log_step "4-配置管理员用户 $USER_NAME 开始"
+          echo "$LOG_STEP_DIVIDER [日志] 4-配置管理员用户 $USER_NAME 开始 $LOG_STEP_DIVIDER"
 
           if [ -z "$SSH_PASS" ]; then
-            die "错误：ROOTS_PASSWORD 未配置，退出本步骤"
+            echo "$LOG_PREFIX 错误：ROOTS_PASSWORD 未配置，退出本步骤"
+            exit 0
           fi
 
-          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
-          echo "$USER_NAME:$SSH_PASS" | sudo chpasswd
-          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
-          sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
-          sudo usermod -aG docker "$USER_NAME"
+          id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME" || true
+          echo "$USER_NAME:$SSH_PASS" | sudo chpasswd || true
+          echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null || true
+          sudo chmod 0440 /etc/sudoers.d/"$USER_NAME" || true
+          sudo usermod -aG docker "$USER_NAME" || true
 
           SSH_CONF="/etc/ssh/sshd_config"
-          safe_run sudo sed -i \
+          sudo sed -i \
             -e 's/^#*PermitRootLogin.*/PermitRootLogin yes/' \
             -e 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' \
             -e 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' \
-            $SSH_CONF
+            "$SSH_CONF" || true
 
-          sudo systemctl restart ssh
+          sudo systemctl restart ssh || true
 
-          log_info "✅ 4-管理员用户 & SSH 配置完成"
-          log_step "4-步骤结束"
+          echo "$LOG_PREFIX 4-管理员用户 & SSH 配置完成"
+          echo "$LOG_STEP_DIVIDER [日志] 4-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤5: Tailscale组网
@@ -174,58 +149,51 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
+          set -e
           TS_SUFFIX=$((RANDOM % 1000))
           TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
 
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
-          retry_with_backoff() {
-            local max_attempts=\$1
-            local delay=\$2
-            local cmd="\$3"
-            for ((i=1; i<=max_attempts; i++)); do
-              if eval "$cmd"; then
-                return 0
-              fi
-              if [ $i -lt $max_attempts ]; then
-                log_info "  ⏳ 重试 $i/$max_attempts，等待 ${delay}s..."
-                sleep $delay
-                delay=$((delay * 2))
-              fi
-            done
-            return 1
-          }
-
-          log_step "5-Tailscale组网 + 显示本机信息 开始"
+          echo "$LOG_STEP_DIVIDER [日志] 5-Tailscale组网 + 显示本机信息 开始 $LOG_STEP_DIVIDER"
 
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
-            log_info "⚠️ Tailscale 未配置，跳过组网"
+            echo "$LOG_PREFIX Tailscale 未配置，跳过组网"
             exit 0
           fi
 
-          log_info "🔧 安装 Tailscale..."
-          retry_with_backoff 3 2 "curl -fsSL https://tailscale.com/install.sh | sudo bash"
+          echo "$LOG_PREFIX 安装 Tailscale..."
+          for i in 1 2 3; do
+            curl -fsSL https://tailscale.com/install.sh | sudo bash && break || {
+              echo "$LOG_PREFIX 安装重试 $i/3..."
+              sleep 2
+            }
+          done
 
-          log_info "🚀 启动 Tailscale 服务..."
-          safe_run sudo systemctl enable --now tailscaled
+          echo "$LOG_PREFIX 启动 Tailscale 服务..."
+          sudo systemctl enable --now tailscaled || true
           sleep 2
 
-          log_info "🔗 连接 Tailscale 网络 (主机名: ${TS_HOSTNAME})..."
-          retry_with_backoff 3 3 "sudo tailscale up \
-            --authkey='$TAILSCALE_AUTH_KEY' \
-            --hostname='$TS_HOSTNAME' \
-            --accept-routes --reset"
+          echo "$LOG_PREFIX 连接 Tailscale 网络 (主机名: ${TS_HOSTNAME})..."
+          for i in 1 2 3; do
+            sudo tailscale up \
+              --authkey="$TAILSCALE_AUTH_KEY" \
+              --hostname="$TS_HOSTNAME" \
+              --accept-routes --reset && break || {
+              echo "$LOG_PREFIX 连接重试 $i/3..."
+              sleep 3
+            }
+          done
 
-          echo -e "\n$LOG_PREFIX === 本机 IP 信息 ==="
+          echo ""
+          echo "$LOG_PREFIX === 本机 IP 信息 ==="
           LOCAL_IP=$(hostname -I | awk '{print \$1}')
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
-          log_info "物理内网IP: $LOCAL_IP"
-          log_info "Tailscale内网IP: $TAILSCALE_IP"
-          echo "===================================\n"
+          echo "$LOG_PREFIX 物理内网IP: $LOCAL_IP"
+          echo "$LOG_PREFIX Tailscale内网IP: $TAILSCALE_IP"
+          echo "==================================="
+          echo ""
 
-          log_info "✅ 5-Tailscale 组网上线完成"
-          log_step "5-步骤结束"
+          echo "$LOG_PREFIX 5-Tailscale 组网上线完成"
+          echo "$LOG_STEP_DIVIDER [日志] 5-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤6: 从内网拉取备份并恢复
@@ -234,63 +202,19 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 30
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
-
-          retry_ssh() {
-            local retries=$RETRY_TIMES
-            local delay=1
-            for ((i=1; i<=retries; i++)); do
-              if eval "\$1"; then
-                return 0
-              fi
-              if [ $i -lt $retries ]; then
-                log_info "  ⏳ SSH重试 $i/$retries，等待 ${delay}s..."
-                sleep $delay
-                delay=$((delay * 2))
-              fi
-            done
-            return 1
-          }
-
-          check_node_health() {
-            local ip=\$1
-            local timeout=5
-            log_info "🏥 检查节点 $ip 健康状态..."
-            if timeout $timeout bash -c "echo > /dev/tcp/$ip/22" 2>/dev/null; then
-              log_info "  ✅ SSH 端口可达"
-              return 0
-            else
-              log_info "  ⚠️ SSH 端口不可达"
-              return 1
-            fi
-          }
-
-          verify_backup() {
-            local file=\$1
-            log_info "🔍 验证备份文件..."
-            local size=$(stat -c%s "$file" 2>/dev/null || echo "0")
-            if [ "$size" -lt 1024 ]; then
-              log_info "  ❌ 文件过小: $size bytes"
-              return 1
-            fi
-            log_info "  ✅ 文件大小正常: $(numfmt --to=iec $size)"
-            return 0
-          }
-
-          log_step "6-多节点尝试拉取备份（拉取即删） 开始"
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 6-多节点尝试拉取备份（拉取即删） 开始 $LOG_STEP_DIVIDER"
 
           if [ -z "$TAILSCALE_AUTH_KEY" ] || [ -z "$SSH_PASS" ]; then
-            log_info "ℹ️ 未配置 Tailscale/SSH，纯净启动"
+            echo "$LOG_PREFIX 未配置 Tailscale/SSH，纯净启动"
             exit 0
           fi
 
           TS_STATUS=$(sudo tailscale status --json 2>/dev/null || echo '{"Peer":[]}')
           SELF_ID=$(echo "$TS_STATUS" | jq -r '.Self.ID // empty')
           SELF_HOSTNAME=$(echo "$TS_STATUS" | jq -r '.Self.HostName // empty')
-          log_info "本机 Tailscale ID: $SELF_ID"
-          log_info "本机 Tailscale 主机名: $SELF_HOSTNAME"
+          echo "$LOG_PREFIX 本机 Tailscale ID: $SELF_ID"
+          echo "$LOG_PREFIX 本机 Tailscale 主机名: $SELF_HOSTNAME"
 
           TARGET_LIST=$(echo "$TS_STATUS" | jq -r --arg self "$SELF_ID" '
             .Peer[] |
@@ -301,131 +225,151 @@ jobs:
           ' 2>/dev/null | sort || true)
 
           if [ -z "$TARGET_LIST" ]; then
-            log_info "ℹ️ 未找到符合条件节点，纯净启动"
+            echo "$LOG_PREFIX 未找到符合条件节点，纯净启动"
             exit 0
           fi
 
-          echo -e "\n$LOG_PREFIX 符合条件节点（共 $(echo "$TARGET_LIST" | wc -l) 个）："
+          echo ""
+          echo "$LOG_PREFIX 符合条件节点（共 $(echo "$TARGET_LIST" | wc -l) 个）："
           echo "$TARGET_LIST" | while IFS='|' read -r h ip online; do
             echo "  - 设备：$h ｜ IP：$ip ｜ 在线：$online"
           done
 
-          echo -e "\n$LOG_PREFIX 停止 Docker/CasaOS 以安全恢复..."
-          safe_run sudo fuser -k 80/tcp 443/tcp
-          safe_run sudo systemctl stop docker containerd casaos
-          safe_run sudo pkill -9 -f "casaos|docker|containerd"
-          safe_run sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid
+          echo ""
+          echo "$LOG_PREFIX 停止 Docker/CasaOS 以安全恢复..."
+          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
+          sudo systemctl stop docker containerd casaos 2>/dev/null || true
+          sudo pkill -9 -f "casaos|docker|containerd" 2>/dev/null || true
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
           sync && sleep 2
 
-          safe_run sudo mkdir -p "$LOCAL_BACKUP_DIR"
-          safe_run sudo chmod 777 "$LOCAL_BACKUP_DIR"
+          sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
+          sudo chmod 777 "$LOCAL_BACKUP_DIR" || true
 
           RESTORE_SUCCESS=0
           FAILED_NODES=()
           while IFS='|' read -r TARGET_HOST TARGET_IP TARGET_ONLINE; do
-            echo -e "\n==========================================================="
-            echo "$LOG_PREFIX 🎯 尝试节点：$TARGET_HOST | $TARGET_IP"
+            echo ""
+            echo "==========================================================="
+            echo "$LOG_PREFIX 尝试节点：$TARGET_HOST | $TARGET_IP"
             echo "==========================================================="
 
-            check_node_health "$TARGET_IP" || {
-              log_info "⚠️ 节点 $TARGET_HOST 健康检查失败，跳过"
+            echo "$LOG_PREFIX 检查节点 $TARGET_IP SSH端口..."
+            if ! timeout 5 bash -c "echo > /dev/tcp/$TARGET_IP/22" 2>/dev/null; then
+              echo "$LOG_PREFIX 节点 $TARGET_HOST 健康检查失败，跳过"
               FAILED_NODES+=("$TARGET_HOST")
               continue
-            }
+            fi
+            echo "$LOG_PREFIX SSH 端口可达"
 
             LATEST_FILE=""
-            if retry_ssh "sshpass -p '$SSH_PASS' ssh -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=5 -o ServerAliveInterval=10 \
-              '$SSH_USER@$TARGET_IP' \"ls -t \\\"$REMOTE_BACKUP_BASE\\\"/casaos-*.tar.zst 2>/dev/null | head -1\""; then
+            for retry in 1 2 3; do
               LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no \
-                -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" \
-                "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.zst 2>/dev/null | head -1" || true)
-            fi
+                -o ConnectTimeout=5 -o ServerAliveInterval=10 \
+                "$SSH_USER@$TARGET_IP" \
+                "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.zst 2>/dev/null | head -1" 2>/dev/null || true)
+              [ -n "$LATEST_FILE" ] && break
+              echo "$LOG_PREFIX SSH重试 $retry/3..."
+              sleep 2
+            done
 
-            [ -z "$LATEST_FILE" ] && {
-              log_info "⚠️ 无备份，跳过"
+            if [ -z "$LATEST_FILE" ]; then
+              echo "$LOG_PREFIX 无备份，跳过"
               FAILED_NODES+=("$TARGET_HOST (无备份)")
               continue
-            }
+            fi
 
-            log_info "📋 发现备份: $LATEST_FILE"
+            echo "$LOG_PREFIX 发现备份: $LATEST_FILE"
 
             REMOTE_SIZE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no \
               -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" \
-              "stat -c%s '$LATEST_FILE' 2>/dev/null" || echo "0")
-            log_info "📦 远程文件大小: $(numfmt --to=iec $REMOTE_SIZE 2>/dev/null || echo "$REMOTE_SIZE bytes")"
+              "stat -c%s '$LATEST_FILE' 2>/dev/null" 2>/dev/null || echo "0")
+            echo "$LOG_PREFIX 远程文件大小: $(numfmt --to=iec $REMOTE_SIZE 2>/dev/null || echo "$REMOTE_SIZE bytes")"
 
             LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
             pull_success=0
 
-            log_info "📥 拉取备份文件..."
-            for ((i=1; i<=RETRY_TIMES; i++)); do
+            echo "$LOG_PREFIX 拉取备份文件..."
+            for retry in 1 2 3; do
               if sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no \
                 -o ConnectTimeout=15 "$SSH_USER@$TARGET_IP:$LATEST_FILE" "$LOCAL_FILE" 2>/dev/null; then
                 pull_success=1
                 break
               fi
-              log_info "  ⏳ SCP重试 $i/$RETRY_TIMES..."
+              echo "$LOG_PREFIX SCP重试 $retry/3..."
               sleep 2
             done
 
             if [ $pull_success -ne 1 ] || [ ! -s "$LOCAL_FILE" ]; then
-              log_info "⚠️ 拉取失败/文件无效"
+              echo "$LOG_PREFIX 拉取失败/文件无效"
               rm -f "$LOCAL_FILE"
               FAILED_NODES+=("$TARGET_HOST (拉取失败)")
               continue
             fi
 
-            verify_backup "$LOCAL_FILE" || {
-              log_info "⚠️ 备份验证失败"
+            echo "$LOG_PREFIX 验证备份文件..."
+            local_size=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo "0")
+            if [ "$local_size" -lt 1024 ]; then
+              echo "$LOG_PREFIX 文件过小: $local_size bytes"
               rm -f "$LOCAL_FILE"
               FAILED_NODES+=("$TARGET_HOST (验证失败)")
               continue
-            }
-
-            echo -e "\n$LOG_PREFIX 🗑️ 拉取成功，执行拉取即删：删除远程文件"
-            retry_ssh "sshpass -p '$SSH_PASS' ssh -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=5 '$SSH_USER@$TARGET_IP' \"sudo rm -f '$LATEST_FILE'\"" \
-              || log_info "  ⚠️ 远程删除失败（可能已被其他节点删除）"
-
-            echo -e "\n$LOG_PREFIX 🔧 开始解压恢复"
-            if safe_run sudo tar --zstd -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions; then
-              log_info "  ✅ 解压恢复成功"
-            else
-              log_info "  ⚠️ 解压恢复有警告，继续"
             fi
+            echo "$LOG_PREFIX 文件大小正常: $(numfmt --to=iec $local_size)"
 
-            log_info "🔐 修复目录权限..."
-            for dir in $PERSONAL_DATA_DIRS; do
-              [ -d "$dir" ] && safe_run sudo chown -R root:root "$dir"
+            echo ""
+            echo "$LOG_PREFIX 拉取成功，删除远程文件..."
+            for retry in 1 2 3; do
+              sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" \
+                "sudo rm -f '$LATEST_FILE'" 2>/dev/null && break || {
+                echo "$LOG_PREFIX 删除重试 $retry/3..."
+                sleep 1
+              }
             done
 
-            [ -d "/etc/casaos" ]     && safe_run sudo chmod -R 755 /etc/casaos
-            [ -d "/DATA" ]           && safe_run sudo chmod -R 755 /DATA
-            [ -d "/var/lib/casaos" ] && safe_run sudo chmod -R 700 /var/lib/casaos
-            [ -d "/var/lib/docker" ] && safe_run sudo chmod -R 700 /var/lib/docker
+            echo ""
+            echo "$LOG_PREFIX 开始解压恢复"
+            if sudo tar --zstd -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions 2>/dev/null; then
+              echo "$LOG_PREFIX 解压恢复成功"
+            else
+              echo "$LOG_PREFIX 解压恢复有警告，继续"
+            fi
+
+            echo "$LOG_PREFIX 修复目录权限..."
+            for dir in $PERSONAL_DATA_DIRS; do
+              [ -d "$dir" ] && sudo chown -R root:root "$dir" 2>/dev/null || true
+            done
+
+            [ -d "/etc/casaos" ]     && sudo chmod -R 755 /etc/casaos 2>/dev/null || true
+            [ -d "/DATA" ]           && sudo chmod -R 755 /DATA 2>/dev/null || true
+            [ -d "/var/lib/casaos" ] && sudo chmod -R 700 /var/lib/casaos 2>/dev/null || true
+            [ -d "/var/lib/docker" ] && sudo chmod -R 700 /var/lib/docker 2>/dev/null || true
 
             rm -f "$LOCAL_FILE"
 
-            echo -e "\n$LOG_PREFIX 🎉 节点 $TARGET_HOST 恢复成功！"
+            echo ""
+            echo "$LOG_PREFIX 节点 $TARGET_HOST 恢复成功！"
             RESTORE_SUCCESS=1
             break
           done < <(echo "$TARGET_LIST")
 
           if [ ${#FAILED_NODES[@]} -gt 0 ]; then
-            echo -e "\n$LOG_PREFIX ⚠️ 失败节点统计："
+            echo ""
+            echo "$LOG_PREFIX 失败节点统计："
             for node in "${FAILED_NODES[@]}"; do
               echo "  - $node"
             done
           fi
 
           if [ $RESTORE_SUCCESS -ne 1 ]; then
-            echo -e "\n$LOG_PREFIX ❌ 所有节点均失败，纯净启动"
+            echo ""
+            echo "$LOG_PREFIX 所有节点均失败，纯净启动"
             exit 0
           fi
 
-          log_info "✅ 6-恢复流程完成"
-          log_step "6-步骤结束"
+          echo "$LOG_PREFIX 6-恢复流程完成"
+          echo "$LOG_STEP_DIVIDER [日志] 6-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤7: 启动服务
@@ -434,43 +378,39 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 10
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 7-启动 Docker & CasaOS 开始 $LOG_STEP_DIVIDER"
 
-          check_service() {
-            local service=\$1
-            local max_wait=${2:-30}
-            local count=0
-            log_info "🏥 检查服务 $service..."
-            while [ $count -lt $max_wait ]; do
-              if systemctl is-active --quiet "$service"; then
-                log_info "  ✅ $service 运行正常"
-                return 0
-              fi
-              count=$((count + 2))
-              sleep 2
-            done
-            log_info "  ⚠️ $service 未在 ${max_wait}s 内启动"
-            return 1
-          }
+          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
+          sudo mkdir -p /run/docker || true
+          sudo systemctl daemon-reload || true
 
-          log_step "7-启动 Docker & CasaOS 开始"
+          echo "$LOG_PREFIX 启动 Docker 服务..."
+          sudo systemctl enable --now docker containerd || true
 
-          safe_run sudo fuser -k 80/tcp 443/tcp
-          safe_run sudo mkdir -p /run/docker
-          safe_run sudo systemctl daemon-reload
+          echo "$LOG_PREFIX 检查 Docker 服务..."
+          for i in $(seq 1 15); do
+            if systemctl is-active --quiet docker; then
+              echo "$LOG_PREFIX Docker 运行正常"
+              break
+            fi
+            sleep 1
+          done
 
-          log_info "🚀 启动 Docker 服务..."
-          sudo systemctl enable --now docker containerd
-          check_service "docker" 15
+          echo "$LOG_PREFIX 启动 CasaOS 服务..."
+          sudo systemctl enable --now casaos || true
 
-          log_info "🚀 启动 CasaOS 服务..."
-          sudo systemctl enable --now casaos
-          check_service "casaos" 20
+          echo "$LOG_PREFIX 检查 CasaOS 服务..."
+          for i in $(seq 1 20); do
+            if systemctl is-active --quiet casaos; then
+              echo "$LOG_PREFIX CasaOS 运行正常"
+              break
+            fi
+            sleep 1
+          done
 
-          log_info "✅ 7-Docker & CasaOS 启动完成"
-          log_step "7-步骤结束"
+          echo "$LOG_PREFIX 7-Docker & CasaOS 启动完成"
+          echo "$LOG_STEP_DIVIDER [日志] 7-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤8: 稳定运行
@@ -479,49 +419,62 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: ${{ env.TARGET_RUN_MINUTES }}
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
-
-          heartbeat_check() {
-            log_info "💓 心跳检查..."
-            if systemctl is-active --quiet docker; then
-              log_info "  ✅ Docker 正常"
-            else
-              log_info "  ⚠️ Docker 异常"
-            fi
-            if systemctl is-active --quiet casaos; then
-              log_info "  ✅ CasaOS 正常"
-            else
-              log_info "  ⚠️ CasaOS 异常"
-            fi
-          }
-
-          log_step "8-稳定运行 $TARGET_RUN_MINUTES 分钟 开始"
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 8-稳定运行 $TARGET_RUN_MINUTES 分钟 开始 $LOG_STEP_DIVIDER"
 
           RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
-          log_info "总等待秒数：$RUN_SECONDS"
+          echo "$LOG_PREFIX 总等待秒数：$RUN_SECONDS"
 
-          heartbeat_check
+          echo "$LOG_PREFIX 心跳检查..."
+          if systemctl is-active --quiet docker; then
+            echo "$LOG_PREFIX Docker 正常"
+          else
+            echo "$LOG_PREFIX Docker 异常"
+          fi
+          if systemctl is-active --quiet casaos; then
+            echo "$LOG_PREFIX CasaOS 正常"
+          else
+            echo "$LOG_PREFIX CasaOS 异常"
+          fi
 
           ELAPSED=0
           while [ $ELAPSED -lt $RUN_SECONDS ]; do
             sleep 60 &
             WAIT_PID=$!
             MINUTES=$((ELAPSED / 60))
-            log_info "已运行 $MINUTES / $TARGET_RUN_MINUTES 分钟..."
+            echo "$LOG_PREFIX 已运行 $MINUTES / $TARGET_RUN_MINUTES 分钟..."
             wait $WAIT_PID
             ELAPSED=$((ELAPSED + 60))
 
             if [ $((MINUTES % 10)) -eq 0 ] && [ $MINUTES -gt 0 ]; then
-              heartbeat_check
+              echo "$LOG_PREFIX 心跳检查..."
+              if systemctl is-active --quiet docker; then
+                echo "$LOG_PREFIX Docker 正常"
+              else
+                echo "$LOG_PREFIX Docker 异常"
+              fi
+              if systemctl is-active --quiet casaos; then
+                echo "$LOG_PREFIX CasaOS 正常"
+              else
+                echo "$LOG_PREFIX CasaOS 异常"
+              fi
             fi
           done
 
-          heartbeat_check
+          echo "$LOG_PREFIX 心跳检查..."
+          if systemctl is-active --quiet docker; then
+            echo "$LOG_PREFIX Docker 正常"
+          else
+            echo "$LOG_PREFIX Docker 异常"
+          fi
+          if systemctl is-active --quiet casaos; then
+            echo "$LOG_PREFIX CasaOS 正常"
+          else
+            echo "$LOG_PREFIX CasaOS 异常"
+          fi
 
-          log_info "✅ 8-稳定运行完成"
-          log_step "8-步骤结束"
+          echo "$LOG_PREFIX 8-稳定运行完成"
+          echo "$LOG_STEP_DIVIDER [日志] 8-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤9: 停止业务服务
@@ -530,30 +483,27 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 9-停止业务服务（保留Tailscale） 开始 $LOG_STEP_DIVIDER"
 
-          log_step "9-停止业务服务（保留Tailscale） 开始"
+          sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
+          sudo systemctl stop casaos docker containerd 2>/dev/null || true
+          sudo pkill -9 -f "casaos|docker|containerd" 2>/dev/null || true
+          sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid 2>/dev/null || true
 
-          safe_run sudo fuser -k 80/tcp 443/tcp
-          safe_run sudo systemctl stop casaos docker containerd
-          safe_run sudo pkill -9 -f "casaos|docker|containerd"
-          safe_run sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid
-
-          log_info "🔍 验证服务停止状态..."
+          echo "$LOG_PREFIX 验证服务停止状态..."
           for svc in casaos docker containerd; do
             if systemctl is-active --quiet $svc 2>/dev/null; then
-              log_info "  ⚠️ $svc 仍在运行"
+              echo "$LOG_PREFIX $svc 仍在运行"
             else
-              log_info "  ✅ $svc 已停止"
+              echo "$LOG_PREFIX $svc 已停止"
             fi
           done
 
           sync && sleep 2
 
-          log_info "✅ 9-业务服务已停止"
-          log_step "9-步骤结束"
+          echo "$LOG_PREFIX 9-业务服务已停止"
+          echo "$LOG_STEP_DIVIDER [日志] 9-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤10: 本地备份
@@ -562,73 +512,56 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 60
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 10-生成本地全量备份 开始 $LOG_STEP_DIVIDER"
 
-          verify_local_backup() {
-            local file=\$1
-            log_info "🔍 验证本地备份..."
-            local size=$(stat -c%s "$file" 2>/dev/null || echo "0")
-            if [ "$size" -lt 1024 ]; then
-              log_info "  ❌ 文件过小: $size bytes"
-              return 1
-            fi
-            log_info "  ✅ 文件大小正常: $(numfmt --to=iec $size)"
-            return 0
-          }
-
-          log_step "10-生成本地全量备份 开始"
-
-          safe_run sudo mkdir -p "$LOCAL_BACKUP_DIR"
+          sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
 
           IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
           for dir in "${DIR_ARRAY[@]}"; do
-            [ ! -d "$dir" ] && safe_run sudo mkdir -p "$dir"
+            [ ! -d "$dir" ] && sudo mkdir -p "$dir" 2>/dev/null || true
           done
 
-          log_info "📊 统计备份目录大小..."
+          echo "$LOG_PREFIX 统计备份目录大小..."
           TOTAL_SIZE=0
           for dir in "${DIR_ARRAY[@]}"; do
             if [ -d "$dir" ]; then
               DIR_SIZE=$(sudo du -sb "$dir" 2>/dev/null | awk '{print \$1}' || echo "0")
               TOTAL_SIZE=$((TOTAL_SIZE + DIR_SIZE))
-              log_info "  $dir: $(numfmt --to=iec $DIR_SIZE 2>/dev/null || echo "$DIR_SIZE bytes")"
+              echo "$LOG_PREFIX $dir: $(numfmt --to=iec $DIR_SIZE 2>/dev/null || echo "$DIR_SIZE bytes")"
             fi
           done
-          log_info "  📦 总计待备份: $(numfmt --to=iec $TOTAL_SIZE 2>/dev/null || echo "$TOTAL_SIZE bytes")"
+          echo "$LOG_PREFIX 总计待备份: $(numfmt --to=iec $TOTAL_SIZE 2>/dev/null || echo "$TOTAL_SIZE bytes")"
 
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
-          log_info "📁 备份文件：$SNAP_NAME"
+          echo "$LOG_PREFIX 备份文件：$SNAP_NAME"
 
-          log_info "🔨 开始创建备份..."
-          if safe_run sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" -cf "$LOCAL_FILE" \
+          echo "$LOG_PREFIX 开始创建备份..."
+          sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" -cf "$LOCAL_FILE" \
             --ignore-failed-read --preserve-permissions "${DIR_ARRAY[@]}" 2>&1 | \
-            grep -v "tar:" || true; then
-            log_info "  ✅ tar 命令执行完成"
-          fi
+            grep -v "tar:" || true
 
           if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
             FILE_SIZE=$(du -h "$LOCAL_FILE" | cut -f1)
-            log_info "✅ 备份文件已创建 (大小: $FILE_SIZE)"
+            echo "$LOG_PREFIX 备份文件已创建 (大小: $FILE_SIZE)"
 
-            if verify_local_backup "$LOCAL_FILE"; then
-              log_info "✅ 备份完整性验证通过"
-              echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
-              echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
+            local backup_size=$(stat -c%s "$LOCAL_FILE" 2>/dev/null || echo "0")
+            if [ "$backup_size" -lt 1024 ]; then
+              echo "$LOG_PREFIX 文件过小: $backup_size bytes"
             else
-              log_info "⚠️ 备份验证失败，但继续执行"
-              echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
-              echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
+              echo "$LOG_PREFIX 文件大小正常: $(numfmt --to=iec $backup_size)"
+              echo "$LOG_PREFIX 备份完整性验证通过"
             fi
+            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
+            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
           else
-            log_info "❌ 备份文件无效"
+            echo "$LOG_PREFIX 备份文件无效"
             exit 0
           fi
 
-          log_info "✅ 10-备份完成"
-          log_step "10-步骤结束"
+          echo "$LOG_PREFIX 10-备份完成"
+          echo "$LOG_STEP_DIVIDER [日志] 10-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤11: 触发下一轮
@@ -637,76 +570,60 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
-
-          api_retry() {
-            local max_attempts=5
-            local delay=3
-            for ((i=1; i<=max_attempts; i++)); do
-              if eval "\$1"; then
-                return 0
-              fi
-              if [ $i -lt $max_attempts ]; then
-                log_info "  ⏳ API重试 $i/$max_attempts，等待 ${delay}s..."
-                sleep $delay
-                delay=$((delay * 2))
-              fi
-            done
-            return 1
-          }
-
-          log_step "11-带自动校验的续跑触发 开始"
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 11-带自动校验的续跑触发 开始 $LOG_STEP_DIVIDER"
 
           if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
-            log_info "⚠️ 未配置 PAT/REPO，跳过"
+            echo "$LOG_PREFIX 未配置 PAT/REPO，跳过"
             exit 0
           fi
 
           RETRY_DISPATCH_TIMES=5
           DISPATCH_SUCCESS=0
 
-          for ((retry=1; retry<=RETRY_DISPATCH_TIMES; retry++)); do
-            echo -e "\n$LOG_PREFIX 第 $retry 次触发续跑..."
+          for retry in $(seq 1 $RETRY_DISPATCH_TIMES); do
+            echo ""
+            echo "$LOG_PREFIX 第 $retry 次触发续跑..."
 
-            if api_retry "curl -s -f -X POST \
-              -H 'Authorization: token $USER_PAT' \
-              -H 'Content-Type: application/json' \
-              https://api.github.com/repos/$REPO/dispatches \
-              -d '{\"event_type\":\"renew_casaos_snapshot\"}'"; then
-              log_info "  ✅ dispatch 请求成功"
-            else
-              log_info "  ⚠️ dispatch 请求失败"
-            fi
+            for attempt in $(seq 1 5); do
+              if curl -s -f -X POST \
+                -H "Authorization: token $USER_PAT" \
+                -H "Content-Type: application/json" \
+                https://api.github.com/repos/$REPO/dispatches \
+                -d '{"event_type":"renew_casaos_snapshot"}' 2>/dev/null; then
+                echo "$LOG_PREFIX dispatch 请求成功"
+                break
+              fi
+              echo "$LOG_PREFIX API重试 $attempt/5..."
+              sleep 3
+            done
 
             sleep 5
 
-            log_info "🔍 校验是否已有任务在排队/运行..."
+            echo "$LOG_PREFIX 校验是否已有任务在排队/运行..."
             WF_RUN=$(curl -s -H "Authorization: token $USER_PAT" \
               "https://api.github.com/repos/$REPO/actions/runs?per_page=3" \
               | jq -r '.workflow_runs[0] | "\(.status) \(.workflow_id) \(.name)"' 2>/dev/null || echo "error error unknown")
 
             WF_STATUS=$(echo "$WF_RUN" | awk '{print \$1}')
-
-            log_info "  📋 最新运行状态: $WF_STATUS"
+            echo "$LOG_PREFIX 最新运行状态: $WF_STATUS"
 
             if [ "$WF_STATUS" = "queued" ] || [ "$WF_STATUS" = "in_progress" ]; then
-              log_info "✅ 续跑校验成功！当前任务状态：$WF_STATUS"
+              echo "$LOG_PREFIX 续跑校验成功！当前任务状态：$WF_STATUS"
               DISPATCH_SUCCESS=1
               break
             fi
 
-            log_info "第 $retry 次未检测到有效任务，5秒后重试..."
+            echo "$LOG_PREFIX 第 $retry 次未检测到有效任务，5秒后重试..."
           done
 
           if [ $DISPATCH_SUCCESS -eq 1 ]; then
-            log_info "🎉 续跑最终确认成功！"
+            echo "$LOG_PREFIX 续跑最终确认成功！"
           else
-            log_info "❌ 重试 $RETRY_DISPATCH_TIMES 次仍未成功"
+            echo "$LOG_PREFIX 重试 $RETRY_DISPATCH_TIMES 次仍未成功"
           fi
 
-          log_step "11-步骤结束"
+          echo "$LOG_STEP_DIVIDER [日志] 11-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤12: 轮询等待删除
@@ -715,61 +632,59 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 1440
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
-
-          log_step "12-备份移入/aaa + 无限轮询删除 开始"
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 12-备份移入/aaa + 无限轮询删除 开始 $LOG_STEP_DIVIDER"
 
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
-            log_info "ℹ️ 无备份文件，跳过"
+            echo "$LOG_PREFIX 无备份文件，跳过"
             exit 0
           fi
 
-          safe_run sudo mkdir -p "$LOCAL_AAA_DIR"
+          sudo mkdir -p "$LOCAL_AAA_DIR" || true
           TARGET_FILE="$LOCAL_AAA_DIR/$SNAP_NAME"
 
-          log_info "📦 移动备份文件到 $LOCAL_AAA_DIR"
-          if safe_run sudo mv -v "$BACKUP_FILE" "$TARGET_FILE"; then
-            log_info "  ✅ 文件移动成功"
+          echo "$LOG_PREFIX 移动备份文件到 $LOCAL_AAA_DIR"
+          if sudo mv -v "$BACKUP_FILE" "$TARGET_FILE" 2>/dev/null; then
+            echo "$LOG_PREFIX 文件移动成功"
           else
-            log_info "  ❌ 文件移动失败"
+            echo "$LOG_PREFIX 文件移动失败"
             exit 0
           fi
 
           if [ ! -f "$TARGET_FILE" ]; then
-            log_info "❌ 目标文件不存在"
+            echo "$LOG_PREFIX 目标文件不存在"
             exit 0
           fi
 
           FILE_SIZE=$(stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
-          log_info "📁 监控文件: $SNAP_NAME ($(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE bytes"))"
+          echo "$LOG_PREFIX 监控文件: $SNAP_NAME ($(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE bytes"))"
 
-          echo -e "\n$LOG_PREFIX ⌛ 无限轮询：文件被删除即退出，进入下一轮"
+          echo ""
+          echo "$LOG_PREFIX 无限轮询：文件被删除即退出，进入下一轮"
 
           POLL_COUNT=0
           LAST_SIZE=$FILE_SIZE
           while true; do
             if [ ! -f "$TARGET_FILE" ]; then
-              log_info "🎉 文件已被拉取删除，退出轮询"
-              log_info "📊 总轮询次数: $POLL_COUNT"
+              echo "$LOG_PREFIX 文件已被拉取删除，退出轮询"
+              echo "$LOG_PREFIX 总轮询次数: $POLL_COUNT"
               break
             fi
 
             CURRENT_SIZE=$(stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
 
             if [ "$CURRENT_SIZE" != "$LAST_SIZE" ]; then
-              log_info "📝 文件大小变化: $(numfmt --to=iec $LAST_SIZE) → $(numfmt --to=iec $CURRENT_SIZE)"
+              echo "$LOG_PREFIX 文件大小变化: $(numfmt --to=iec $LAST_SIZE) -> $(numfmt --to=iec $CURRENT_SIZE)"
               LAST_SIZE=$CURRENT_SIZE
             fi
 
-            log_info "⏳ 等待中... ($POLL_COUNT次, $(numfmt --to=iec $CURRENT_SIZE))"
+            echo "$LOG_PREFIX 等待中... ($POLL_COUNT次, $(numfmt --to=iec $CURRENT_SIZE))"
             sleep $POLL_INTERVAL
             POLL_COUNT=$((POLL_COUNT + 1))
           done
 
-          log_info "✅ 12-轮询结束"
-          log_step "12-步骤结束"
+          echo "$LOG_PREFIX 12-轮询结束"
+          echo "$LOG_STEP_DIVIDER [日志] 12-步骤结束 $LOG_STEP_DIVIDER"
 
       # ============================================================
       # 步骤13: 最终清理
@@ -778,30 +693,27 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
-          log_info() { echo "$LOG_PREFIX \$1"; }
-          log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
-          safe_run() { "$@" 2>/dev/null || true; }
+          set -e
+          echo "$LOG_STEP_DIVIDER [日志] 13-最终清理 + 关闭Tailscale 开始 $LOG_STEP_DIVIDER"
 
-          log_step "13-最终清理 + 关闭Tailscale 开始"
-
-          log_info "🔌 停止 Tailscale..."
-          safe_run sudo systemctl stop tailscaled
-          safe_run sudo pkill -9 -f "tailscaled"
+          echo "$LOG_PREFIX 停止 Tailscale..."
+          sudo systemctl stop tailscaled 2>/dev/null || true
+          sudo pkill -9 -f "tailscaled" 2>/dev/null || true
 
           if systemctl is-active --quiet tailscaled 2>/dev/null; then
-            log_info "  ⚠️ Tailscale 仍在运行"
+            echo "$LOG_PREFIX Tailscale 仍在运行"
           else
-            log_info "  ✅ Tailscale 已停止"
+            echo "$LOG_PREFIX Tailscale 已停止"
           fi
 
-          log_info "🧹 清理临时文件..."
-          safe_run sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/*
-          safe_run sudo rm -f /etc/sudoers.d/root
+          echo "$LOG_PREFIX 清理临时文件..."
+          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
+          sudo rm -f /etc/sudoers.d/root 2>/dev/null || true
 
-          log_info "📦 清理 apt 缓存..."
-          safe_run sudo apt autoremove -y -qq
-          safe_run sudo apt clean -y -qq
+          echo "$LOG_PREFIX 清理 apt 缓存..."
+          sudo apt autoremove -y -qq 2>/dev/null || true
+          sudo apt clean -y -qq 2>/dev/null || true
 
-          log_info "✅ 13-清理完成，Tailscale 已关闭"
-          log_info "🎉 全流程正常结束"
-          log_step "13-步骤结束"
+          echo "$LOG_PREFIX 13-清理完成，Tailscale 已关闭"
+          echo "$LOG_PREFIX 全流程正常结束"
+          echo "$LOG_STEP_DIVIDER [日志] 13-步骤结束 $LOG_STEP_DIVIDER"
