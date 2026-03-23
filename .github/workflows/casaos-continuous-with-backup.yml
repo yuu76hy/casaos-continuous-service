@@ -138,7 +138,7 @@ jobs:
           fi
           echo "$LOG_PREFIX 5-Tailscale组网完成"
 
-      - name: 6-拉取备份恢复
+      - name: 6-拉取备份恢复（含主动清内存）
         run: |
           echo "$LOG_PREFIX === 6-拉取备份开始 ==="
           
@@ -159,7 +159,14 @@ jobs:
             else
               echo "$LOG_PREFIX 发现节点: $TARGET_LIST"
               sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
+              sleep 2
+              
+              # 主动清内存，避免OOM
+              sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 2>/dev/null || true
+              sleep 2
+              
               sudo systemctl stop docker containerd casaos 2>/dev/null || true
+              sleep 2
               sudo pkill -9 -f "casaos|docker|containerd" 2>/dev/null || true
               sync && sleep 2
               
@@ -227,13 +234,19 @@ jobs:
         run: |
           echo "$LOG_PREFIX === 9-停止服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
+          sleep 2
+          
+          # 主动清内存
+          sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 2>/dev/null || true
+          sleep 2
+          
           sudo systemctl stop casaos docker containerd 2>/dev/null || true
           sudo pkill -9 -f "casaos" 2>/dev/null || true
           sudo pkill -9 -f "docker" 2>/dev/null || true
           sudo pkill -9 -f "containerd" 2>/dev/null || true
           echo "$LOG_PREFIX 9-停止服务完成"
 
-      - name: 10-本地备份
+      - name: 10-本地备份（含主动清内存）
         run: |
           echo "$LOG_PREFIX === 10-本地备份开始 ==="
           mkdir -p "$LOCAL_BACKUP_DIR" || true
@@ -246,6 +259,10 @@ jobs:
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
           echo "$LOG_PREFIX 备份文件: $SNAP_NAME"
+          
+          # 备份前清内存
+          sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 2>/dev/null || true
+          sleep 2
           
           sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" -cf "$LOCAL_FILE" \
             --ignore-failed-read --preserve-permissions "${DIR_ARRAY[@]}" 2>&1 | grep -v "tar:" || true
