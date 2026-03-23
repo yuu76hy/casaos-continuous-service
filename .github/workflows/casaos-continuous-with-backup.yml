@@ -21,29 +21,6 @@ on:
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
-# ============================================================
-# 全局配置
-# ============================================================
-env:
-  # 核心配置 (可在此处修改)
-  TARGET_RUN_MINUTES: 300
-  RETRY_TIMES: 3
-  ZSTD_COMPRESS_LEVEL: 3
-  POLL_INTERVAL: 60
-
-  # 路径配置
-  PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
-  REMOTE_BACKUP_BASE: "/aaa"
-  LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
-  LOCAL_AAA_DIR: "/aaa"
-
-  # SSH配置
-  SSH_USER: "root"
-
-  # 日志配置
-  LOG_PREFIX: "[日志]"
-  LOG_STEP_DIVIDER: "====="
-
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
@@ -54,15 +31,15 @@ jobs:
       REPO: ${{ secrets.REPO }}
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
-      TARGET_RUN_MINUTES: ${{ env.TARGET_RUN_MINUTES }}
-      RETRY_TIMES: ${{ env.RETRY_TIMES }}
-      ZSTD_COMPRESS_LEVEL: ${{ env.ZSTD_COMPRESS_LEVEL }}
-      POLL_INTERVAL: ${{ env.POLL_INTERVAL }}
-      PERSONAL_DATA_DIRS: ${{ env.PERSONAL_DATA_DIRS }}
-      REMOTE_BACKUP_BASE: ${{ env.REMOTE_BACKUP_BASE }}
-      LOCAL_BACKUP_DIR: ${{ env.LOCAL_BACKUP_DIR }}
-      LOCAL_AAA_DIR: ${{ env.LOCAL_AAA_DIR }}
-      SSH_USER: ${{ env.SSH_USER }}
+      TARGET_RUN_MINUTES: 300
+      RETRY_TIMES: 3
+      ZSTD_COMPRESS_LEVEL: 3
+      POLL_INTERVAL: 60
+      PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
+      REMOTE_BACKUP_BASE: "/aaa"
+      LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
+      LOCAL_AAA_DIR: "/aaa"
+      SSH_USER: "root"
       LOG_PREFIX: "[日志]"
       LOG_STEP_DIVIDER: "====="
 
@@ -74,27 +51,18 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 10
         run: |
-          # ---------------- 工具函数 ----------------
           log_info() { echo "$LOG_PREFIX \$1"; }
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
-          check_timeout() {
-            if [ -n "$STEPPER_TIMEOUT_MINUTES" ]; then
-              log_info "⏱️ 步骤超时检查：${STEPPER_TIMEOUT_MINUTES}分钟"
-            fi
-          }
 
           log_step "1-系统初始化+全域深度清理 开始"
-          check_timeout
 
-          # 安装必要工具 (带超时保护)
+          # 安装必要工具
           safe_run sudo apt update -y -qq &
           APT_PID=$!
-
           safe_run sudo apt install -y \
             curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq &
           INSTALL_PID=$!
-
           wait $APT_PID $INSTALL_PID
 
           # 清理缓存和临时文件
@@ -106,7 +74,6 @@ jobs:
 
           safe_run sudo rm -rf /tmp/* /var/tmp/* \
             ~/.cache/* /root/.cache/* /var/cache/apt/* &
-
           wait
 
           # 清理apt
@@ -115,16 +82,6 @@ jobs:
 
           # 启用SSH
           safe_run sudo systemctl enable --now ssh
-
-          # 验证关键工具可用
-          log_info "🔍 验证关键工具..."
-          for tool in curl jq tar sshpass; do
-            if command -v $tool &>/dev/null; then
-              log_info "  ✅ $tool 可用"
-            else
-              log_info "  ⚠️ $tool 不可用"
-            fi
-          done
 
           log_info "✅ 1-系统初始化+深度清理完成"
           log_step "1-步骤结束"
@@ -144,13 +101,11 @@ jobs:
 
           export DEBIAN_FRONTEND=noninteractive
           safe_run curl -fsSL https://get.docker.com | sudo bash
-
           safe_run sudo systemctl enable docker containerd
           safe_run sudo systemctl stop docker containerd
 
-          # 验证安装
           DOCKER_VER=$(docker --version 2>/dev/null || echo "未安装")
-          log_info "🐳 Docker 版本: $DOCKER_VER"
+          log_info "Docker 版本: $DOCKER_VER"
           safe_run sudo usermod -aG docker runner
 
           log_info "✅ 2-Docker 安装完成"
@@ -183,33 +138,23 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
-          # ---------------- 配置 ----------------
           USER_NAME="$SSH_USER"
-
-          # ---------------- 工具函数 ----------------
           log_info() { echo "$LOG_PREFIX \$1"; }
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           die() { echo "$LOG_PREFIX ❌ \$1"; exit 0; }
 
           log_step "4-配置管理员用户 $USER_NAME 开始"
 
-          # 检查密码配置
           if [ -z "$SSH_PASS" ]; then
             die "错误：ROOTS_PASSWORD 未配置，退出本步骤"
           fi
 
-          # 创建用户或更新密码
           id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME"
           echo "$USER_NAME:$SSH_PASS" | sudo chpasswd
-
-          # 配置sudo权限
           echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null
           sudo chmod 0440 /etc/sudoers.d/"$USER_NAME"
-
-          # 添加到docker组
           sudo usermod -aG docker "$USER_NAME"
 
-          # 配置SSH (支持密码登录)
           SSH_CONF="/etc/ssh/sshd_config"
           safe_run sudo sed -i \
             -e 's/^#*PermitRootLogin.*/PermitRootLogin yes/' \
@@ -218,14 +163,6 @@ jobs:
             $SSH_CONF
 
           sudo systemctl restart ssh
-
-          # 验证SSH配置
-          log_info "🔍 验证SSH配置..."
-          if systemctl is-active --quiet ssh; then
-            log_info "  ✅ SSH 服务运行正常"
-          else
-            log_info "  ⚠️ SSH 服务可能未正常运行"
-          fi
 
           log_info "✅ 4-管理员用户 & SSH 配置完成"
           log_step "4-步骤结束"
@@ -237,11 +174,9 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 5
         run: |
-          # ---------------- 配置 ----------------
           TS_SUFFIX=$((RANDOM % 1000))
           TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
 
-          # ---------------- 工具函数 ----------------
           log_info() { echo "$LOG_PREFIX \$1"; }
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
@@ -256,7 +191,7 @@ jobs:
               if [ $i -lt $max_attempts ]; then
                 log_info "  ⏳ 重试 $i/$max_attempts，等待 ${delay}s..."
                 sleep $delay
-                delay=$((delay * 2))  # 指数退避
+                delay=$((delay * 2))
               fi
             done
             return 1
@@ -264,38 +199,29 @@ jobs:
 
           log_step "5-Tailscale组网 + 显示本机信息 开始"
 
-          # 检查Tailscale配置
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             log_info "⚠️ Tailscale 未配置，跳过组网"
             exit 0
           fi
 
-          # 安装Tailscale (带重试)
           log_info "🔧 安装 Tailscale..."
           retry_with_backoff 3 2 "curl -fsSL https://tailscale.com/install.sh | sudo bash"
 
-          # 启动Tailscale
           log_info "🚀 启动 Tailscale 服务..."
           safe_run sudo systemctl enable --now tailscaled
           sleep 2
 
-          # 连接组网 (带重试)
           log_info "🔗 连接 Tailscale 网络 (主机名: ${TS_HOSTNAME})..."
           retry_with_backoff 3 3 "sudo tailscale up \
             --authkey='$TAILSCALE_AUTH_KEY' \
             --hostname='$TS_HOSTNAME' \
             --accept-routes --reset"
 
-          # 显示IP信息
-          echo -e "\n$LOG_PREFIX === 🖥️ 本机 IP 信息 ==="
+          echo -e "\n$LOG_PREFIX === 本机 IP 信息 ==="
           LOCAL_IP=$(hostname -I | awk '{print \$1}')
           TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
           log_info "物理内网IP: $LOCAL_IP"
           log_info "Tailscale内网IP: $TAILSCALE_IP"
-
-          # 验证连接状态
-          TS_STATE=$(sudo tailscale status --self --json 2>/dev/null | jq -r '.BackendState' || echo "未知")
-          log_info "Tailscale 状态: $TS_STATE"
           echo "===================================\n"
 
           log_info "✅ 5-Tailscale 组网上线完成"
@@ -308,12 +234,10 @@ jobs:
         if: ${{ always() }}
         timeout-minutes: 30
         run: |
-          # ---------------- 工具函数 ----------------
           log_info() { echo "$LOG_PREFIX \$1"; }
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
 
-          # 增强重试函数 (指数退避)
           retry_ssh() {
             local retries=$RETRY_TIMES
             local delay=1
@@ -330,7 +254,6 @@ jobs:
             return 1
           }
 
-          # 节点健康检查
           check_node_health() {
             local ip=\$1
             local timeout=5
@@ -344,12 +267,9 @@ jobs:
             fi
           }
 
-          # 备份校验函数
           verify_backup() {
             local file=\$1
             log_info "🔍 验证备份文件..."
-
-            # 只检查文件大小
             local size=$(stat -c%s "$file" 2>/dev/null || echo "0")
             if [ "$size" -lt 1024 ]; then
               log_info "  ❌ 文件过小: $size bytes"
@@ -361,20 +281,17 @@ jobs:
 
           log_step "6-多节点尝试拉取备份（拉取即删） 开始"
 
-          # 检查配置
           if [ -z "$TAILSCALE_AUTH_KEY" ] || [ -z "$SSH_PASS" ]; then
             log_info "ℹ️ 未配置 Tailscale/SSH，纯净启动"
             exit 0
           fi
 
-          # 获取Tailscale状态
           TS_STATUS=$(sudo tailscale status --json 2>/dev/null || echo '{"Peer":[]}')
           SELF_ID=$(echo "$TS_STATUS" | jq -r '.Self.ID // empty')
           SELF_HOSTNAME=$(echo "$TS_STATUS" | jq -r '.Self.HostName // empty')
           log_info "本机 Tailscale ID: $SELF_ID"
           log_info "本机 Tailscale 主机名: $SELF_HOSTNAME"
 
-          # 筛选目标节点 (按主机名排序，增加确定性)
           TARGET_LIST=$(echo "$TS_STATUS" | jq -r --arg self "$SELF_ID" '
             .Peer[] |
             select(.Online == true) |
@@ -393,7 +310,6 @@ jobs:
             echo "  - 设备：$h ｜ IP：$ip ｜ 在线：$online"
           done
 
-          # 停止服务准备恢复
           echo -e "\n$LOG_PREFIX 停止 Docker/CasaOS 以安全恢复..."
           safe_run sudo fuser -k 80/tcp 443/tcp
           safe_run sudo systemctl stop docker containerd casaos
@@ -404,7 +320,6 @@ jobs:
           safe_run sudo mkdir -p "$LOCAL_BACKUP_DIR"
           safe_run sudo chmod 777 "$LOCAL_BACKUP_DIR"
 
-          # ---------------- 逐节点尝试恢复 ----------------
           RESTORE_SUCCESS=0
           FAILED_NODES=()
           while IFS='|' read -r TARGET_HOST TARGET_IP TARGET_ONLINE; do
@@ -412,14 +327,12 @@ jobs:
             echo "$LOG_PREFIX 🎯 尝试节点：$TARGET_HOST | $TARGET_IP"
             echo "==========================================================="
 
-            # 健康检查
             check_node_health "$TARGET_IP" || {
               log_info "⚠️ 节点 $TARGET_HOST 健康检查失败，跳过"
               FAILED_NODES+=("$TARGET_HOST")
               continue
             }
 
-            # 查找最新备份
             LATEST_FILE=""
             if retry_ssh "sshpass -p '$SSH_PASS' ssh -o StrictHostKeyChecking=no \
               -o ConnectTimeout=5 -o ServerAliveInterval=10 \
@@ -437,13 +350,11 @@ jobs:
 
             log_info "📋 发现备份: $LATEST_FILE"
 
-            # 获取远程文件大小
             REMOTE_SIZE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no \
               -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" \
               "stat -c%s '$LATEST_FILE' 2>/dev/null" || echo "0")
             log_info "📦 远程文件大小: $(numfmt --to=iec $REMOTE_SIZE 2>/dev/null || echo "$REMOTE_SIZE bytes")"
 
-            # 拉取备份文件 (带重试)
             LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
             pull_success=0
 
@@ -465,7 +376,6 @@ jobs:
               continue
             fi
 
-            # 验证备份
             verify_backup "$LOCAL_FILE" || {
               log_info "⚠️ 备份验证失败"
               rm -f "$LOCAL_FILE"
@@ -473,13 +383,11 @@ jobs:
               continue
             }
 
-            # 删除远程文件 (拉取即删)
             echo -e "\n$LOG_PREFIX 🗑️ 拉取成功，执行拉取即删：删除远程文件"
             retry_ssh "sshpass -p '$SSH_PASS' ssh -o StrictHostKeyChecking=no \
               -o ConnectTimeout=5 '$SSH_USER@$TARGET_IP' \"sudo rm -f '$LATEST_FILE'\"" \
               || log_info "  ⚠️ 远程删除失败（可能已被其他节点删除）"
 
-            # 恢复备份
             echo -e "\n$LOG_PREFIX 🔧 开始解压恢复"
             if safe_run sudo tar --zstd -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions; then
               log_info "  ✅ 解压恢复成功"
@@ -487,7 +395,6 @@ jobs:
               log_info "  ⚠️ 解压恢复有警告，继续"
             fi
 
-            # 修复权限
             log_info "🔐 修复目录权限..."
             for dir in $PERSONAL_DATA_DIRS; do
               [ -d "$dir" ] && safe_run sudo chown -R root:root "$dir"
@@ -498,7 +405,6 @@ jobs:
             [ -d "/var/lib/casaos" ] && safe_run sudo chmod -R 700 /var/lib/casaos
             [ -d "/var/lib/docker" ] && safe_run sudo chmod -R 700 /var/lib/docker
 
-            # 清理本地临时文件
             rm -f "$LOCAL_FILE"
 
             echo -e "\n$LOG_PREFIX 🎉 节点 $TARGET_HOST 恢复成功！"
@@ -506,7 +412,6 @@ jobs:
             break
           done < <(echo "$TARGET_LIST")
 
-          # 报告失败节点
           if [ ${#FAILED_NODES[@]} -gt 0 ]; then
             echo -e "\n$LOG_PREFIX ⚠️ 失败节点统计："
             for node in "${FAILED_NODES[@]}"; do
@@ -533,7 +438,6 @@ jobs:
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
 
-          # 服务健康检查
           check_service() {
             local service=\$1
             local max_wait=${2:-30}
@@ -557,12 +461,10 @@ jobs:
           safe_run sudo mkdir -p /run/docker
           safe_run sudo systemctl daemon-reload
 
-          # 启动Docker
           log_info "🚀 启动 Docker 服务..."
           sudo systemctl enable --now docker containerd
           check_service "docker" 15
 
-          # 启动CasaOS
           log_info "🚀 启动 CasaOS 服务..."
           sudo systemctl enable --now casaos
           check_service "casaos" 20
@@ -581,34 +483,17 @@ jobs:
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
 
-          # 心跳检查函数
           heartbeat_check() {
             log_info "💓 心跳检查..."
-
-            # 检查Docker
             if systemctl is-active --quiet docker; then
               log_info "  ✅ Docker 正常"
             else
               log_info "  ⚠️ Docker 异常"
             fi
-
-            # 检查CasaOS
             if systemctl is-active --quiet casaos; then
               log_info "  ✅ CasaOS 正常"
             else
               log_info "  ⚠️ CasaOS 异常"
-            fi
-
-            # 检查端口
-            if command -v lsof &>/dev/null; then
-              HTTP_PORT=$(lsof -i :80 -t 2>/dev/null || echo "")
-              HTTPS_PORT=$(lsof -i :443 -t 2>/dev/null || echo "")
-              if [ -n "$HTTP_PORT" ]; then
-                log_info "  ✅ HTTP 端口(80) 占用"
-              fi
-              if [ -n "$HTTPS_PORT" ]; then
-                log_info "  ✅ HTTPS 端口(443) 占用"
-              fi
             fi
           }
 
@@ -617,10 +502,8 @@ jobs:
           RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
           log_info "总等待秒数：$RUN_SECONDS"
 
-          # 初始检查
           heartbeat_check
 
-          # 进度显示
           ELAPSED=0
           while [ $ELAPSED -lt $RUN_SECONDS ]; do
             sleep 60 &
@@ -630,13 +513,11 @@ jobs:
             wait $WAIT_PID
             ELAPSED=$((ELAPSED + 60))
 
-            # 每10分钟心跳检查
             if [ $((MINUTES % 10)) -eq 0 ] && [ $MINUTES -gt 0 ]; then
               heartbeat_check
             fi
           done
 
-          # 最终检查
           heartbeat_check
 
           log_info "✅ 8-稳定运行完成"
@@ -660,7 +541,6 @@ jobs:
           safe_run sudo pkill -9 -f "casaos|docker|containerd"
           safe_run sudo rm -f /var/run/docker.pid /var/run/docker.sock.lock /var/run/containerd.pid
 
-          # 验证停止
           log_info "🔍 验证服务停止状态..."
           for svc in casaos docker containerd; do
             if systemctl is-active --quiet $svc 2>/dev/null; then
@@ -686,12 +566,9 @@ jobs:
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
 
-          # 备份校验
           verify_local_backup() {
             local file=\$1
             log_info "🔍 验证本地备份..."
-
-            # 只检查文件大小
             local size=$(stat -c%s "$file" 2>/dev/null || echo "0")
             if [ "$size" -lt 1024 ]; then
               log_info "  ❌ 文件过小: $size bytes"
@@ -705,13 +582,11 @@ jobs:
 
           safe_run sudo mkdir -p "$LOCAL_BACKUP_DIR"
 
-          # 确保目录存在
           IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
           for dir in "${DIR_ARRAY[@]}"; do
             [ ! -d "$dir" ] && safe_run sudo mkdir -p "$dir"
           done
 
-          # 计算备份前大小
           log_info "📊 统计备份目录大小..."
           TOTAL_SIZE=0
           for dir in "${DIR_ARRAY[@]}"; do
@@ -723,12 +598,10 @@ jobs:
           done
           log_info "  📦 总计待备份: $(numfmt --to=iec $TOTAL_SIZE 2>/dev/null || echo "$TOTAL_SIZE bytes")"
 
-          # 生成备份文件名
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
           log_info "📁 备份文件：$SNAP_NAME"
 
-          # 创建备份
           log_info "🔨 开始创建备份..."
           if safe_run sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" -cf "$LOCAL_FILE" \
             --ignore-failed-read --preserve-permissions "${DIR_ARRAY[@]}" 2>&1 | \
@@ -736,12 +609,10 @@ jobs:
             log_info "  ✅ tar 命令执行完成"
           fi
 
-          # 验证备份
           if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
             FILE_SIZE=$(du -h "$LOCAL_FILE" | cut -f1)
             log_info "✅ 备份文件已创建 (大小: $FILE_SIZE)"
 
-            # 验证备份
             if verify_local_backup "$LOCAL_FILE"; then
               log_info "✅ 备份完整性验证通过"
               echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
@@ -770,7 +641,6 @@ jobs:
           log_step() { echo "$LOG_STEP_DIVIDER [日志] \$1 $LOG_STEP_DIVIDER"; }
           safe_run() { "$@" 2>/dev/null || true; }
 
-          # 带退避的API重试
           api_retry() {
             local max_attempts=5
             local delay=3
@@ -795,13 +665,11 @@ jobs:
           fi
 
           RETRY_DISPATCH_TIMES=5
-          WORKFLOW_NAME="CasaOS纯净部署（Tailscale内网版 /aaa目录 拉取即删 无限检测删除）"
           DISPATCH_SUCCESS=0
 
           for ((retry=1; retry<=RETRY_DISPATCH_TIMES; retry++)); do
             echo -e "\n$LOG_PREFIX 第 $retry 次触发续跑..."
 
-            # 触发dispatch
             if api_retry "curl -s -f -X POST \
               -H 'Authorization: token $USER_PAT' \
               -H 'Content-Type: application/json' \
@@ -814,17 +682,14 @@ jobs:
 
             sleep 5
 
-            # 校验触发结果
             log_info "🔍 校验是否已有任务在排队/运行..."
             WF_RUN=$(curl -s -H "Authorization: token $USER_PAT" \
               "https://api.github.com/repos/$REPO/actions/runs?per_page=3" \
               | jq -r '.workflow_runs[0] | "\(.status) \(.workflow_id) \(.name)"' 2>/dev/null || echo "error error unknown")
 
             WF_STATUS=$(echo "$WF_RUN" | awk '{print \$1}')
-            WF_ID=$(echo "$WF_RUN" | awk '{print \$2}')
-            WF_NAME=$(echo "$WF_RUN" | awk '{print \$3}')
 
-            log_info "  📋 最新运行: $WF_NAME (ID: $WF_ID, 状态: $WF_STATUS)"
+            log_info "  📋 最新运行状态: $WF_STATUS"
 
             if [ "$WF_STATUS" = "queued" ] || [ "$WF_STATUS" = "in_progress" ]; then
               log_info "✅ 续跑校验成功！当前任务状态：$WF_STATUS"
@@ -872,7 +737,6 @@ jobs:
             exit 0
           fi
 
-          # 验证文件存在
           if [ ! -f "$TARGET_FILE" ]; then
             log_info "❌ 目标文件不存在"
             exit 0
@@ -893,9 +757,7 @@ jobs:
             fi
 
             CURRENT_SIZE=$(stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
-            CURRENT_MTIME=$(stat -c%Y "$TARGET_FILE" 2>/dev/null || echo "0")
 
-            # 检测文件变化
             if [ "$CURRENT_SIZE" != "$LAST_SIZE" ]; then
               log_info "📝 文件大小变化: $(numfmt --to=iec $LAST_SIZE) → $(numfmt --to=iec $CURRENT_SIZE)"
               LAST_SIZE=$CURRENT_SIZE
@@ -922,24 +784,20 @@ jobs:
 
           log_step "13-最终清理 + 关闭Tailscale 开始"
 
-          # 停止Tailscale
           log_info "🔌 停止 Tailscale..."
           safe_run sudo systemctl stop tailscaled
           safe_run sudo pkill -9 -f "tailscaled"
 
-          # 验证Tailscale已停止
           if systemctl is-active --quiet tailscaled 2>/dev/null; then
             log_info "  ⚠️ Tailscale 仍在运行"
           else
             log_info "  ✅ Tailscale 已停止"
           fi
 
-          # 清理文件
           log_info "🧹 清理临时文件..."
           safe_run sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/*
           safe_run sudo rm -f /etc/sudoers.d/root
 
-          # 清理apt
           log_info "📦 清理 apt 缓存..."
           safe_run sudo apt autoremove -y -qq
           safe_run sudo apt clean -y -qq
