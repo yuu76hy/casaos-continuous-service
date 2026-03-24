@@ -9,7 +9,7 @@ env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 3
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 1  # 这里改成 1 分钟
+  TARGET_RUN_MINUTES: 1
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -139,7 +139,7 @@ jobs:
           fi
           echo "$LOG_PREFIX 5-Tailscale组网完成"
 
-      - name: 6-拉取备份恢复（含主机名调试日志）
+      - name: 6-拉取备份恢复（双bug修复版）
         run: |
           echo "$LOG_PREFIX === 6-拉取备份开始 ==="
           
@@ -167,11 +167,18 @@ jobs:
               echo "$LOG_PREFIX 发现节点: $TARGET_LIST"
               sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
               sudo systemctl stop docker containerd casaos 2>/dev/null || true
-              sudo pkill -9 -f "casaos|docker|containerd" 2>/dev/null || true
+              # 修复1：拆分pkill，避免被系统杀死
+              sudo pkill -9 -f "casaos" 2>/dev/null || true
+              sudo pkill -9 -f "docker" 2>/dev/null || true
+              sudo pkill -9 -f "containerd" 2>/dev/null || true
               sync && sleep 2
               
-              echo "$TARGET_LIST" | while IFS='/' read -r HOST IP; do
+              echo "$TARGET_LIST" | while IFS= read -r line; do
+                # 修复2：处理双斜杠，正确分割主机名和IP，解决IP多斜杠问题
+                HOST=$(echo "$line" | cut -d'/' -f1)
+                IP=$(echo "$line" | cut -d'/' -f3)
                 echo "$LOG_PREFIX 尝试节点: $HOST ($IP)"
+                
                 LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
                   "$SSH_USER@$IP" "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.zst 2>/dev/null | head -1" 2>/dev/null || true)
                 
@@ -294,7 +301,7 @@ jobs:
             
             if [ -f "$TARGET_FILE" ]; then
               FILE_SIZE=$(sudo stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
-              echo "$LOG_PREFIX 监控文件: $SNAP_NAME ($(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE bytes"))"
+              echo "$LOG_PREFIX 监控文件: $SNAP ($(numfmt --to=iec $FILE_SIZE 2>/dev/null || echo "$FILE_SIZE bytes"))"
               echo "$LOG_PREFIX 无限轮询等待删除..."
               
               POLL_COUNT=0
