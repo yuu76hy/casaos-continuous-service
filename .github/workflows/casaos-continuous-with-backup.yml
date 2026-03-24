@@ -9,7 +9,7 @@ env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 1
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 10  # 已改回 10 分钟
+  TARGET_RUN_MINUTES: 10
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -245,30 +245,34 @@ jobs:
           sudo pkill -9 -f "containerd" 2>/dev/null || true
           echo "$LOG_PREFIX 9-停止服务完成"
 
-      - name: 10-本地备份（多线程 + 最快压缩）
+      - name: 10-本地全量备份（tar.zst 最快压缩 + 多线程 + 容错）
+        if: ${{ always() }}
         run: |
-          echo "$LOG_PREFIX === 10-本地备份开始 ==="
-          mkdir -p "$LOCAL_BACKUP_DIR" || true
-          
+          set +e
+          echo "===== [日志] 10-生成本地全量备份 开始 ====="
+          sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
           IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
           for dir in "${DIR_ARRAY[@]}"; do
-            [ ! -d "$dir" ] && mkdir -p "$dir" 2>/dev/null || true
+            [ ! -d "$dir" ] && sudo mkdir -p "$dir" || true
           done
-          
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
-          echo "$LOG_PREFIX 备份文件: $SNAP_NAME"
+          echo "[日志] 备份文件：$SNAP_NAME"
           
           sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" -cf "$LOCAL_FILE" \
-            --ignore-failed-read --preserve-permissions "${DIR_ARRAY[@]}" 2>&1 | grep -v "tar:" || true
+            --ignore-failed-read --preserve-permissions \
+            "${DIR_ARRAY[@]}" || true
           
           if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
             FILE_SIZE=$(du -h "$LOCAL_FILE" | cut -f1)
-            echo "$LOG_PREFIX 备份完成 (大小: $FILE_SIZE)"
-            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV
-            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV
+            echo "[日志] ✅ 备份有效 (大小: $FILE_SIZE)"
+            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV || true
+            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV || true
+          else
+            echo "[日志] ❌ 备份文件无效"
+            exit 0
           fi
-          echo "$LOG_PREFIX 10-本地备份完成"
+          echo "✅ [日志] 10-备份完成"
 
       - name: 11-触发下一轮
         run: |
