@@ -9,7 +9,7 @@ env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 3
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 10
+  TARGET_RUN_MINUTES: 1  # 这里改成 1 分钟
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -134,11 +134,12 @@ jobs:
             TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
             echo "$LOG_PREFIX 物理内网IP: $LOCAL_IP"
             echo "$LOG_PREFIX Tailscale内网IP: $TAILSCALE_IP"
+            echo "$LOG_PREFIX 本机Tailscale主机名: $TS_HOSTNAME"
             echo "================================"
           fi
           echo "$LOG_PREFIX 5-Tailscale组网完成"
 
-      - name: 6-拉取备份恢复（含主动清内存）
+      - name: 6-拉取备份恢复（含主机名调试日志）
         run: |
           echo "$LOG_PREFIX === 6-拉取备份开始 ==="
           
@@ -147,6 +148,9 @@ jobs:
           else
             TS_STATUS=$(sudo tailscale status --json 2>/dev/null || echo '{"Peer":[]}')
             SELF_ID=$(echo "$TS_STATUS" | jq -r '.Self.ID // empty')
+            echo "$LOG_PREFIX 🔍 本机Tailscale ID: $SELF_ID"
+            echo "$LOG_PREFIX 🔍 所有在线Peer列表："
+            echo "$TS_STATUS" | jq -r '.Peer[] | select(.Online == true) | "  ID: \(.ID) | HostName: \(.HostName)"' || echo "  无在线Peer"
             
             TARGET_LIST=$(echo "$TS_STATUS" | jq -r --arg self "$SELF_ID" '
               .Peer[] | select(.Online == true) | select(.ID != $self) |
@@ -154,19 +158,15 @@ jobs:
               "\(.HostName)//\(.TailscaleIPs[0])"
             ' 2>/dev/null || true)
             
+            echo "$LOG_PREFIX 🔍 筛选后目标节点列表："
             if [ -z "$TARGET_LIST" ]; then
+              echo "  无符合条件的CasaOS节点"
               echo "$LOG_PREFIX 未找到符合条件节点，纯净启动"
             else
+              echo "$TARGET_LIST" | while IFS= read -r line; do echo "  $line"; done
               echo "$LOG_PREFIX 发现节点: $TARGET_LIST"
               sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-              sleep 2
-              
-              # 主动清内存，避免OOM
-              sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 2>/dev/null || true
-              sleep 2
-              
               sudo systemctl stop docker containerd casaos 2>/dev/null || true
-              sleep 2
               sudo pkill -9 -f "casaos|docker|containerd" 2>/dev/null || true
               sync && sleep 2
               
@@ -234,19 +234,13 @@ jobs:
         run: |
           echo "$LOG_PREFIX === 9-停止服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-          sleep 2
-          
-          # 主动清内存
-          sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 2>/dev/null || true
-          sleep 2
-          
           sudo systemctl stop casaos docker containerd 2>/dev/null || true
           sudo pkill -9 -f "casaos" 2>/dev/null || true
           sudo pkill -9 -f "docker" 2>/dev/null || true
           sudo pkill -9 -f "containerd" 2>/dev/null || true
           echo "$LOG_PREFIX 9-停止服务完成"
 
-      - name: 10-本地备份（含主动清内存）
+      - name: 10-本地备份
         run: |
           echo "$LOG_PREFIX === 10-本地备份开始 ==="
           mkdir -p "$LOCAL_BACKUP_DIR" || true
@@ -259,10 +253,6 @@ jobs:
           SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
           echo "$LOG_PREFIX 备份文件: $SNAP_NAME"
-          
-          # 备份前清内存
-          sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches 2>/dev/null || true
-          sleep 2
           
           sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T0" -cf "$LOCAL_FILE" \
             --ignore-failed-read --preserve-permissions "${DIR_ARRAY[@]}" 2>&1 | grep -v "tar:" || true
