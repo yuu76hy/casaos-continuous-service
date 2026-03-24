@@ -3,13 +3,13 @@ name: CasaOS纯净部署（单服务器并行-修复版）
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [renew_casaos_snapshot]
+  types: [renew_casaos_snapshot]
 
 env:
   RETRY_TIMES: 3
-  ZSTD_COMPRESS_LEVEL: 1
+  ZSTD_COMPRESS_LEVEL: 5  # 👈 速度/压缩比 黄金平衡点
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 10
+  TARGET_RUN_MINUTES: 60  # 1小时稳定运行
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -245,7 +245,7 @@ jobs:
           sudo pkill -9 -f "containerd" 2>/dev/null || true
           echo "$LOG_PREFIX 9-停止服务完成"
 
-      - name: 10-本地全量备份（2核4线程专用 -T2 最快）
+      - name: 10-本地全量备份（2核4线程 -T2 + 平衡等级5）
         if: ${{ always() }}
         run: |
           set +e
@@ -259,7 +259,7 @@ jobs:
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
           echo "[日志] 备份文件：$SNAP_NAME"
 
-          # 2核4线程最优：压缩等级1 + 2线程
+          # 黄金组合：等级5(平衡) + 2线程(2核专用)
           sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T2" -cf "$LOCAL_FILE" \
             --ignore-failed-read --preserve-permissions \
             "${DIR_ARRAY[@]}" || true
