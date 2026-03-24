@@ -3,13 +3,13 @@ name: CasaOS纯净部署（单服务器并行-修复版）
 on:
   workflow_dispatch:
   repository_dispatch:
-  types: [renew_casaos_snapshot]
+    types: [renew_casaos_snapshot]
 
 env:
   RETRY_TIMES: 3
-  ZSTD_COMPRESS_LEVEL: 5  # 👈 速度/压缩比 黄金平衡点
+  ZSTD_COMPRESS_LEVEL: 5
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 60  # 1小时稳定运行
+  TARGET_RUN_MINUTES: 60
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -259,7 +259,6 @@ jobs:
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
           echo "[日志] 备份文件：$SNAP_NAME"
 
-          # 黄金组合：等级5(平衡) + 2线程(2核专用)
           sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T2" -cf "$LOCAL_FILE" \
             --ignore-failed-read --preserve-permissions \
             "${DIR_ARRAY[@]}" || true
@@ -310,7 +309,11 @@ jobs:
               POLL_COUNT=0
               while [ -f "$TARGET_FILE" ]; do
                 CURRENT_SIZE=$(sudo stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
-                [ "$CURRENT_SIZE" != "$FILE_SIZE" ] && echo "$LOG_PREFIX 文件变化" && FILE_SIZE=$CURRENT_SIZE
+                # 👇 这里修复了引号/比较语法错误
+                if [ "$CURRENT_SIZE" != "$FILE_SIZE" ]; then
+                  echo "$LOG_PREFIX 文件变化"
+                  FILE_SIZE=$CURRENT_SIZE
+                fi
                 echo "$LOG_PREFIX 等待中... ($POLL_COUNT)"
                 sleep $POLL_INTERVAL
                 POLL_COUNT=$((POLL_COUNT + 1))
