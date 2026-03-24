@@ -29,7 +29,7 @@ jobs:
       SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
 
     steps:
-      - name: 1-系统初始化+Docker+CasaOS+管理员（并行）
+      - name: 系统初始化(串行) + Docker/CasaOS/管理员(并行)
         run: |
           task1_init() {
             echo "$LOG_PREFIX === 系统初始化开始 ==="
@@ -109,11 +109,11 @@ jobs:
 
           echo "$LOG_PREFIX ✅ 所有初始化任务全部完成"
 
-      - name: 2-Tailscale组网
+      - name: 5-Tailscale组网
         run: |
           TS_SUFFIX=$((RANDOM % 1000))
           TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
-          echo "$LOG_PREFIX === 2-Tailscale组网开始 ==="
+          echo "$LOG_PREFIX === 5-Tailscale组网开始 ==="
           
           if [ -z "$TAILSCALE_AUTH_KEY" ]; then
             echo "$LOG_PREFIX Tailscale未配置，跳过"
@@ -137,11 +137,11 @@ jobs:
             echo "$LOG_PREFIX 本机Tailscale主机名: $TS_HOSTNAME"
             echo "================================"
           fi
-          echo "$LOG_PREFIX 2-Tailscale组网完成"
+          echo "$LOG_PREFIX 5-Tailscale组网完成"
 
-      - name: 3-拉取备份恢复（解压双线程 -T2）
+      - name: 6-拉取备份恢复（解压双线程 -T2）
         run: |
-          echo "$LOG_PREFIX === 3-拉取备份开始 ==="
+          echo "$LOG_PREFIX === 6-拉取备份开始 ==="
           
           if [ -z "$TAILSCALE_AUTH_KEY" ] || [ -z "$SSH_PASS" ]; then
             echo "$LOG_PREFIX 未配置Tailscale/SSH，纯净启动"
@@ -205,11 +205,11 @@ jobs:
               done
             fi
           fi
-          echo "$LOG_PREFIX 3-拉取备份完成"
+          echo "$LOG_PREFIX 6-拉取备份完成"
 
-      - name: 4-启动服务
+      - name: 7-启动服务
         run: |
-          echo "$LOG_PREFIX === 4-启动服务开始 ==="
+          echo "$LOG_PREFIX === 7-启动服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
           sudo mkdir -p /run/docker
           sudo systemctl daemon-reload || true
@@ -218,12 +218,12 @@ jobs:
           sudo systemctl enable --now casaos || true
           echo "$LOG_PREFIX Docker状态: $(systemctl is-active docker 2>/dev/null || echo 'unknown')"
           echo "$LOG_PREFIX CasaOS状态: $(systemctl is-active casaos 2>/dev/null || echo 'unknown')"
-          echo "$LOG_PREFIX 4-启动服务完成"
+          echo "$LOG_PREFIX 7-启动服务完成"
 
-      - name: 5-稳定运行
+      - name: 8-稳定运行
         timeout-minutes: 360
         run: |
-          echo "$LOG_PREFIX === 5-稳定运行 $TARGET_RUN_MINUTES 分钟 ==="
+          echo "$LOG_PREFIX === 8-稳定运行 $TARGET_RUN_MINUTES 分钟 ==="
           RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
           ELAPSED=0
           while [ $ELAPSED -lt $RUN_SECONDS ]; do
@@ -233,23 +233,23 @@ jobs:
             ELAPSED=$((ELAPSED + 60))
             [ $((MINUTES % 10)) -eq 0 ] && [ $MINUTES -gt 0 ] && echo "$LOG_PREFIX 心跳: Docker=$(systemctl is-active docker 2>/dev/null || echo '?') CasaOS=$(systemctl is-active casaos 2>/dev/null || echo '?')"
           done
-          echo "$LOG_PREFIX 5-稳定运行完成"
+          echo "$LOG_PREFIX 8-稳定运行完成"
 
-      - name: 6-停止服务（保留Tailscale）
+      - name: 9-停止服务（保留Tailscale）
         run: |
-          echo "$LOG_PREFIX === 6-停止服务开始 ==="
+          echo "$LOG_PREFIX === 9-停止服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
           sudo systemctl stop casaos docker containerd 2>/dev/null || true
           sudo pkill -9 -f "casaos" 2>/dev/null || true
           sudo pkill -9 -f "docker" 2>/dev/null || true
           sudo pkill -9 -f "containerd" 2>/dev/null || true
-          echo "$LOG_PREFIX 6-停止服务完成"
+          echo "$LOG_PREFIX 9-停止服务完成"
 
-      - name: 7-本地全量备份（压缩双线程 -T2 + 等级5）
+      - name: 10-本地全量备份（压缩双线程 -T2 + 等级5）
         if: ${{ always() }}
         run: |
           set +e
-          echo "===== [日志] 7-生成本地全量备份 开始 ====="
+          echo "===== [日志] 10-生成本地全量备份 开始 ====="
           sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
           IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
           for dir in "${DIR_ARRAY[@]}"; do
@@ -272,11 +272,11 @@ jobs:
             echo "[日志] ❌ 备份文件无效"
             exit 0
           fi
-          echo "✅ [日志] 7-备份完成"
+          echo "✅ [日志] 10-备份完成"
 
-      - name: 8-触发下一轮
+      - name: 11-触发下一轮
         run: |
-          echo "$LOG_PREFIX === 8-触发下一轮 ==="
+          echo "$LOG_PREFIX === 11-触发下一轮 ==="
           if [ -z "$USER_PAT" ] || [ -z "$REPO" ]; then
             echo "$LOG_PREFIX 未配置PAT/REPO，跳过"
           else
@@ -287,12 +287,12 @@ jobs:
               sleep 3
             done
           fi
-          echo "$LOG_PREFIX 8-触发下一轮完成"
+          echo "$LOG_PREFIX 11-触发下一轮完成"
 
-      - name: 9-轮询等待删除
+      - name: 12-轮询等待删除
         timeout-minutes: 1440
         run: |
-          echo "$LOG_PREFIX === 9-轮询删除开始 ==="
+          echo "$LOG_PREFIX === 12-轮询删除开始 ==="
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
             echo "$LOG_PREFIX 无备份文件，跳过"
           else
@@ -320,14 +320,14 @@ jobs:
               echo "$LOG_PREFIX 文件已被删除，退出"
             fi
           fi
-          echo "$LOG_PREFIX 9-轮询删除完成"
+          echo "$LOG_PREFIX 12-轮询删除完成"
 
-      - name: 10-最终清理（保留Tailscale）
+      - name: 13-最终清理（保留Tailscale）
         run: |
-          echo "$LOG_PREFIX === 10-最终清理 ==="
+          echo "$LOG_PREFIX === 13-最终清理 ==="
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
           sudo rm -f /etc/sudoers.d/root 2>/dev/null || true
           sudo apt autoremove -y -qq 2>/dev/null || true
           sudo apt clean -y -qq 2>/dev/null || true
-          echo "$LOG_PREFIX 10-最终清理完成"
+          echo "$LOG_PREFIX 13-最终清理完成"
           echo "$LOG_PREFIX === 全流程结束 ==="
