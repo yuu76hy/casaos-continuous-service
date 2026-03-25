@@ -1,4 +1,4 @@
-name: CasaOS纯净部署（单服务器并行-修复版）
+name: CasaOS纯净部署（单服务器并行-优化版）
 
 on:
   workflow_dispatch:
@@ -7,9 +7,9 @@ on:
 
 env:
   RETRY_TIMES: 3
-  ZSTD_COMPRESS_LEVEL: 5
+  ZSTD_COMPRESS_LEVEL: 6
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 320  # 已改为 320 分钟
+  TARGET_RUN_MINUTES: 320
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -34,7 +34,7 @@ jobs:
           task1_init() {
             echo "$LOG_PREFIX === 系统初始化开始 ==="
             sudo apt update -y -qq || true
-            sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd -qq || true
+            sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd rsync -qq || true
             sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n || true
             sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google || true
             sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* || true
@@ -130,7 +130,7 @@ jobs:
           fi
           echo "$LOG_PREFIX 2-Tailscale组网完成"
 
-      - name: 3-拉取备份恢复
+      - name: 3-拉取备份恢复（rsync优化传输）
         run: |
           echo "$LOG_PREFIX === 3-拉取备份开始 ==="
           
@@ -163,7 +163,7 @@ jobs:
                   LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
                   mkdir -p "$LOCAL_BACKUP_DIR"
                   
-                  if sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+                  if sshpass -p "$SSH_PASS" rsync --partial --progress --rsh="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
                     "$SSH_USER@$IP:$LATEST_FILE" "$LOCAL_FILE"; then
                     sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
                       "$SSH_USER@$IP" "sudo rm -f '$LATEST_FILE'" || true
@@ -220,7 +220,7 @@ jobs:
           sudo pkill -9 -f "casaos docker containerd" 2>/dev/null || true
           echo "$LOG_PREFIX 6-停止服务完成"
 
-      - name: 7-本地全量备份
+      - name: 7-本地全量备份（等级6 + 排除冗余文件）
         if: ${{ always() }}
         run: |
           set +e
@@ -235,7 +235,12 @@ jobs:
           echo "[日志] 备份文件：$SNAP_NAME"
 
           sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T2" -cf "$LOCAL_FILE" \
-            --ignore-failed-read --preserve-permissions "${DIR_ARRAY[@]}" || true
+            --ignore-failed-read --preserve-permissions \
+            --exclude='/var/lib/docker/containers/*/logs' \
+            --exclude='/var/lib/docker/tmp' \
+            --exclude='/var/lib/docker/volumes/*/_data/tmp' \
+            --exclude='/var/lib/docker/overlay2/*/diff/tmp' \
+            "${DIR_ARRAY[@]}" || true
 
           if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
             FILE_SIZE=$(du -h "$LOCAL_FILE" | cut -f1)
