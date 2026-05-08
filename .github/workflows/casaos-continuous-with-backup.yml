@@ -7,7 +7,7 @@ on:
 
 env:
   RETRY_TIMES: 3
-  ZSTD_COMPRESS_LEVEL: 6
+  ZSTD_COMPRESS_LEVEL: 8
   POLL_INTERVAL: 60
   TARGET_RUN_MINUTES: 320
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
