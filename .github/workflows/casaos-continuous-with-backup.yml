@@ -10,6 +10,7 @@ env:
   ZSTD_COMPRESS_LEVEL: 8
   POLL_INTERVAL: 60
   TARGET_RUN_MINUTES: 320
+  WATCH_BACKUP_TIMEOUT: 120
   # 业务目录
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
@@ -17,14 +18,12 @@ env:
   LOCAL_AAA_DIR: "/aaa"
   SSH_USER: "root"
   LOG_PREFIX: "[日志]"
-  # 超时控制（统一单位分钟）
-  JOB_GLOBAL_TIMEOUT: 420
-  WATCH_BACKUP_TIMEOUT: 120
 
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ env.JOB_GLOBAL_TIMEOUT }}
+    # job 级timeout只能写固定数字，不能用env表达式
+    timeout-minutes: 420
     env:
       ROOT_PASSWORD: ${{ secrets.ROOT_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
