@@ -5,11 +5,16 @@ on:
   repository_dispatch:
     types: [renew_casaos_snapshot]
 
+# 防止重复触发：同一事件类型只保留最新的运行
+concurrency:
+  group: casaos-single-${{ github.event_name }}
+  cancel-in-progress: false
+
 env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 8
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 10
+  TARGET_RUN_MINUTES: 320
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -20,7 +25,7 @@ env:
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 540
     env:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
@@ -147,13 +152,23 @@ jobs:
             
             if [ -n "$TARGET_LIST" ]; then
               sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
-              sudo systemctl stop docker containerd casaos 2>/dev/null || true
-              # 优雅等待进程退出，避免 pkill -9 误杀
-              for i in $(seq 1 10); do
-                pgrep -f "dockerd|containerd|casaos" &>/dev/null || break
-                sleep 1
+              
+              # 彻底停止 Docker（先停容器，再停 daemon）
+              if docker info &>/dev/null 2>&1; then
+                CONTAINERS=$(docker ps -q 2>/dev/null)
+                [ -n "$CONTAINERS" ] && echo "$CONTAINERS" | xargs -r docker stop --time=10 2>/dev/null || true
+              fi
+              sudo systemctl stop casaos docker docker.socket containerd 2>/dev/null || true
+              
+              # 等待进程退出
+              for i in $(seq 1 15); do
+                if ! pgrep -x "dockerd" &>/dev/null && ! pgrep -x "containerd" &>/dev/null; then break; fi
+                sleep 2
               done
-              sync && sleep 2
+              # 精确强制终止（避免 pkill -f 自我匹配）
+              sudo killall -e -9 dockerd containerd casaos 2>/dev/null || true
+              sleep 2
+              sync
               
               # 关键修复：使用 here-string 替代管道，避免子shell中 break 失效
               RESTORE_SUCCESS=0
@@ -283,17 +298,21 @@ jobs:
           
           echo "$LOG_PREFIX Docker状态: $(systemctl is-active docker 2>/dev/null || echo 'unknown')"
           echo "$LOG_PREFIX CasaOS状态: $(systemctl is-active casaos 2>/dev/null || echo 'unknown')"
+          # 输出 Docker 容器列表供参考
+          DOCKER_PS_COUNT=$(timeout 10 docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null | wc -l || echo "?")
+          echo "$LOG_PREFIX 容器总数: $DOCKER_PS_COUNT"
           if [ "$CASAOS_OK" -ne 1 ]; then
             echo "$LOG_PREFIX ⚠️ CasaOS 启动异常，但不阻塞流程"
           fi
           echo "$LOG_PREFIX 4-启动服务完成"
       - name: 5-稳定运行
-        timeout-minutes: 20
+        timeout-minutes: 360
         run: |
           echo "$LOG_PREFIX === 5-稳定运行 $TARGET_RUN_MINUTES 分钟 ==="
           RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
           ELAPSED=0
           LAST_HEARTBEAT=0
+          CONSECUTIVE_FAILS=0
           while [ $ELAPSED -lt $RUN_SECONDS ]; do
             MINUTES=$((ELAPSED / 60))
             sleep 60
@@ -303,23 +322,44 @@ jobs:
             if [ $((MINUTES % 5)) -eq 0 ] && [ $MINUTES -gt "$LAST_HEARTBEAT" ]; then
               LAST_HEARTBEAT=$MINUTES
               
-              # Docker 健康检查
-              if ! docker info &>/dev/null; then
-                echo "$LOG_PREFIX ⚠️ Docker 异常，尝试重启..."
-                sudo systemctl restart docker containerd 2>/dev/null || true
-                sleep 5
+              # Docker 健康检查（用 timeout 防止卡死）
+              DOCKER_OK=0
+              if timeout 10 docker info &>/dev/null 2>&1; then
+                DOCKER_OK=1
+              else
+                echo "$LOG_PREFIX ⚠️ Docker 异常/超时，检查进程..."
+                if ! pgrep -x "dockerd" &>/dev/null; then
+                  echo "$LOG_PREFIX ❌ dockerd 进程不存在，尝试重启..."
+                  sudo systemctl restart docker containerd 2>/dev/null || true
+                  sleep 5
+                fi
               fi
               
               # CasaOS 健康检查
-              if ! systemctl is-active --quiet casaos 2>/dev/null; then
+              CASAOS_OK=0
+              if systemctl is-active --quiet casaos 2>/dev/null; then
+                CASAOS_OK=1
+              else
                 echo "$LOG_PREFIX ⚠️ CasaOS 异常，尝试重启..."
                 sudo systemctl restart casaos 2>/dev/null || true
                 sleep 3
               fi
               
+              # 统计连续失败次数
+              if [ "$DOCKER_OK" -eq 1 ] && [ "$CASAOS_OK" -eq 1 ]; then
+                CONSECUTIVE_FAILS=0
+              else
+                CONSECUTIVE_FAILS=$((CONSECUTIVE_FAILS + 1))
+              fi
+              if [ "$CONSECUTIVE_FAILS" -ge 3 ]; then
+                echo "$LOG_PREFIX ❌❌❌ 连续 ${CONSECUTIVE_FAILS} 次健康检查异常，但继续运行"
+              fi
+              
+              # 输出状态
               D_STATUS=$(systemctl is-active docker 2>/dev/null || echo 'down')
               C_STATUS=$(systemctl is-active casaos 2>/dev/null || echo 'down')
-              echo "$LOG_PREFIX ❤️ 运行${MINUTES}min | Docker=${D_STATUS} CasaOS=${C_STATUS}"
+              DOCKER_PS_COUNT=$(timeout 5 docker ps -q 2>/dev/null | wc -l || echo "?")
+              echo "$LOG_PREFIX ❤️ 运行${MINUTES}min | Docker=${D_STATUS} CasaOS=${C_STATUS} | 容器数=${DOCKER_PS_COUNT} | 连续异常=${CONSECUTIVE_FAILS}"
             fi
           done
           echo "$LOG_PREFIX 5-稳定运行完成"
@@ -328,24 +368,62 @@ jobs:
           echo "$LOG_PREFIX === 6-停止服务开始 ==="
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
           
-          # 优雅停止：先 CasaOS 再 Docker
-          sudo systemctl stop casaos 2>/dev/null || true
-          sleep 2
-          sudo systemctl stop docker containerd 2>/dev/null || true
+          # Step 1: 先停止所有 Docker 容器（关键！否则 dockerd 拒绝停止）
+          if docker info &>/dev/null; then
+            CONTAINERS=$(docker ps -q 2>/dev/null)
+            if [ -n "$CONTAINERS" ]; then
+              echo "$LOG_PREFIX 停止所有 Docker 容器..."
+              echo "$CONTAINERS" | xargs -r docker stop --time=30 2>/dev/null || true
+              echo "$CONTAINERS" | xargs -r docker rm -f 2>/dev/null || true
+            fi
+          fi
           
-          # 等待进程自然退出
-          for i in $(seq 1 15); do
-            pgrep -f "dockerd|containerd|casaos" &>/dev/null || break
-            echo "$LOG_PREFIX 等待进程退出... ($i/15)"
+          # Step 2: 优雅停止 CasaOS
+          sudo systemctl stop casaos 2>/dev/null || true
+          sleep 3
+          
+          # Step 3: 停止 Docker daemon
+          echo "$LOG_PREFIX 停止 Docker daemon..."
+          sudo systemctl stop docker 2>/dev/null || true
+          sleep 2
+          sudo systemctl stop docker.socket 2>/dev/null || true
+          sudo systemctl stop containerd 2>/dev/null || true
+          
+          # Step 4: 等待所有进程退出（最多 20 轮/40 秒）
+          STOP_OK=0
+          for i in $(seq 1 20); do
+            if ! pgrep -x "dockerd" &>/dev/null && ! pgrep -x "containerd" &>/dev/null; then
+              STOP_OK=1
+              echo "$LOG_PREFIX 所有进程已退出 (第${i}轮)"
+              break
+            fi
+            echo "$LOG_PREFIX 等待进程退出... ($i/20)"
             sleep 2
           done
           
-          # 最后手段：强制终止残留
-          if pgrep -f "dockerd|casaos" &>/dev/null; then
-            echo "$LOG_PREFIX 强制终止残留进程"
-            sudo pkill -9 -f "dockerd" 2>/dev/null || true
-            sudo pkill -9 -f "casaos" 2>/dev/null || true
+          # Step 5: 强制终止残留（使用 killall -e 精确匹配，避免 pkill -f 自我匹配）
+          if [ "$STOP_OK" -ne 1 ]; then
+            echo "$LOG_PREFIX ⚠️ 优雅停止失败，强制终止..."
+            # 使用精确匹配避免杀死脚本自身
+            sudo killall -e -9 dockerd 2>/dev/null || true
+            sudo killall -e -9 containerd 2>/dev/null || true
+            sudo killall -e -9 casaos 2>/dev/null || true
+            sleep 3
+            # 验证
+            if pgrep -x "dockerd" &>/dev/null; then
+              echo "$LOG_PREFIX ❌ 警告：dockerd 仍然存活！"
+            else
+              echo "$LOG_PREFIX 强制终止成功"
+            fi
           fi
+          
+          # Step 6: 最终验证 - 确保 Docker 完全停止才能安全备份
+          if pgrep -x "dockerd" &>/dev/null; then
+            echo "$LOG_PREFIX ❌❌❌ [严重] Docker 无法停止！继续备份但可能不一致"
+          else
+            echo "$LOG_PREFIX ✅ Docker 已完全停止，备份安全"
+          fi
+          
           sync
           echo "$LOG_PREFIX 6-停止服务完成"
       - name: 7-本地全量备份（等级6 + 排除冗余文件）
@@ -353,6 +431,24 @@ jobs:
         run: |
           set +e
           echo "===== [日志] 7-生成本地全量备份 开始 ====="
+          
+          # 🔒 安全检查：确保 Docker 已停止才能安全备份
+          if pgrep -x "dockerd" &>/dev/null; then
+            echo "[日志] ⚠️⚠️⚠️ Docker 仍在运行！备份可能不一致。强制停止..."
+            if command -v docker &>/dev/null; then
+              timeout 15 docker ps -q 2>/dev/null | xargs -r docker stop --time=10 2>/dev/null || true
+            fi
+            sudo systemctl stop docker docker.socket containerd 2>/dev/null || true
+            sleep 3
+            sudo killall -e -9 dockerd containerd 2>/dev/null || true
+            sleep 3
+            if pgrep -x "dockerd" &>/dev/null; then
+              echo "[日志] ❌❌❌ 严重：无法停止 Docker，备份跳过！"
+              exit 0
+            fi
+          fi
+          echo "[日志] ✅ Docker 确认已停止，开始备份"
+          
           sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
           IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
           for dir in "${DIR_ARRAY[@]}"; do
@@ -415,9 +511,9 @@ jobs:
           fi
           echo "$LOG_PREFIX 8-触发下一轮完成"
       - name: 9-轮询等待删除
-        timeout-minutes: 60
+        timeout-minutes: 720
         run: |
-          MAX_POLLS=60    # 最多轮询60次（约1小时）
+          MAX_POLLS=720   # 最多轮询720次（约12小时）
           echo "$LOG_PREFIX === 9-轮询删除开始 (最大等待: $((MAX_POLLS * POLL_INTERVAL / 60))分钟) ==="
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
             echo "$LOG_PREFIX 无备份文件，跳过"
