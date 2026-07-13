@@ -9,7 +9,7 @@ env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 8
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 320
+  TARGET_RUN_MINUTES: 10
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -20,7 +20,7 @@ env:
 jobs:
   casaos-deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 480
+    timeout-minutes: 120
     env:
       ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
       USER_PAT: ${{ secrets.USER_PAT }}
@@ -288,7 +288,7 @@ jobs:
           fi
           echo "$LOG_PREFIX 4-启动服务完成"
       - name: 5-稳定运行
-        timeout-minutes: 360
+        timeout-minutes: 20
         run: |
           echo "$LOG_PREFIX === 5-稳定运行 $TARGET_RUN_MINUTES 分钟 ==="
           RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
@@ -415,9 +415,9 @@ jobs:
           fi
           echo "$LOG_PREFIX 8-触发下一轮完成"
       - name: 9-轮询等待删除
-        timeout-minutes: 720
+        timeout-minutes: 60
         run: |
-          MAX_POLLS=720   # 最多轮询720次（约12小时）
+          MAX_POLLS=60    # 最多轮询60次（约1小时）
           echo "$LOG_PREFIX === 9-轮询删除开始 (最大等待: $((MAX_POLLS * POLL_INTERVAL / 60))分钟) ==="
           if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
             echo "$LOG_PREFIX 无备份文件，跳过"
