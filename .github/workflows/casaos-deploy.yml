@@ -1,295 +1,304 @@
-name： CasaOS纯净部署（单服务器并行-优化版）
+name: CasaOS纯净部署（单服务器并行-优化版）
 
-关于：
-  workflow_dispatch：
-  repository_dispatch：
-    类型：[renew_casaos_snapshot]
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [renew_casaos_snapshot]
 
-环境：
-  RETRY_TIMES：3
-  ZSTD_COMPRESS_LEVEL：8
-  POLL_INTERVAL：60
-  TARGET_RUN_MINUTES：320
-  PERSONAL_DATA_DIRS：“/var/lib/docker /etc/casaos /var/lib/casaos /DATA”
-  REMOTE_BACKUP_BASE：“/aaa”
-  LOCAL_BACKUP_DIR：“/tmp/casaos-backup”
-  LOCAL_AAA_DIR：“/aaa”
-  SSH_USER：“根”
-  LOG_PREFIX：“[日志]”
+env:
+  RETRY_TIMES: 3
+  ZSTD_COMPRESS_LEVEL: 8
+  POLL_INTERVAL: 60
+  TARGET_RUN_MINUTES: 320
+  PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
+  REMOTE_BACKUP_BASE: "/aaa"
+  LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
+  LOCAL_AAA_DIR: "/aaa"
+  SSH_USER: "root"
+  LOG_PREFIX: "[日志]"
 
-职位：
-  casaos-deploy：
-    runs-on： ubuntu-24.04
-    暂停分钟：480分钟
-    环境：
-      ROOTS_PASSWORD：${{ 秘密。ROOTS_PASSWORD }}
-      USER_PAT：${{ 秘密。USER_PAT }}
-      收紧：${{ 秘密。REPO }}
-      TAILSCALE_AUTH_KEY：${{ 秘密。TAILSCALE_AUTH_KEY }}
-      SSH_PASS：${{ 秘密。ROOTS_PASSWORD }}
+jobs:
+  casaos-deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    env:
+      ROOTS_PASSWORD: ${{ secrets.ROOTS_PASSWORD }}
+      USER_PAT: ${{ secrets.USER_PAT }}
+      REPO: ${{ secrets.REPO }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      SSH_PASS: ${{ secrets.ROOTS_PASSWORD }}
 
-    步骤：
-      - name： 1-系统初始化+Docker+CasaOS+管理员
-        运行：|
-task1_init（） {
-echo “$LOG_PREFIX === 系统初始化开始 ===”
-sudo apt update -y -qq ||确实如此
-Sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd rsync -qq ||确实如此
-sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n ||确实如此
-sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google ||确实如此
-sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* ||确实如此
-sudo DEBIAN_FRONTEND=非交互式 apt autoremove --purge -y ||确实如此
-sudo DEBIAN_FRONTEND=非交互式 apt clean ||确实如此
-echo “$LOG_PREFIX === 系统初始化完成 ===”
+    steps:
+      - name: 1-系统初始化+Docker+CasaOS+管理员
+        run: |
+          task1_init() {
+            echo "$LOG_PREFIX === 系统初始化开始 ==="
+            sudo apt update -y -qq || true
+            sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd rsync -qq || true
+            sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n || true
+            sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google || true
+            sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* || true
+            sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y || true
+            sudo DEBIAN_FRONTEND=noninteractive apt clean || true
+            echo "$LOG_PREFIX === 系统初始化完成 ==="
           }
-task2_docker（） {
-echo “$LOG_PREFIX === 安装Docker开始 ===”
-导出 DEBIAN_FRONTEND=非交互式
-其中I在1 2 3;做
-卷曲 -FSSL https://get.docker.com |须多狂欢 & 破坏 ||睡眠3
-完成
-Sudo systemCTL enable Docker containerd ||确实如此
-sudo systemctl stop docker containerd ||确实如此
-DOCKER_VER=$（docker --version 2>/dev/null || echo “未安装”）
-echo “$LOG_PREFIX Docker 版本： $DOCKER_VER”
-sudo usermod -aG docker runner ||确实如此
-echo “$LOG_PREFIX === Docker安装完成 ===”
+          task2_docker() {
+            echo "$LOG_PREFIX === 安装Docker开始 ==="
+            export DEBIAN_FRONTEND=noninteractive
+            for i in 1 2 3; do
+              curl -fsSL https://get.docker.com | sudo bash & break || sleep 3
+            done
+            sudo systemctl enable docker containerd || true
+            sudo systemctl stop docker containerd || true
+            DOCKER_VER=$(docker --version 2>/dev/null || echo "未安装")
+            echo "$LOG_PREFIX Docker 版本: $DOCKER_VER"
+            sudo usermod -aG docker runner || true
+            echo "$LOG_PREFIX === Docker安装完成 ==="
           }
-task3_casaos（） {
-echo “$LOG_PREFIX === 安装CasaOS开始 ===”
-其中I在1 2 3;做
-curl -fsSL https://get.casaos.io |须多狂欢 & 破坏 ||{
-echo “$LOG_PREFIX CasaOS安装失败，重试 $i/3”
-第五睡
+          task3_casaos() {
+            echo "$LOG_PREFIX === 安装CasaOS开始 ==="
+            for i in 1 2 3; do
+              curl -fsSL https://get.casaos.io | sudo bash & break || {
+                echo "$LOG_PREFIX CasaOS安装失败，重试 $i/3"
+                sleep 5
               }
-完成
-sudo systemctl stop casaos ||确实如此
-sudo systemctl disable casaos ||确实如此
-if command -v casaos &>/dev/null;则
-echo “$LOG_PREFIX ✅ CasaOS 安装成功： $（casaos --version 2>/dev/null）”
-否则
-echo “$LOG_PREFIX ❌ CasaOS 安装失败！”
-出口1
-Fi
-echo “$LOG_PREFIX === CasaOS安装完成 ===”
+            done
+            sudo systemctl stop casaos || true
+            sudo systemctl disable casaos || true
+            if command -v casaos &>/dev/null; then
+              echo "$LOG_PREFIX ✅ CasaOS 安装成功: $(casaos --version 2>/dev/null)"
+            else
+              echo "$LOG_PREFIX ❌ CasaOS 安装失败！"
+              exit 1
+            fi
+            echo "$LOG_PREFIX === CasaOS安装完成 ==="
           }
-task4_admin（） {
-echo “$LOG_PREFIX === 配置管理员开始 ===”
-如果 [ -z “$SSH_PASS” ];则
-echo “$LOG_PREFIX 警告：未配置ROOTS_PASSWORD”
-否则
-USER_NAME=“$SSH_USER”
-id -u “$USER_NAME” & >/dev/null ||sudo useradd -m -s /bin/bash “$USER_NAME” ||确实如此
-回声“$USER_NAME：$SSH_PASS” |Sudo chpasswd ||确实如此
-回声“$USER_NAME all=（全部） NOPASSWD： ALL” |sudo tee /etc/sudoers.d/“$USER_NAME” >/dev/null ||确实如此
-sudo chmod 0440 /etc/sudoers.d/“$USER_NAME” ||确实如此
-sudo usermod -aG docker “$USER_NAME” ||确实如此
-SSH_CONF=“ /etc/ssh/sshd_config”
-sudo sed -i \
--e 's/^#*PermitRootLogin.*/PermitRootLogin yes/' \
--e 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' \
--e 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' \
-“$SSH_CONF” ||确实如此
-sudo systemctl restart ssh ||确实如此
-Fi
-echo “$LOG_PREFIX === 管理员配置完成 ===”
+          task4_admin() {
+            echo "$LOG_PREFIX === 配置管理员开始 ==="
+            if [ -z "$SSH_PASS" ]; then
+              echo "$LOG_PREFIX 警告：未配置ROOTS_PASSWORD"
+            else
+              USER_NAME="$SSH_USER"
+              id -u "$USER_NAME" &>/dev/null || sudo useradd -m -s /bin/bash "$USER_NAME" || true
+              echo "$USER_NAME:$SSH_PASS" | sudo chpasswd || true
+              echo "$USER_NAME ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"$USER_NAME" >/dev/null || true
+              sudo chmod 0440 /etc/sudoers.d/"$USER_NAME" || true
+              sudo usermod -aG docker "$USER_NAME" || true
+              SSH_CONF="/etc/ssh/sshd_config"
+              sudo sed -i \
+              -e 's/^#*PermitRootLogin.*/PermitRootLogin yes/' \
+              -e 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' \
+              -e 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' \
+              "$SSH_CONF" || true
+              sudo systemctl restart ssh || true
+            fi
+            echo "$LOG_PREFIX === 管理员配置完成 ==="
           }
-task1_init
-task2_docker &
-task3_casaos &
-task4_admin &
-等等
-echo “$LOG_PREFIX ✅ 所有初始化任务全部完成”
-      - 名称：2-Tailscale组网
-        运行：|
-TS_SUFFIX=$（（随机百分比1000））
-TS_HOSTNAME=“CasaOS-${TS_SUFFIX}”
-回声“$LOG_前缀=== 2-Tailscale组网开始 ===”
+          task1_init
+          task2_docker &
+          task3_casaos &
+          task4_admin &
+          wait
+          echo "$LOG_PREFIX ✅ 所有初始化任务全部完成"
+
+      - name: 2-Tailscale组网
+        run: |
+          TS_SUFFIX=$((RANDOM % 1000))
+          TS_HOSTNAME="CasaOS-${TS_SUFFIX}"
+          echo "$LOG_PREFIX === 2-Tailscale组网开始 ==="
           
-如果 [ -z “$TAILSCALE_AUTH_KEY” ];则
-echo “$LOG_PREFIX Tailscale未配置，跳过”
-否则
-其中I在1 2 3;做
-curl -FSSL https://tailscale.com/install.sh |须多狂欢 & 破坏 ||睡眠2
-完成
-sudo systemctl enable --now tailscaled ||确实如此
-睡眠2
-其中I在1 2 3;做
-sudo tailscale up --authkey=“$TAILSCALE_AUTH_KEY” --hostname=“$TS_HOSTNAME” --accept-routes --reset & break ||睡眠3
-完成
-LOCAL_IP=$（主机名 -I | cut -d' ' -f1）
-TAILSCALE_IP=$（sudo tailscale ip -4 2>/dev/null || echo “获取失败”）
-echo “$LOG_PREFIX 物理内网IP： $LOCAL_IP”
-echo “$LOG_PREFIX Tailscale内网IP： $TAILSCALE_IP”
-echo “$LOG_PREFIX 本机Tailscale主机名： $TS_HOSTNAME”
-Fi
-echo “$LOG_PREFIX 2-Tailscale组网完成”
-      - 名称：3-拉取备份恢复（rsync优化传输）
-        运行：|
-回声 “$LOG_PREFIX === 3-拉取备份开始 ===”
+          if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+            echo "$LOG_PREFIX Tailscale未配置，跳过"
+          else
+            for i in 1 2 3; do
+              curl -fsSL https://tailscale.com/install.sh | sudo bash & break || sleep 2
+            done
+            sudo systemctl enable --now tailscaled || true
+            sleep 2
+            for i in 1 2 3; do
+              sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="$TS_HOSTNAME" --accept-routes --reset & break || sleep 3
+            done
+            LOCAL_IP=$(hostname -I | cut -d' ' -f1)
+            TAILSCALE_IP=$(sudo tailscale ip -4 2>/dev/null || echo "获取失败")
+            echo "$LOG_PREFIX 物理内网IP: $LOCAL_IP"
+            echo "$LOG_PREFIX Tailscale内网IP: $TAILSCALE_IP"
+            echo "$LOG_PREFIX 本机Tailscale主机名: $TS_HOSTNAME"
+          fi
+          echo "$LOG_PREFIX 2-Tailscale组网完成"
+
+      - name: 3-拉取备份恢复（rsync优化传输）
+        run: |
+          echo "$LOG_PREFIX === 3-拉取备份开始 ==="
           
-如果 [ -z “$TAILSCALE_AUTH_KEY” ] ||[ -z “$SSH_PASS” ];则
-echo “$LOG_PREFIX 未配置Tailscale/SSH，纯净启动”
-否则
-TS_STATUS=$（sudo tailscale status --json 2>/dev/null || echo '{“Peer”：[]}'）
-SELF_ID=$（echo “$TS_STATUS” | jq -r '.Self.ID // empty'）
-TARGET_LIST=$（echo “$TS_STATUS” | jq -r --arg self “$SELF_ID” '
-.同伴[] |select（.在线 == 真实） |select（.ID ！= $self） |
-select（ （主机名 |ascii_downcase） |包含（“casaos”）|
-"\(.主机名）//\（。TailscaleIPs[0]）”
-' 2>/dev/null ||确实如此）
+          if [ -z "$TAILSCALE_AUTH_KEY" ] || [ -z "$SSH_PASS" ]; then
+            echo "$LOG_PREFIX 未配置Tailscale/SSH，纯净启动"
+          else
+            TS_STATUS=$(sudo tailscale status --json 2>/dev/null || echo '{"Peer":[]}')
+            SELF_ID=$(echo "$TS_STATUS" | jq -r '.Self.ID // empty')
+            TARGET_LIST=$(echo "$TS_STATUS" | jq -r --arg self "$SELF_ID" '
+            .Peer[] |select(.Online == true) |select(.ID != $self) |
+            select( (.Hostname |ascii_downcase) |contains("casaos") ) |
+            "\(.Hostname)//\(.TailscaleIPs[0])"
+            ' 2>/dev/null || true)
             
-如果 [ -n “$TARGET_LIST” ];则
-Sudo fuser -k 80/TCP 443/TCP 2>/dev/null ||确实如此
-Sudo systemCTL stop Docker containerd casaos 2>/dev/null ||确实如此
-Sudo pkill -9 -f “casaos Docker containerd” 2>/dev/null ||确实如此
-同步与睡眠2
+            if [ -n "$TARGET_LIST" ]; then
+              sudo fuser -k 80/TCP 443/TCP 2>/dev/null || true
+              sudo systemctl stop docker containerd casaos 2>/dev/null || true
+              sudo pkill -9 -f "casaos docker containerd" 2>/dev/null || true
+              sync && sleep 2
               
-回声“$TARGET_LIST” |而IFS=读-r行;做
-HOST=$（回声“$line” | cut -d'/' -f1）
-IP=$（回声“$line” | cut -d'/' -f3）
-echo “$LOG_PREFIX 尝试节点： $HOST （$IP）”
+              echo "$TARGET_LIST" | while IFS= read -r line; do
+                HOST=$(echo "$line" | cut -d'/' -f1)
+                IP=$(echo "$line" | cut -d'/' -f3)
+                echo "$LOG_PREFIX 尝试节点: $HOST ($IP)"
                 
-LATEST_FILE=$（sshpass -p “$SSH_PASS” ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-“$SSH_USER@$IP” “ls -t \”$REMOTE_BACKUP_BASE\“/casaos-*.tar.zst 2>/dev/null |头部 -1“ ||确实如此）
+                LATEST_FILE=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                "$SSH_USER@$IP" "ls -t \"$REMOTE_BACKUP_BASE\"/casaos-*.tar.zst 2>/dev/null | head -1" || true)
                 
-如果 [ -n “$LATEST_FILE” ];则
-LOCAL_FILE=“$LOCAL_BACKUP_DIR/$（basename ”$LATEST_FILE“）”
-mkdir -p “$LOCAL_BACKUP_DIR”
+                if [ -n "$LATEST_FILE" ]; then
+                  LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST_FILE")"
+                  mkdir -p "$LOCAL_BACKUP_DIR"
                   
-if sshpass -p “$SSH_PASS” rsync --partial --progress --rsh=“ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15” \
-“$SSH_USER@$IP：$LATEST_FILE” “$LOCAL_FILE”;则
-sshpass -p “$SSH_PASS” ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-“$SSH_USER@$IP” “sudo rm -f '$LATEST_FILE'” ||确实如此
+                  if sshpass -p "$SSH_PASS" rsync --partial --progress --rsh="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
+                  "$SSH_USER@$IP:$LATEST_FILE" "$LOCAL_FILE"; then
+                    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+                    "$SSH_USER@$IP" "sudo rm -f '$LATEST_FILE'" || true
                     
-echo “$LOG_PREFIX 开始解压恢复（双线程 -T2）...”
-sudo tar -I“zstd -d -T2” -xf “$LOCAL_FILE” -C / --overwrite --preserve-permissions 2>/dev/null ||确实如此
+                    echo "$LOG_PREFIX 开始解压恢复（双线程 -T2）..."
+                    sudo tar -I"zstd -d -T2" -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions 2>/dev/null || true
                     
-$PERSONAL_DATA_DIRS 中的 dir 表示;做
-[ -d “$dir” ] && sudo chown -R root：root “$dir” 2>/dev/null ||确实如此
-完成
-rm -f “$LOCAL_FILE”
-echo “$LOG_PREFIX 节点 $HOST 恢复成功！”
-休息
-Fi
-Fi
-完成
-Fi
-Fi
-echo “$LOG_PREFIX 3-拉取备份完成”
-      - 名称：4-启动服务
-        运行：|
-回声 “$LOG_PREFIX === 4-启动服务开始 ===”
-Sudo fuser -k 80/TCP 443/TCP 2>/dev/null ||确实如此
-sudo mkdir -p /run/docker
-Sudo systemCTL daemon-reload ||确实如此
-Sudo systemCTL enable --now Docker containerd ||确实如此
-第五睡
-sudo systemctl enable --now casaos ||确实如此
-echo “$LOG_PREFIX Docker状态： $（systemctl is-active docker 2>/dev/null ||回声'未知'）”
-echo “$LOG_PREFIX CasaOS状态： $（systemctl is-active casaos 2>/dev/null ||回声'未知'）”
-echo “$LOG_PREFIX 4-启动服务完成”
-      - 名称：5-稳定运行
-        暂停分钟：360分钟
-        运行：|
-echo “$LOG_PREFIX === 5-稳定运行 $TARGET_RUN_MINUTES 分钟 ===”
-RUN_SECONDS=$（（TARGET_RUN_MINUTES * 60））
-ELAPSED=0
-而[$ELAPSED -lt $RUN_SECONDS];做
-分钟=$（（快进 / 60））
-echo “$LOG_PREFIX 已运行 $MINUTES / $TARGET_RUN_MINUTES 分钟...”
-睡眠60
-ELAPSED=$（（ELAPSED + 60））
-[ $（（MINUTES % 10）） -eq 0 ] && [ $MINUTES -gt 0 ] && echo “$LOG_PREFIX 心跳： Docker=$（systemctl is-active docker 2>/dev/null ||回声“？”）CasaOS=$（systemctl is-active casaos 2>/dev/null || echo '？'）”
-完成
-echo “$LOG_PREFIX 5-稳定运行完成”
-      - 名称：6-停止服务
-        运行：|
-回声 “$LOG_PREFIX === 6-停止服务开始 ===”
-Sudo fuser -k 80/TCP 443/TCP 2>/dev/null ||确实如此
-Sudo systemCTL stop casaos Docker containerd 2>/dev/null ||确实如此
-Sudo pkill -9 -f “casaos Docker containerd” 2>/dev/null ||确实如此
-echo “$LOG_PREFIX 6-停止服务完成”
-      - 名称：7-本地全量备份（等级6 + 排除冗余文件）
-        如果：${{ always（） }}
-        运行：|
-集合+e
-echo “===== [日志] 7-生成本地全量备份 开始 =====”
-sudo mkdir -p “$LOCAL_BACKUP_DIR” ||确实如此
-IFS=' 'read -r -a DIR_ARRAY <<< “$PERSONAL_DATA_DIRS”
-dir在“${DIR_ARRAY[@]}”中;做
-[ ！ -d “$dir” ] & Sudo mkdir -p “$dir” ||确实如此
-完成
-SNAP_NAME=“casaos-full-$（date +%Y%m%d-%H%M%S）.tar.zst”
-LOCAL_FILE=“$LOCAL_BACKUP_DIR/$SNAP_NAME”
-echo “[日志] 备份文件：$SNAP_NAME”
-sudo tar -I“zstd -$ZSTD_COMPRESS_LEVEL -T2” -cf “$LOCAL_FILE” \
---忽略-失败-读取 --保留权限\
---exclude='/var/lib/docker/containers/*/logs' \
---exclude='/var/lib/docker/tmp' \
---exclude='/var/lib/docker/volumes/*/_data/tmp' \
---exclude='/var/lib/docker/overlay2/*/diff/tmp' \
-“${DIR_ARRAY[@]}” ||确实如此
-如果 [ -f “$LOCAL_FILE” ] & [ -s “$LOCAL_FILE” ];则
-FILE_SIZE=$（du -h “$LOCAL_FILE” | cut -f1）
-echo “[日志] ✅ 备份有效 （大小： $FILE_SIZE）”
-echo “BACKUP_FILE=$LOCAL_FILE” >> $GITHUB_ENV ||确实如此
-回声 “SNAP_NAME=$SNAP_NAME” >> $GITHUB_ENV ||确实如此
-否则
+                    for dir in $PERSONAL_DATA_DIRS; do
+                      [ -d "$dir" ] && sudo chown -R root:root "$dir" 2>/dev/null || true
+                    done
+                    rm -f "$LOCAL_FILE"
+                    echo "$LOG_PREFIX 节点 $HOST 恢复成功！"
+                    break
+                  fi
+                fi
+              done
+            fi
+          fi
+          echo "$LOG_PREFIX 3-拉取备份完成"
+
+      - name: 4-启动服务
+        run: |
+          echo "$LOG_PREFIX === 4-启动服务开始 ==="
+          sudo fuser -k 80/TCP 443/TCP 2>/dev/null || true
+          sudo mkdir -p /run/docker
+          sudo systemctl daemon-reload || true
+          sudo systemctl enable --now docker containerd || true
+          sleep 5
+          sudo systemctl enable --now casaos || true
+          echo "$LOG_PREFIX Docker状态: $(systemctl is-active docker 2>/dev/null || echo '未知')"
+          echo "$LOG_PREFIX CasaOS状态: $(systemctl is-active casaos 2>/dev/null || echo '未知')"
+          echo "$LOG_PREFIX 4-启动服务完成"
+
+      - name: 5-稳定运行
+        timeout-minutes: 360
+        run: |
+          echo "$LOG_PREFIX === 5-稳定运行 $TARGET_RUN_MINUTES 分钟 ==="
+          RUN_SECONDS=$((TARGET_RUN_MINUTES * 60))
+          ELAPSED=0
+          while [ $ELAPSED -lt $RUN_SECONDS ]; do
+            MINUTES=$((ELAPSED / 60))
+            echo "$LOG_PREFIX 已运行 $MINUTES / $TARGET_RUN_MINUTES 分钟..."
+            sleep 60
+            ELAPSED=$((ELAPSED + 60))
+            [ $((MINUTES % 10)) -eq 0 ] && [ $MINUTES -gt 0 ] && echo "$LOG_PREFIX 心跳: Docker=$(systemctl is-active docker 2>/dev/null || echo "?") CasaOS=$(systemctl is-active casaos 2>/dev/null || echo '?')"
+          done
+          echo "$LOG_PREFIX 5-稳定运行完成"
+
+      - name: 6-停止服务
+        run: |
+          echo "$LOG_PREFIX === 6-停止服务开始 ==="
+          sudo fuser -k 80/TCP 443/TCP 2>/dev/null || true
+          sudo systemctl stop casaos docker containerd 2>/dev/null || true
+          sudo pkill -9 -f "casaos docker containerd" 2>/dev/null || true
+          echo "$LOG_PREFIX 6-停止服务完成"
+
+      - name: 7-本地全量备份（等级6 + 排除冗余文件）
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "===== [日志] 7-生成本地全量备份 开始 ====="
+          sudo mkdir -p "$LOCAL_BACKUP_DIR" || true
+          IFS=' ' read -r -a DIR_ARRAY <<< "$PERSONAL_DATA_DIRS"
+          for dir in "${DIR_ARRAY[@]}"; do
+            [ ! -d "$dir" ] && sudo mkdir -p "$dir" || true
+          done
+          SNAP_NAME="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
+          LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP_NAME"
+          echo "[日志] 备份文件:$SNAP_NAME"
+          sudo tar -I"zstd -$ZSTD_COMPRESS_LEVEL -T2" -cf "$LOCAL_FILE" \
+          --ignore-failed-read --preserve-permissions \
+          --exclude='/var/lib/docker/containers/*/logs' \
+          --exclude='/var/lib/docker/tmp' \
+          --exclude='/var/lib/docker/volumes/*/_data/tmp' \
+          --exclude='/var/lib/docker/overlay2/*/diff/tmp' \
+          "${DIR_ARRAY[@]}" || true
+          if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
+            FILE_SIZE=$(du -h "$LOCAL_FILE" | cut -f1)
+            echo "[日志] ✅ 备份有效 (大小: $FILE_SIZE)"
+            echo "BACKUP_FILE=$LOCAL_FILE" >> $GITHUB_ENV || true
+            echo "SNAP_NAME=$SNAP_NAME" >> $GITHUB_ENV || true
+          else
             echo "[日志] ❌ 备份文件无效"
             exit 0
           fi
-echo “ ✅ [日志] 7-备份完成”
-      - 名称：8-触发下一轮
-        运行：|
-回声“$LOG_前缀 === 8-触发下一轮 ===”
-如果 [ -n “$USER_PAT” ] & [ -n “$REPO” ];则
-1 2 3 重试;做
-curl -s -f -X POST -H “Authorization： token $USER_PAT” -H “Content-Type： application/json” \
-https://api.github.com/repos/$REPO/dispatches \
--d '{“event_type”：“renew_casaos_snapshot”}' && echo “$LOG_PREFIX dispatch成功” && break
-睡眠3
-完成
-否则
-echo “$LOG_PREFIX 未配置PAT/REPO，跳过”
-Fi
-echo “$LOG_PREFIX 8-触发下一轮完成”
-      - 名称：9-轮询等待删除
-        暂停分钟：1440分钟
-        运行：|
-回声 “$LOG_PREFIX === 9-轮询删除开始 ===”
-如果 [ -z “$BACKUP_FILE” ] ||[ -z “$SNAP_NAME” ];则
-echo “$LOG_PREFIX 无备份文件，跳过”
-否则
-sudo mkdir -p “$LOCAL_AAA_DIR” ||确实如此
-sudo chown runner：runner “$LOCAL_AAA_DIR” ||确实如此
-TARGET_FILE=“$LOCAL_AAA_DIR/$SNAP_NAME”
-sudo mv -v “$BACKUP_FILE” “$TARGET_FILE” 2>/dev/null ||确实如此
+          echo " ✅ [日志] 7-备份完成"
+
+      - name: 8-触发下一轮
+        run: |
+          echo "$LOG_PREFIX === 8-触发下一轮 ==="
+          if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
+            for retry in 1 2 3; do
+              curl -s -f -X POST -H "Authorization: token $USER_PAT" -H "Content-Type: application/json" \
+              https://api.github.com/repos/$REPO/dispatches \
+              -d '{"event_type":"renew_casaos_snapshot"}' && echo "$LOG_PREFIX dispatch成功" && break
+              sleep 3
+            done
+          else
+            echo "$LOG_PREFIX 未配置PAT/REPO，跳过"
+          fi
+          echo "$LOG_PREFIX 8-触发下一轮完成"
+
+      - name: 9-轮询等待删除
+        timeout-minutes: 1440
+        run: |
+          echo "$LOG_PREFIX === 9-轮询删除开始 ==="
+          if [ -z "$BACKUP_FILE" ] || [ -z "$SNAP_NAME" ]; then
+            echo "$LOG_PREFIX 无备份文件，跳过"
+          else
+            sudo mkdir -p "$LOCAL_AAA_DIR" || true
+            sudo chown runner:runner "$LOCAL_AAA_DIR" || true
+            TARGET_FILE="$LOCAL_AAA_DIR/$SNAP_NAME"
+            sudo mv -v "$BACKUP_FILE" "$TARGET_FILE" 2>/dev/null || true
             
-如果 [ -f “$TARGET_FILE” ];则
-FILE_SIZE=$（sudo stat -c%s “$TARGET_FILE” 2>/dev/null || echo “0”）
-echo “$LOG_PREFIX 监控文件： $SNAP_NAME”
-POLL_COUNT=0
-虽然 [ -f “$TARGET_FILE” ];做
-CURRENT_SIZE=$（sudo stat -c%s “$TARGET_FILE” 2>/dev/null || echo “0”）
-如果 [ “$CURRENT_SIZE” ！= “$FILE_SIZE” ];则
-echo “$LOG_PREFIX 文件变化”
-FILE_SIZE=$CURRENT_SIZE
-Fi
-回声 “$LOG_PREFIX 等待中...（$POLL计数）”
-睡眠$POLL间歇
-POLL_COUNT=$（（POLL_COUNT + 1））
-完成
-echo “$LOG_PREFIX 文件已被删除，退出”
-Fi
-Fi
-echo “$LOG_PREFIX 9-轮询删除完成”
-      - 名称：10-最终清理
-        运行：|
-回声“$LOG_前缀 === 10-最终清理 ===”
-sudo rm -rf “$LOCAL_BACKUP_DIR” /tmp/* 2>/dev/null ||确实如此
-sudo rm -f /etc/sudoers.d/root 2>/dev/null ||确实如此
-sudo apt autoremove -y -qq 2>/dev/null ||确实如此
-sudo apt clean -y -qq 2>/dev/null ||确实如此
-echo “$LOG_PREFIX 10-最终清理完成”
-回声 “$LOG_前缀 === 全流程结束 ===”
+            if [ -f "$TARGET_FILE" ]; then
+              FILE_SIZE=$(sudo stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
+              echo "$LOG_PREFIX 监控文件: $SNAP_NAME"
+              POLL_COUNT=0
+              while [ -f "$TARGET_FILE" ]; do
+                CURRENT_SIZE=$(sudo stat -c%s "$TARGET_FILE" 2>/dev/null || echo "0")
+                if [ "$CURRENT_SIZE" != "$FILE_SIZE" ]; then
+                  echo "$LOG_PREFIX 文件变化"
+                  FILE_SIZE=$CURRENT_SIZE
+                fi
+                echo "$LOG_PREFIX 等待中...($POLL_COUNT计数)"
+                sleep $POLL_INTERVAL
+                POLL_COUNT=$((POLL_COUNT + 1))
+              done
+              echo "$LOG_PREFIX 文件已被删除，退出"
+            fi
+          fi
+          echo "$LOG_PREFIX 9-轮询删除完成"
+
+      - name: 10-最终清理
+        run: |
+          echo "$LOG_PREFIX === 10-最终清理 ==="
+          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/* 2>/dev/null || true
+          sudo rm -f /etc/sudoers.d/root 2>/dev/null || true
+          sudo apt autoremove -y -qq 2>/dev/null || true
+          sudo apt clean -y -qq 2>/dev/null || true
+          echo "$LOG_PREFIX 10-最终清理完成"
+          echo "$LOG_PREFIX === 全流程结束 ==="
