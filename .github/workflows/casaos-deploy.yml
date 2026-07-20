@@ -155,15 +155,15 @@ LATEST_FILE=$（sshpass -p “$SSH_PASS” ssh -o StrictHostKeyChecking=no -o Co
                 
 如果 [ -n “$LATEST_FILE” ];则
 LOCAL_FILE=“$LOCAL_BACKUP_DIR/$（basename ”$LATEST_FILE“）”
-                  mkdir -p "$LOCAL_BACKUP_DIR"
+mkdir -p “$LOCAL_BACKUP_DIR”
                   
-                  if sshpass -p "$SSH_PASS" rsync --partial --progress --rsh="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" \
-                    "$SSH_USER@$IP:$LATEST_FILE" "$LOCAL_FILE"; then
-                    sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
-                      "$SSH_USER@$IP" "sudo rm -f '$LATEST_FILE'" || true
+if sshpass -p “$SSH_PASS” rsync --partial --progress --rsh=“ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15” \
+“$SSH_USER@$IP：$LATEST_FILE” “$LOCAL_FILE”;则
+sshpass -p “$SSH_PASS” ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+“$SSH_USER@$IP” “sudo rm -f '$LATEST_FILE'” ||确实如此
                     
-                    echo "$LOG_PREFIX 开始解压恢复（双线程 -T2）..."
-                    sudo tar -I"zstd -d -T2" -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions 2>/dev/null || true
+echo “$LOG_PREFIX 开始解压恢复（双线程 -T2）...”
+sudo tar -I“zstd -d -T2” -xf “$LOCAL_FILE” -C / --overwrite --preserve-permissions 2>/dev/null ||确实如此
                     
 $PERSONAL_DATA_DIRS 中的 dir 表示;做
 [ -d “$dir” ] && sudo chown -R root：root “$dir” 2>/dev/null ||确实如此
@@ -236,9 +236,9 @@ echo “[日志] ✅ 备份有效 （大小： $FILE_SIZE）”
 echo “BACKUP_FILE=$LOCAL_FILE” >> $GITHUB_ENV ||确实如此
 回声 “SNAP_NAME=$SNAP_NAME” >> $GITHUB_ENV ||确实如此
 否则
-echo “[日志] ❌ 备份文件无效”
-出口0
-Fi
+            echo "[日志] ❌ 备份文件无效"
+            exit 0
+          fi
 echo “ ✅ [日志] 7-备份完成”
       - 名称：8-触发下一轮
         运行：|
