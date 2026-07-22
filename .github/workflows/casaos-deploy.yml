@@ -9,7 +9,7 @@ env:
   RETRY_TIMES: 3
   ZSTD_COMPRESS_LEVEL: 8
   POLL_INTERVAL: 60
-  TARGET_RUN_MINUTES: 20
+  TARGET_RUN_MINUTES: 320
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -36,7 +36,7 @@ jobs:
             sudo apt update -y -qq || true
             sudo apt install -y curl wget jq tar gzip lsof ca-certificates gnupg sshpass openssh-server zstd rsync -qq || true
             sudo rm -rf /usr/local/lib /usr/local/.ghcup /usr/local/julia* /usr/local/aws-* /usr/local/n || true
-            sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/runner-cache /opt/microsoft /opt/google || true
+            sudo rm -rf /opt/hostedtoolcache /opt/actionarchivecache /opt/microsoft /opt/google || true
             sudo rm -rf /tmp/* /var/tmp/* ~/.cache/* /root/.cache/* /var/cache/apt/* || true
             sudo DEBIAN_FRONTEND=noninteractive apt autoremove --purge -y || true
             sudo DEBIAN_FRONTEND=noninteractive apt clean || true
@@ -100,6 +100,7 @@ jobs:
           task4_admin &
           wait
           echo "$LOG_PREFIX ✅ 所有初始化任务全部完成"
+
       - name: 2-Tailscale组网
         run: |
           TS_SUFFIX=$((RANDOM % 1000))
@@ -124,6 +125,7 @@ jobs:
             echo "$LOG_PREFIX 本机Tailscale主机名: $TS_HOSTNAME"
           fi
           echo "$LOG_PREFIX 2-Tailscale组网完成"
+
       - name: 3-拉取备份恢复（rsync优化传输）
         run: |
           echo "$LOG_PREFIX === 3-拉取备份开始 ==="
@@ -177,6 +179,7 @@ jobs:
             fi
           fi
           echo "$LOG_PREFIX 3-拉取备份完成"
+
       - name: 4-启动服务
         run: |
           echo "$LOG_PREFIX === 4-启动服务开始 ==="
@@ -189,6 +192,7 @@ jobs:
           echo "$LOG_PREFIX Docker状态: $(systemctl is-active docker 2>/dev/null || echo 'unknown')"
           echo "$LOG_PREFIX CasaOS状态: $(systemctl is-active casaos 2>/dev/null || echo 'unknown')"
           echo "$LOG_PREFIX 4-启动服务完成"
+
       - name: 5-稳定运行
         timeout-minutes: 360
         run: |
@@ -203,36 +207,44 @@ jobs:
             [ $((MINUTES % 10)) -eq 0 ] && [ $MINUTES -gt 0 ] && echo "$LOG_PREFIX 心跳: Docker=$(systemctl is-active docker 2>/dev/null || echo '?') CasaOS=$(systemctl is-active casaos 2>/dev/null || echo '?')"
           done
           echo "$LOG_PREFIX 5-稳定运行完成"
-      - name: 6-停止服务（优雅停机，无强制杀进程）
+
+      - name: 6-停止服务（优雅停机，无强制杀进程，容错加固）
         run: |
+          set +e
           echo "$LOG_PREFIX === 6-优雅停止服务开始 ==="
-          # 1. 先关闭80/443端口监听，阻断新连接
+          # 阻断新连接
           sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true
 
-          # 2. 优先停止CasaOS应用服务
-          sudo systemctl stop --timeout=60 casaos 2>/dev/null
+          # 停止CasaOS
+          sudo systemctl stop --timeout=60 casaos 2>/dev/null || true
           echo "$LOG_PREFIX CasaOS 服务执行优雅停止，等待60秒超时"
           sleep 3
 
-          # 3. 优雅停止所有容器，给容器30秒正常退出时间
+          # 优雅关闭容器，规避docker stop空参数报错
           if command -v docker &>/dev/null; then
-            sudo docker stop --time=30 $(sudo docker ps -q) 2>/dev/null || true
-            echo "$LOG_PREFIX 所有容器已下发优雅停机指令，等待30秒保存数据"
+            CONTAINER_LIST=$(sudo docker ps -q 2>/dev/null)
+            if [ -n "$CONTAINER_LIST" ]; then
+              sudo docker stop --time=30 $CONTAINER_LIST 2>/dev/null
+              echo "$LOG_PREFIX 所有运行容器下发优雅停机指令，等待30秒保存数据"
+            else
+              echo "$LOG_PREFIX 当前无运行中容器"
+            fi
           fi
 
-          # 4. 依次停止 containerd、docker 守护进程
-          sudo systemctl stop --timeout=90 containerd 2>/dev/null
-          sudo systemctl stop --timeout=90 docker 2>/dev/null
+          # 停止容器运行时
+          sudo systemctl stop --timeout=90 containerd 2>/dev/null || true
+          sudo systemctl stop --timeout=90 docker 2>/dev/null || true
           sleep 5
 
-          # 5. 强制刷新磁盘缓存，确保所有写入落盘，避免备份文件损坏
+          # 刷盘缓存，保证数据落地
           sync
-          echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+          echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1
           sleep 8
           echo "$LOG_PREFIX 磁盘缓存已全部落盘，可安全进入备份流程"
 
-          # 移除原暴力pkill -9，全程无强制杀死进程
           echo "$LOG_PREFIX 6-优雅停止服务完成，无强制杀进程"
+          set -e
+
       - name: 7-本地全量备份（等级6 + 排除冗余文件）
         if: ${{ always() }}
         run: |
@@ -263,6 +275,7 @@ jobs:
             exit 0
           fi
           echo "✅ [日志] 7-备份完成"
+
       - name: 8-触发下一轮
         run: |
           echo "$LOG_PREFIX === 8-触发下一轮 ==="
@@ -277,6 +290,7 @@ jobs:
             echo "$LOG_PREFIX 未配置PAT/REPO，跳过"
           fi
           echo "$LOG_PREFIX 8-触发下一轮完成"
+
       - name: 9-轮询等待删除
         timeout-minutes: 1440
         run: |
@@ -307,6 +321,7 @@ jobs:
             fi
           fi
           echo "$LOG_PREFIX 9-轮询删除完成"
+
       - name: 10-最终清理
         run: |
           echo "$LOG_PREFIX === 10-最终清理 ==="
